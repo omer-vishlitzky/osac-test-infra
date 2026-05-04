@@ -55,7 +55,6 @@ class K8sClient:
             return 0
         return len(output.strip().splitlines())
 
-
     # ComputeInstance queries
 
     def get_compute_instance_name(self, *, uuid: str, checked: bool = True) -> str:
@@ -149,6 +148,28 @@ class K8sClient:
     def get_subnet_phase(self, *, name: str, checked: bool = True) -> str:
         output, rc = self._get(
             "get", "subnet", name, "-n", self.namespace, "-o", "jsonpath={.status.phase}", checked=checked
+        )
+        return output if rc == 0 else ""
+
+    # SecurityGroup queries
+
+    def get_security_group_name(self, *, uuid: str, checked: bool = True) -> str:
+        output, rc = self._get(
+            "get",
+            "securitygroup",
+            "-n",
+            self.namespace,
+            "-l",
+            f"osac.openshift.io/securitygroup-uuid={uuid}",
+            "-o",
+            "jsonpath={.items[0].metadata.name}",
+            checked=checked,
+        )
+        return output if rc == 0 else ""
+
+    def get_security_group_phase(self, *, name: str, checked: bool = True) -> str:
+        output, rc = self._get(
+            "get", "securitygroup", name, "-n", self.namespace, "-o", "jsonpath={.status.phase}", checked=checked
         )
         return output if rc == 0 else ""
 

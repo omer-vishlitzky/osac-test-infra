@@ -76,6 +76,29 @@ class GRPCClient:
     def delete_subnet(self, *, subnet_id: str) -> None:
         self.call(service=f"{PUBLIC_API}.Subnets/Delete", data={"id": subnet_id})
 
+    # SecurityGroup operations
+
+    def create_security_group(
+        self, *, name: str, virtual_network: str, ingress: list[dict[str, Any]], egress: list[dict[str, Any]]
+    ) -> str:
+        response: dict[str, Any] = self.call(
+            service=f"{PUBLIC_API}.SecurityGroups/Create",
+            data={
+                "object": {
+                    "metadata": {"name": name},
+                    "spec": {"virtual_network": virtual_network, "ingress": ingress, "egress": egress},
+                }
+            },
+        )
+        return response["object"]["id"]
+
+    def list_security_group_ids(self) -> list[str]:
+        response: dict[str, Any] = self.call(service=f"{PUBLIC_API}.SecurityGroups/List")
+        return [item["id"] for item in response.get("items", [])]
+
+    def delete_security_group(self, *, sg_id: str) -> None:
+        self.call(service=f"{PUBLIC_API}.SecurityGroups/Delete", data={"id": sg_id})
+
     # Cluster operations
 
     def list_cluster_ids(self) -> list[str]:
