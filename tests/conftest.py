@@ -25,6 +25,11 @@ def fulfillment_address(namespace: str, cluster_domain: str) -> str:
 
 
 @pytest.fixture(scope="session")
+def fulfillment_private_address(namespace: str) -> str:
+    return env("OSAC_FULFILLMENT_PRIVATE_ADDRESS", f"fulfillment-internal-api.{namespace}.svc.cluster.local:8001")
+
+
+@pytest.fixture(scope="session")
 def service_account() -> str:
     return env("OSAC_SERVICE_ACCOUNT", "admin")
 
@@ -37,10 +42,18 @@ def grpc(fulfillment_address: str, namespace: str, service_account: str) -> GRPC
     return GRPCClient(address=fulfillment_address, token=token)
 
 
+@pytest.fixture(scope="session")
+def private_grpc(fulfillment_private_address: str, namespace: str, service_account: str) -> GRPCClient:
+    token: str = run(
+        "oc", "create", "token", service_account, "-n", namespace, "--duration", "1h", "--as", "system:admin"
+    )
+    return GRPCClient(address=fulfillment_private_address, token=token)
+
+
 @pytest.fixture(scope="session", autouse=True)
-def ensure_organizations(grpc: GRPCClient) -> None:
+def ensure_organizations(private_grpc: GRPCClient) -> None:
     for name in ("tenant1", "tenant2"):
-        grpc.ensure_organization(name=name)
+        private_grpc.ensure_organization(name=name)
 
 
 @pytest.fixture(scope="session")
