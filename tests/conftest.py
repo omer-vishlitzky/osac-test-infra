@@ -26,7 +26,11 @@ def fulfillment_address(namespace: str, cluster_domain: str) -> str:
 
 @pytest.fixture(scope="session")
 def fulfillment_private_address(namespace: str) -> str:
-    return env("OSAC_FULFILLMENT_PRIVATE_ADDRESS", f"fulfillment-internal-api.{namespace}.svc.cluster.local:8001")
+    cluster_ip = run(
+        "kubectl", "get", "svc", "fulfillment-internal-api", "-n", namespace,
+        "-o", "jsonpath={.spec.clusterIP}",
+    )
+    return env("OSAC_FULFILLMENT_PRIVATE_ADDRESS", f"{cluster_ip}:8001")
 
 
 @pytest.fixture(scope="session")
