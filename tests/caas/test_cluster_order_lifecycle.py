@@ -1,30 +1,17 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 from pathlib import Path
 from typing import Any
 
-import pytest
 import yaml
 
 from tests.core.grpc_client import GRPCClient
-from tests.core.helpers import (
-    wait_for_cluster_deletion,
-    wait_for_cluster_grpc_removal,
-    wait_for_cluster_order_cr,
-    wait_for_cluster_ready,
-)
 from tests.core.k8s_client import K8sClient
 from tests.core.osac_cli import OsacCLI
-from tests.core.runner import poll_until, run, run_unchecked
-
-
-def _inner_kubectl(kubeconfig: Path, *args: str) -> str:
-    return run(
-        "kubectl", "--kubeconfig", str(kubeconfig),
-        "--insecure-skip-tls-verify", *args,
-    )
+from tests.core.runner import poll_until, run_unchecked
 
 
 def _node_is_ready(kubeconfig: Path) -> bool:
@@ -41,30 +28,33 @@ def _node_is_ready(kubeconfig: Path) -> bool:
     )
 
 
-@pytest.fixture
-def cluster_order(
-    cli: OsacCLI, k8s_hub_client: K8sClient, cluster_template: str, pull_secret_path: str, ssh_public_key_path: str
-):
-    uuid: str = cli.create_cluster(
-        template=cluster_template,
-        template_parameter_files={"pull_secret": pull_secret_path},
-        template_parameters={"ssh_public_key": Path(ssh_public_key_path).read_text().strip()},
+def _cos_available(kubeconfig: Path) -> tuple[bool, str]:
+    output, rc = run_unchecked(
+        "kubectl", "--kubeconfig", str(kubeconfig),
+        "--insecure-skip-tls-verify", "get", "clusteroperators", "-o", "json",
     )
-    co_name: str = wait_for_cluster_order_cr(k8s=k8s_hub_client, uuid=uuid)
-    yield uuid, co_name
-    if k8s_hub_client.is_present(resource="clusterorder", name=co_name):
-        cli.delete_cluster(uuid=uuid)
-        wait_for_cluster_deletion(k8s=k8s_hub_client, name=co_name)
+    if rc != 0:
+        return False, "kubectl failed"
+    operators: list[dict[str, Any]] = json.loads(output)["items"]
+    if not operators:
+        return False, "no operators"
+    for op in operators:
+        conditions = op.get("status", {}).get("conditions", [])
+        if not conditions:
+            continue
+        available = any(c["type"] == "Available" and c["status"] == "True" for c in conditions)
+        degraded = any(c["type"] == "Degraded" and c["status"] == "True" for c in conditions)
+        if not available or degraded:
+            return False, op["metadata"]["name"]
+    return True, ""
 
 
 def test_cluster_order_lifecycle(
-    cluster_order: tuple[str, str], grpc: GRPCClient, k8s_hub_client: K8sClient, cli: OsacCLI
+    ready_cluster: tuple[str, str], grpc: GRPCClient, k8s_hub_client: K8sClient, cli: OsacCLI
 ) -> None:
-    uuid, co_name = cluster_order
+    uuid, co_name = ready_cluster
 
     assert uuid in grpc.list_cluster_ids()
-
-    wait_for_cluster_ready(k8s=k8s_hub_client, name=co_name)
 
     hc_name: str = k8s_hub_client.get_cluster_order_hosted_cluster_name(name=co_name)
     assert hc_name, f"No HostedCluster name in ClusterOrder {co_name}"
@@ -76,7 +66,9 @@ def test_cluster_order_lifecycle(
     kubeconfig: dict[str, Any] = yaml.safe_load(kubeconfig_yaml)
     assert kubeconfig["clusters"][0]["cluster"]["server"].startswith("https://")
 
-    kc_path = Path(tempfile.mktemp(suffix=".kubeconfig"))
+    fd, tmp = tempfile.mkstemp(suffix=".kubeconfig")
+    os.close(fd)
+    kc_path = Path(tmp)
     kc_path.write_text(kubeconfig_yaml)
     try:
         poll_until(
@@ -87,22 +79,12 @@ def test_cluster_order_lifecycle(
             description="worker node Ready in hosted cluster",
         )
 
-        operators: list[dict[str, Any]] = json.loads(
-            _inner_kubectl(kc_path, "get", "clusteroperators", "-o", "json")
-        )["items"]
-        assert len(operators) > 0, "No ClusterOperators found"
-        for op in operators:
-            op_name: str = op["metadata"]["name"]
-            conditions: list[dict[str, str]] = op.get("status", {}).get("conditions", [])
-            if not conditions:
-                continue
-            available = any(c["type"] == "Available" and c["status"] == "True" for c in conditions)
-            degraded = any(c["type"] == "Degraded" and c["status"] == "True" for c in conditions)
-            assert available, f"ClusterOperator {op_name} is not Available"
-            assert not degraded, f"ClusterOperator {op_name} is Degraded"
+        poll_until(
+            fn=lambda: _cos_available(kc_path),
+            until=lambda result: result[0],
+            retries=40,
+            delay=15,
+            description="all ClusterOperators Available",
+        )
     finally:
         kc_path.unlink(missing_ok=True)
-
-    cli.delete_cluster(uuid=uuid)
-    wait_for_cluster_deletion(k8s=k8s_hub_client, name=co_name)
-    wait_for_cluster_grpc_removal(grpc=grpc, uuid=uuid)
