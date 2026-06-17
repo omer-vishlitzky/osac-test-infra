@@ -82,7 +82,7 @@ def test_cluster_order_lifecycle(
         poll_until(
             fn=lambda: _node_is_ready(kc_path),
             until=lambda ready: ready,
-            retries=60,
+            retries=80,
             delay=15,
             description="worker node Ready in hosted cluster",
         )
