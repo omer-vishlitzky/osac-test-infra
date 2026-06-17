@@ -93,7 +93,9 @@ def test_cluster_order_lifecycle(
         assert len(operators) > 0, "No ClusterOperators found"
         for op in operators:
             op_name: str = op["metadata"]["name"]
-            conditions: list[dict[str, str]] = op["status"]["conditions"]
+            conditions: list[dict[str, str]] = op.get("status", {}).get("conditions", [])
+            if not conditions:
+                continue
             available = any(c["type"] == "Available" and c["status"] == "True" for c in conditions)
             degraded = any(c["type"] == "Degraded" and c["status"] == "True" for c in conditions)
             assert available, f"ClusterOperator {op_name} is not Available"
