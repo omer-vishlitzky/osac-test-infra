@@ -15,6 +15,10 @@ on:
         required: false
         default: ""
 
+concurrency:
+  group: periodic-e2e-full-install
+  cancel-in-progress: false
+
 jobs:
   e2e-vmaas-full-install:
     uses: ./.github/workflows/e2e.yml

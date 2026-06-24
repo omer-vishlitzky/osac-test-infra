@@ -39,11 +39,6 @@ on:
         required: false
         type: string
         default: "vmaas-helm"
-      image-overrides:
-        description: "JSON object mapping Helm value paths to image refs, e.g. '{\"service.images.service\":\"ghcr.io/osac-project/fulfillment-service:pr-123\"}'"
-        required: false
-        type: string
-        default: "{}"
       component-image:
         description: "Full image:tag for component override (e.g. ghcr.io/osac-project/osac-operator:pr-42)"
         required: false
@@ -372,38 +367,6 @@ jobs:
           cd "$RUNNER_TEMP/osac-installer"
           bash scripts/setup.sh
 
-      - name: Apply image overrides
-        if: inputs.image-overrides != '{}' && inputs.image-overrides != ''
-        env:
-          KUBECONFIG: ${{ runner.temp }}/kubeconfig
-          VALUES_FILE: ${{ inputs.values-file }}
-          INSTALLER_NAMESPACE: ${{ inputs.namespace }}
-          IMAGE_OVERRIDES: ${{ inputs.image-overrides }}
-        run: |
-          if ! command -v yq &>/dev/null; then
-            sudo curl -fsSL -o /usr/local/bin/yq \
-              "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64"
-            sudo chmod +x /usr/local/bin/yq
-          fi
-
-          cd "$RUNNER_TEMP/osac-installer"
-          echo "Applying image overrides..."
-          SET_ARGS=()
-          for key in $(echo "${IMAGE_OVERRIDES}" | jq -r 'keys[]'); do
-            value=$(echo "${IMAGE_OVERRIDES}" | jq -r --arg k "${key}" '.[$k]')
-            SET_ARGS+=("--set" "${key}=${value}")
-            echo "  --set ${key}=${value}"
-          done
-
-          yq -i '(.dependencies[].version) = "0.0.0"' charts/osac/Chart.yaml
-          helm dependency update charts/osac/
-          helm upgrade osac charts/osac/ \
-            --namespace "${INSTALLER_NAMESPACE}" \
-            --values "${VALUES_FILE}" \
-            "${SET_ARGS[@]}" \
-            --timeout 10m \
-            --wait
-
       - name: Run E2E tests
         id: test
         env:
@@ -451,7 +414,7 @@ jobs:
 
       - name: Upload artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: osac-logs-${{ inputs.test-suite || 'e2e' }}-${{ github.run_id }}
           path: ${{ runner.temp }}/artifacts/
