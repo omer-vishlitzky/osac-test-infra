@@ -1,0 +1,27 @@
+---
+name: "Periodic E2E (full install) [EXPERIMENTAL]"
+
+on:
+  schedule:
+    - cron: '0 */4 * * *'
+  workflow_dispatch:
+    inputs:
+      test-suite:
+        description: "Test suite (vmaas, caas, or empty for all)"
+        required: false
+        default: "vmaas"
+      test-filter:
+        description: "pytest -k filter"
+        required: false
+        default: ""
+
+jobs:
+  e2e-vmaas-full-install:
+    uses: ./.github/workflows/e2e.yml
+    with:
+      test-suite: ${{ github.event.inputs.test-suite || 'vmaas' }}
+      test-filter: ${{ github.event.inputs.test-filter || '' }}
+      deploy-mode: full-install
+      flavor-image: "quay.io/rh-ee-ovishlit/cluster-flavors:sno64withdisk"
+      flavor-name: sno64withdisk
+      timeout: 180

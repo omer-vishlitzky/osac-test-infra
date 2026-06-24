@@ -44,11 +44,46 @@ on:
         required: false
         type: string
         default: "{}"
+      component-image:
+        description: "Full image:tag for component override (e.g. ghcr.io/osac-project/osac-operator:pr-42)"
+        required: false
+        type: string
+        default: ""
+      component-image-name:
+        description: "Image name to match and replace in values file (e.g. ghcr.io/osac-project/osac-operator)"
+        required: false
+        type: string
+        default: ""
+      aap-git-branch:
+        description: "For osac-aap PRs: PR head SHA for projectGitBranch override"
+        required: false
+        type: string
+        default: ""
+      aap-git-uri:
+        description: "For osac-aap fork PRs: fork repo URL for projectGitUri override"
+        required: false
+        type: string
+        default: ""
       installer-ref:
-        description: "Branch/ref of osac-installer to clone for the deploy step"
+        description: "osac-installer git ref to clone (branch, tag, or SHA)"
         required: false
         type: string
         default: "main"
+      deploy-mode:
+        description: "Deployment mode: snapshot (boot + refresh) or full-install (setup.sh)"
+        required: false
+        type: string
+        default: "snapshot"
+      values-file:
+        description: "Helm values file path relative to osac-installer root"
+        required: false
+        type: string
+        default: "values/vmaas-ci/values.yaml"
+      timeout:
+        description: "Job timeout in minutes"
+        required: false
+        type: number
+        default: 90
     outputs:
       result:
         description: "Test result: PASSED or FAILED"
@@ -58,6 +93,7 @@ jobs:
   e2e:
     runs-on: osac-ci
     environment: e2e-test
+    timeout-minutes: ${{ inputs.timeout || 90 }}
     permissions:
       contents: read
     outputs:
@@ -205,21 +241,81 @@ jobs:
 
       - name: Build test image
         env:
-          E2E_IMAGE: "osac-e2e-tests:${{ github.run_id }}"
+          E2E_IMAGE: "osac-e2e-tests:${{ github.run_id }}-${{ inputs.test-suite || 'e2e' }}"
         run: podman build -t "${E2E_IMAGE}" -f Containerfile .
 
-      - name: Deploy OSAC
+      - name: Clone osac-installer
+        env:
+          INSTALLER_REF: ${{ inputs.installer-ref }}
+        run: |
+          INSTALLER_DIR="$RUNNER_TEMP/osac-installer"
+          CLONE_ARGS=(--recurse-submodules --depth 1)
+          if [ "${INSTALLER_REF}" != "main" ]; then
+            CLONE_ARGS+=(--branch "${INSTALLER_REF}")
+          fi
+          git clone "${CLONE_ARGS[@]}" \
+            https://github.com/osac-project/osac-installer.git "${INSTALLER_DIR}"
+
+      - name: Place secrets for installer
+        env:
+          AAP_LICENSE_FILE: ${{ runner.temp }}/aap-license.zip
+          VALUES_FILE: ${{ inputs.values-file }}
+        run: |
+          VALUES_DIR="$(dirname "$RUNNER_TEMP/osac-installer/${VALUES_FILE}")"
+          mkdir -p "${VALUES_DIR}"
+          cp "${AAP_LICENSE_FILE}" "${VALUES_DIR}/license.zip"
+          cp "$RUNNER_TEMP/pull-secret.json" "${VALUES_DIR}/pull-secret.json"
+
+      - name: Override component image in values file
+        if: inputs.component-image != '' && inputs.component-image-name != ''
+        env:
+          COMPONENT_IMAGE: ${{ inputs.component-image }}
+          COMPONENT_IMAGE_NAME: ${{ inputs.component-image-name }}
+          VALUES_FILE: ${{ inputs.values-file }}
+        run: |
+          VF="$RUNNER_TEMP/osac-installer/${VALUES_FILE}"
+          COMPONENT_TAG="${COMPONENT_IMAGE##*:}"
+          COMPONENT_REPO="${COMPONENT_IMAGE%:*}"
+
+          sed -i "s|[a-zA-Z0-9./_-]*${COMPONENT_IMAGE_NAME}:[a-zA-Z0-9._-]*|${COMPONENT_IMAGE}|g" "${VF}"
+          sed -i "/${COMPONENT_IMAGE_NAME##*/}/{s|repository: .*|repository: ${COMPONENT_REPO}|;n;s/tag: .*/tag: ${COMPONENT_TAG}/}" "${VF}"
+
+          grep -q "${COMPONENT_TAG}" "${VF}" || {
+            echo "ERROR: component image override for ${COMPONENT_IMAGE_NAME} not found in ${VALUES_FILE}"
+            cat "${VF}"
+            exit 1
+          }
+          echo "Overrode ${COMPONENT_IMAGE_NAME} -> ${COMPONENT_IMAGE}"
+
+      - name: Override AAP project settings
+        if: inputs.aap-git-branch != ''
+        env:
+          AAP_GIT_BRANCH: ${{ inputs.aap-git-branch }}
+          AAP_GIT_URI: ${{ inputs.aap-git-uri }}
+          COMPONENT_IMAGE: ${{ inputs.component-image }}
+          VALUES_FILE: ${{ inputs.values-file }}
+        run: |
+          VF="$RUNNER_TEMP/osac-installer/${VALUES_FILE}"
+
+          sed -i "s|projectGitBranch: .*|projectGitBranch: \"${AAP_GIT_BRANCH}\"|" "${VF}"
+          grep -q "${AAP_GIT_BRANCH}" "${VF}" || {
+            echo "ERROR: projectGitBranch override failed"
+            exit 1
+          }
+
+          if [ -n "${AAP_GIT_URI}" ]; then
+            sed -i "s|projectGitUri: .*|projectGitUri: \"${AAP_GIT_URI}\"|" "${VF}"
+          fi
+
+          if [ -n "${COMPONENT_IMAGE}" ]; then
+            sed -i "s|eeImage: .*|eeImage: \"${COMPONENT_IMAGE}\"|" "${VF}"
+          fi
+
+      - name: Wait for KubeVirt
+        if: inputs.deploy-mode != 'full-install'
         env:
           KUBECONFIG: ${{ runner.temp }}/kubeconfig
-          VALUES_FILE: values/vmaas-ci/values.yaml
-          INSTALLER_NAMESPACE: ${{ inputs.namespace }}
-          INSTALLER_VM_TEMPLATE: ${{ inputs.vm-template }}
-          INSTALLER_CLUSTER_TEMPLATE: ${{ inputs.cluster-template }}
-          AAP_LICENSE_FILE: ${{ runner.temp }}/aap-license.zip
-          INSTALLER_REF: ${{ inputs.installer-ref }}
-          IMAGE_OVERRIDES: ${{ inputs.image-overrides }}
         run: |
-          # --- Wait for KubeVirt ---
           echo "Waiting for KubeVirt to be Available..."
           for attempt in $(seq 1 60); do
               AVAILABLE=$(oc get hyperconverged kubevirt-hyperconverged -n openshift-cnv \
@@ -238,8 +334,15 @@ jobs:
               exit 1
           fi
 
-          # --- Deploy ---
-          # Ensure helm and yq are available
+      - name: Deploy OSAC (snapshot refresh)
+        if: inputs.deploy-mode != 'full-install'
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+          VALUES_FILE: ${{ inputs.values-file }}
+          INSTALLER_NAMESPACE: ${{ inputs.namespace }}
+          INSTALLER_VM_TEMPLATE: ${{ inputs.vm-template }}
+          INSTALLER_CLUSTER_TEMPLATE: ${{ inputs.cluster-template }}
+        run: |
           if ! command -v helm &>/dev/null; then
             curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
           fi
@@ -249,41 +352,57 @@ jobs:
             sudo chmod +x /usr/local/bin/yq
           fi
 
-          INSTALLER_DIR="$RUNNER_TEMP/osac-installer"
-          git clone --recurse-submodules --depth 1 --branch "${INSTALLER_REF}" \
-            https://github.com/osac-project/osac-installer.git "${INSTALLER_DIR}"
-          cd "${INSTALLER_DIR}"
-
-          # Place AAP license where the refresh script expects it
-          cp "${AAP_LICENSE_FILE}" "$(dirname "${VALUES_FILE}")/license.zip"
-
-          # refresh-after-snapshot.py is purpose-built for snapshot-booted
-          # clusters: fixes stale routes/certs, adopts resources for Helm,
-          # runs helm upgrade, and waits with health monitoring.
+          cd "$RUNNER_TEMP/osac-installer"
           python3 scripts/refresh-after-snapshot.py
 
-          # Apply image overrides via helm upgrade --set flags.
-          # Callers pass a JSON object mapping Helm value paths to image refs,
-          # e.g. '{"service.images.service":"ghcr.io/repo:pr-42"}'.
-          # If empty or '{}', this is a no-op.
-          if [[ -n "${IMAGE_OVERRIDES}" ]] && [[ "${IMAGE_OVERRIDES}" != "{}" ]]; then
-            echo "Applying image overrides..."
-            SET_ARGS=()
-            for key in $(echo "${IMAGE_OVERRIDES}" | jq -r 'keys[]'); do
-              value=$(echo "${IMAGE_OVERRIDES}" | jq -r --arg k "${key}" '.[$k]')
-              SET_ARGS+=("--set" "${key}=${value}")
-              echo "  --set ${key}=${value}"
-            done
-
-            yq -i '(.dependencies[].version) = "0.0.0"' charts/osac/Chart.yaml
-            helm dependency update charts/osac/
-            helm upgrade osac charts/osac/ \
-              --namespace "${INSTALLER_NAMESPACE}" \
-              --values "${VALUES_FILE}" \
-              "${SET_ARGS[@]}" \
-              --timeout 10m \
-              --wait
+      - name: "Deploy OSAC (full install) [EXPERIMENTAL]"
+        if: inputs.deploy-mode == 'full-install'
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+          DEPLOY_MODE: helm
+          VALUES_FILE: ${{ inputs.values-file }}
+          INSTALLER_NAMESPACE: ${{ inputs.namespace }}
+          INSTALLER_VM_TEMPLATE: ${{ inputs.vm-template }}
+          INSTALLER_CLUSTER_TEMPLATE: ${{ inputs.cluster-template }}
+        run: |
+          if ! command -v helm &>/dev/null; then
+            curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
           fi
+
+          cd "$RUNNER_TEMP/osac-installer"
+          bash scripts/setup.sh
+
+      - name: Apply image overrides
+        if: inputs.image-overrides != '{}' && inputs.image-overrides != ''
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+          VALUES_FILE: ${{ inputs.values-file }}
+          INSTALLER_NAMESPACE: ${{ inputs.namespace }}
+          IMAGE_OVERRIDES: ${{ inputs.image-overrides }}
+        run: |
+          if ! command -v yq &>/dev/null; then
+            sudo curl -fsSL -o /usr/local/bin/yq \
+              "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64"
+            sudo chmod +x /usr/local/bin/yq
+          fi
+
+          cd "$RUNNER_TEMP/osac-installer"
+          echo "Applying image overrides..."
+          SET_ARGS=()
+          for key in $(echo "${IMAGE_OVERRIDES}" | jq -r 'keys[]'); do
+            value=$(echo "${IMAGE_OVERRIDES}" | jq -r --arg k "${key}" '.[$k]')
+            SET_ARGS+=("--set" "${key}=${value}")
+            echo "  --set ${key}=${value}"
+          done
+
+          yq -i '(.dependencies[].version) = "0.0.0"' charts/osac/Chart.yaml
+          helm dependency update charts/osac/
+          helm upgrade osac charts/osac/ \
+            --namespace "${INSTALLER_NAMESPACE}" \
+            --values "${VALUES_FILE}" \
+            "${SET_ARGS[@]}" \
+            --timeout 10m \
+            --wait
 
       - name: Run E2E tests
         id: test
@@ -293,7 +412,7 @@ jobs:
           OSAC_NAMESPACE: ${{ inputs.namespace }}
           OSAC_VM_TEMPLATE: ${{ inputs.vm-template }}
           OSAC_CLUSTER_TEMPLATE: ${{ inputs.cluster-template }}
-          E2E_IMAGE: "osac-e2e-tests:${{ github.run_id }}"
+          E2E_IMAGE: "osac-e2e-tests:${{ github.run_id }}-${{ inputs.test-suite || 'e2e' }}"
         run: |
           KUBECONFIG_PATH="$RUNNER_TEMP/kubeconfig"
 
@@ -321,10 +440,28 @@ jobs:
             pytest ${TEST_ARGS} ${FILTER_ARGS} \
               --junitxml=/tmp/junit.xml -v
 
+      - name: Gather artifacts
+        if: always()
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+          NAMESPACE: ${{ inputs.namespace }}
+          ARTIFACT_DIR: ${{ runner.temp }}/artifacts
+        run: |
+          timeout 1200 bash scripts/gather-artifacts.sh || true
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: osac-logs-${{ inputs.test-suite || 'e2e' }}-${{ github.run_id }}
+          path: ${{ runner.temp }}/artifacts/
+          retention-days: 14
+          if-no-files-found: ignore
+
       - name: Teardown
         if: always()
         env:
-          E2E_IMAGE: "osac-e2e-tests:${{ github.run_id }}"
+          E2E_IMAGE: "osac-e2e-tests:${{ github.run_id }}-${{ inputs.test-suite || 'e2e' }}"
         run: |
           # --- Destroy cluster clone ---
           echo "Destroying clone '${CLONE_NAME}'..."
