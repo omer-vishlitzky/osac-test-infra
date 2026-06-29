@@ -169,13 +169,14 @@ if [[ -n "${AAP_ROUTE}" && -n "${AAP_ADMIN_PW}" ]]; then
                 | tr -c 'A-Za-z0-9._-' '_' | head -c 100)
             curl "${AAP_AUTH[@]}" \
                 "https://${AAP_ROUTE}/api/controller/v2/jobs/${job_id}/stdout/?format=txt" \
-                > "${ARTIFACT_DIR}/aap-jobs/job-${job_id}-${status}-${name}.txt" 2>&1 || true
+                > "${ARTIFACT_DIR}/aap-jobs/job-${job_id}-${status}-${name}.txt" 2>&1 &
         done
         next=$(jq -r '.next // empty' "${page_file}")
         [[ -z "${next}" || "${next}" == "null" ]] && break
         page=$((page + 1))
     done
-    echo "  Captured stdout for $(ls "${ARTIFACT_DIR}/aap-jobs"/job-*.txt 2>&1 | wc -l) AAP jobs"
+    wait
+    echo "  Captured stdout for $(find "${ARTIFACT_DIR}/aap-jobs" -name "job-*.txt" | wc -l) AAP jobs"
     curl "${AAP_AUTH[@]}" \
         "https://${AAP_ROUTE}/api/controller/v2/project_updates/?page_size=50&order_by=id" \
         > "${ARTIFACT_DIR}/aap-jobs/project-updates.json" 2>&1 || true
@@ -184,9 +185,10 @@ if [[ -n "${AAP_ROUTE}" && -n "${AAP_ADMIN_PW}" ]]; then
             "${ARTIFACT_DIR}/aap-jobs/project-updates.json")
         curl "${AAP_AUTH[@]}" \
             "https://${AAP_ROUTE}/api/controller/v2/project_updates/${pu_id}/stdout/?format=txt" \
-            > "${ARTIFACT_DIR}/aap-jobs/project-update-${pu_id}-${status}.txt" 2>&1 || true
+            > "${ARTIFACT_DIR}/aap-jobs/project-update-${pu_id}-${status}.txt" 2>&1 &
     done
-    echo "  Captured $(ls "${ARTIFACT_DIR}/aap-jobs"/project-update-*.txt 2>&1 | wc -l) AAP project updates"
+    wait
+    echo "  Captured $(find "${ARTIFACT_DIR}/aap-jobs" -name "project-update-*.txt" | wc -l) AAP project updates"
 else
     echo "  AAP route or admin password not found, skipping job stdout capture"
 fi
@@ -199,9 +201,12 @@ fi
 
 echo "Redacting sensitive data..."
 
-# AAP RESOURCE_SERVER SECRET_KEY in all YAML (AutomationController CR, AAP CR, annotations)
-find "${ARTIFACT_DIR}" -type f -name "*.yaml" -print0 \
-    | xargs -0 sed -i -E 's/(SECRET_KEY[":]+\s*)[A-Za-z0-9_-]{40,}/\1REDACTED/g' || true
+# AAP RESOURCE_SERVER SECRET_KEY in YAML, logs, and escaped JSON annotations
+find "${ARTIFACT_DIR}" -type f \( -name "*.yaml" -o -name "*.log" -o -name "*.txt" -o -name "*.json" \) -print0 \
+    | xargs -0 sed -i -E \
+        -e 's/(SECRET_KEY[":]+\s*)[A-Za-z0-9_-]{40,}/\1REDACTED/g' \
+        -e 's/(SECRET_KEY[^A-Za-z0-9]*value[^A-Za-z0-9]*)[A-Za-z0-9_-]{40,}/\1REDACTED/g' \
+    || true
 
 # JWT tokens in pod descriptions, logs, and AAP job stdout
 find "${ARTIFACT_DIR}" \( -name "pods-describe.txt" -o -name "*.log" -o -name "*.txt" \) -print0 \
@@ -225,6 +230,15 @@ find "${ARTIFACT_DIR}" -type f \( -name "*.yaml" -o -name "*.json" \) -print0 \
 # Broad sweep: curl -u "admin:password" patterns
 find "${ARTIFACT_DIR}" -type f \( -name "*.log" -o -name "*.txt" \) -print0 \
     | xargs -0 sed -i -E 's/-u "admin:[^"]*"/-u "admin:REDACTED"/g' || true
+
+# Env var passwords in pod descriptions (e.g. KEYCLOAK_ADMIN_PASSWORD: admin)
+# Skips K8s-masked values that start with '<set to'
+find "${ARTIFACT_DIR}" -name "pods-describe.txt" -print0 \
+    | xargs -0 sed -i -E 's/(_PASSWORD[A-Z_]*:\s+)([^< \t]\S*)/\1REDACTED/g' || true
+
+# Large base64 blobs in log files (may contain kubeconfigs, certs, serialized secrets)
+find "${ARTIFACT_DIR}" -type f -name "*.log" -print0 \
+    | xargs -0 sed -i -E 's/"[A-Za-z0-9+/]{500,}[A-Za-z0-9+/=]*"/"REDACTED_BLOB"/g' || true
 
 # Clean up empty files from failed log captures
 find "${ARTIFACT_DIR}" -type f -empty -delete || true
