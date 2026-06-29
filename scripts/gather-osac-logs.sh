@@ -180,6 +180,9 @@ if [[ -n "${AAP_ROUTE}" && -n "${AAP_ADMIN_PW}" ]]; then
     curl "${AAP_AUTH[@]}" \
         "https://${AAP_ROUTE}/api/controller/v2/project_updates/?page_size=50&order_by=id" \
         > "${ARTIFACT_DIR}/aap-jobs/project-updates.json" 2>&1 || true
+    if ! jq -e '.results | type == "array"' "${ARTIFACT_DIR}/aap-jobs/project-updates.json" &>/dev/null; then
+        echo "  Skipping AAP project updates: invalid response"
+    else
     for pu_id in $(jq -r '.results[]?.id // empty' "${ARTIFACT_DIR}/aap-jobs/project-updates.json"); do
         status=$(jq -r ".results[] | select(.id == ${pu_id}) | .status // \"unknown\"" \
             "${ARTIFACT_DIR}/aap-jobs/project-updates.json")
@@ -188,6 +191,7 @@ if [[ -n "${AAP_ROUTE}" && -n "${AAP_ADMIN_PW}" ]]; then
             > "${ARTIFACT_DIR}/aap-jobs/project-update-${pu_id}-${status}.txt" 2>&1 &
     done
     wait
+    fi
     echo "  Captured $(find "${ARTIFACT_DIR}/aap-jobs" -name "project-update-*.txt" | wc -l) AAP project updates"
 else
     echo "  AAP route or admin password not found, skipping job stdout capture"
@@ -204,7 +208,7 @@ echo "Redacting sensitive data..."
 # AAP RESOURCE_SERVER SECRET_KEY in YAML, logs, and escaped JSON annotations
 find "${ARTIFACT_DIR}" -type f \( -name "*.yaml" -o -name "*.log" -o -name "*.txt" -o -name "*.json" \) -print0 \
     | xargs -0 sed -i -E \
-        -e 's/(SECRET_KEY[":]+\s*"?)[A-Za-z0-9_-]{40,}/\1REDACTED/g' \
+        -e 's/(SECRET_KEY[":\\]+\s*"?)[A-Za-z0-9_-]{40,}/\1REDACTED/g' \
         -e 's/(SECRET_KEY[^A-Za-z0-9]*value[^A-Za-z0-9]*)[A-Za-z0-9_-]{40,}/\1REDACTED/g' \
         -e 's/("value":\s*")[A-Za-z0-9_-]{40,}/\1REDACTED/g' \
     || true
