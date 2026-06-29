@@ -203,12 +203,12 @@ echo "Redacting sensitive data..."
 find "${ARTIFACT_DIR}" -type f -name "*.yaml" -print0 \
     | xargs -0 sed -i -E 's/(SECRET_KEY[":]+\s*)[A-Za-z0-9_-]{40,}/\1REDACTED/g' 2>/dev/null || true
 
-# JWT tokens in pod descriptions and all log files
-find "${ARTIFACT_DIR}" \( -name "pods-describe.txt" -o -name "*.log" \) -print0 \
+# JWT tokens in pod descriptions, logs, and AAP job stdout
+find "${ARTIFACT_DIR}" \( -name "pods-describe.txt" -o -name "*.log" -o -name "*.txt" \) -print0 \
     | xargs -0 sed -i -E 's/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/REDACTED_JWT/g' 2>/dev/null || true
 
-# AAP gateway operator: base64-encoded database passwords and API tokens
-find "${ARTIFACT_DIR}" -path "*/ansible-aap/*manager*.log" -print0 \
+# Base64-encoded database passwords and API tokens (operator logs, AAP job stdout)
+find "${ARTIFACT_DIR}" -type f \( -name "*.log" -o -name "*.txt" \) -print0 \
     | xargs -0 sed -i -E \
         -e 's/"password":\s*"[A-Za-z0-9+/=]{16,}"/"password": "REDACTED"/g' \
         -e 's/"token":\s*"[A-Za-z0-9+/=]{16,}"/"token": "REDACTED"/g' \

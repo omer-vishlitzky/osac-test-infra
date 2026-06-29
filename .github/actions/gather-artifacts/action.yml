@@ -33,8 +33,7 @@ runs:
         JUNIT_PATH: ${{ inputs.junit-path }}
       run: |
         ARTIFACT_DIR="${RUNNER_TEMP}/osac-artifacts"
-        timeout 900 "$GITHUB_WORKSPACE/scripts/gather-osac-logs.sh" "${ARTIFACT_DIR}" || true
-        if [[ -d "${ARTIFACT_DIR}" ]]; then
+        if timeout 900 "$GITHUB_WORKSPACE/scripts/gather-osac-logs.sh" "${ARTIFACT_DIR}"; then
           touch "${ARTIFACT_DIR}/.redaction-complete"
         fi
 
