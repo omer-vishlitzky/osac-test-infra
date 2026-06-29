@@ -26,6 +26,7 @@ runs:
   steps:
     - name: Collect cluster diagnostics
       if: always()
+      timeout-minutes: 15
       shell: bash
       env:
         KUBECONFIG: ${{ inputs.kubeconfig-path }}
@@ -187,6 +188,9 @@ runs:
         AAP_ROUTE=$(oc get route osac-aap -n "${E2E_NAMESPACE}" -o jsonpath='{.spec.host}' 2>/dev/null)
         AAP_ADMIN_PW=$(oc get secret osac-aap-controller-admin-password -n "${E2E_NAMESPACE}" \
             -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null)
+        if [[ -n "${AAP_ADMIN_PW}" ]]; then
+            echo "::add-mask::${AAP_ADMIN_PW}"
+        fi
         if [[ -n "${AAP_ROUTE}" && -n "${AAP_ADMIN_PW}" ]]; then
             AAP_AUTH=(-sk -u "admin:${AAP_ADMIN_PW}")
             page=1
@@ -279,12 +283,13 @@ runs:
           REDACT_COUNT=$((REDACT_COUNT + 1))
         done < <(find "${ARTIFACT_DIR}" -path "*/ansible-aap/*manager*.log" -print0 2>/dev/null)
 
-        # 5. Fulfillment controller: break-glass credentials (plaintext passwords)
+        # 5. Fulfillment: break-glass credentials (plaintext passwords)
+        #    Appears in controller logs AND grpc-server logs (event notifications)
         #    Pattern: "break_glass_credentials":{"password":"...","username":"..."}
         while IFS= read -r -d '' f; do
           sed -i -E 's/"break_glass_credentials":\{[^}]+\}/"break_glass_credentials":{"password":"REDACTED","username":"REDACTED"}/g' "$f"
           REDACT_COUNT=$((REDACT_COUNT + 1))
-        done < <(find "${ARTIFACT_DIR}" -name "pod-fulfillment-controller-*-controller.log" -print0 2>/dev/null)
+        done < <(find "${ARTIFACT_DIR}" -name "pod-fulfillment-*.log" -print0 2>/dev/null)
 
         # 6. Broad sweep: any .dockerconfigjson base64 blobs that may have leaked
         find "${ARTIFACT_DIR}" -type f \( -name "*.yaml" -o -name "*.json" \) -print0 2>/dev/null \
@@ -297,8 +302,22 @@ runs:
         # 8. Remove empty files (failed log captures produce 0-byte files)
         find "${ARTIFACT_DIR}" -type f -empty -delete 2>/dev/null || true
 
+        touch "${ARTIFACT_DIR}/.redaction-complete"
         echo "Applied redaction to ${REDACT_COUNT} files"
         echo "::endgroup::"
+
+    - name: Verify redaction completed
+      if: always()
+      shell: bash
+      env:
+        ARTIFACT_DIR: ${{ runner.temp }}/osac-artifacts
+      run: |
+        if [[ -d "${ARTIFACT_DIR}" ]] && [[ ! -f "${ARTIFACT_DIR}/.redaction-complete" ]]; then
+          echo "::error::Redaction step did not complete — refusing to upload unredacted artifacts"
+          rm -rf "${ARTIFACT_DIR}"
+          exit 1
+        fi
+        rm -f "${ARTIFACT_DIR}/.redaction-complete" 2>/dev/null || true
 
     - name: Upload artifacts
       if: always()
