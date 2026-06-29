@@ -204,8 +204,9 @@ echo "Redacting sensitive data..."
 # AAP RESOURCE_SERVER SECRET_KEY in YAML, logs, and escaped JSON annotations
 find "${ARTIFACT_DIR}" -type f \( -name "*.yaml" -o -name "*.log" -o -name "*.txt" -o -name "*.json" \) -print0 \
     | xargs -0 sed -i -E \
-        -e 's/(SECRET_KEY[":]+\s*)[A-Za-z0-9_-]{40,}/\1REDACTED/g' \
+        -e 's/(SECRET_KEY[":]+\s*"?)[A-Za-z0-9_-]{40,}/\1REDACTED/g' \
         -e 's/(SECRET_KEY[^A-Za-z0-9]*value[^A-Za-z0-9]*)[A-Za-z0-9_-]{40,}/\1REDACTED/g' \
+        -e 's/("value":\s*")[A-Za-z0-9_-]{40,}/\1REDACTED/g' \
     || true
 
 # JWT tokens in pod descriptions, logs, and AAP job stdout
