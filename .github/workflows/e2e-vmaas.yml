@@ -305,10 +305,13 @@ jobs:
             FILTER_ARGS="-k ${TEST_FILTER}"
           fi
 
+          mkdir -p "$RUNNER_TEMP/test-output"
+
           podman run --rm --network=host \
             -v "${KUBECONFIG_PATH}":/root/.kube/config:ro,Z \
             -v "${RUNNER_TEMP}/pull-secret.json":/root/pull-secret:ro,Z \
             -v "${RUNNER_TEMP}/aap-license.zip":/root/aap-license.zip:ro,Z \
+            -v "${RUNNER_TEMP}/test-output":/tmp/test-output:Z \
             -e KUBECONFIG=/root/.kube/config \
             -e OSAC_VM_KUBECONFIG=/root/.kube/config \
             -e OSAC_NAMESPACE="${OSAC_NAMESPACE}" \
@@ -317,7 +320,16 @@ jobs:
             -e OSAC_PULL_SECRET_PATH=/root/pull-secret \
             "${E2E_IMAGE}" \
             pytest ${TEST_ARGS} ${FILTER_ARGS} \
-              --junitxml=/tmp/junit.xml -v
+              --junitxml=/tmp/test-output/junit.xml -v
+
+      - name: Gather artifacts
+        if: always()
+        uses: osac-project/osac-test-infra/.github/actions/gather-artifacts@main
+        with:
+          namespace: ${{ inputs.namespace }}
+          kubeconfig-path: ${{ runner.temp }}/kubeconfig
+          artifact-name: osac-logs-${{ github.run_id }}
+          junit-path: ${{ runner.temp }}/test-output/junit.xml
 
       - name: Teardown
         if: always()
