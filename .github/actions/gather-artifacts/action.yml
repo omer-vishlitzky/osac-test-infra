@@ -37,7 +37,7 @@ runs:
           touch "${ARTIFACT_DIR}/.redaction-complete"
         fi
 
-    - name: Upload artifacts
+    - name: Verify redaction complete
       if: always()
       shell: bash
       env:

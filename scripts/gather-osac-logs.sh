@@ -147,9 +147,9 @@ oc get automationcontroller -n "${E2E_NAMESPACE}" -o yaml > "${ARTIFACT_DIR}/aut
 
 echo "Collecting AAP job stdout..."
 mkdir -p "${ARTIFACT_DIR}/aap-jobs"
-AAP_ROUTE=$(oc get route osac-aap -n "${E2E_NAMESPACE}" -o jsonpath='{.spec.host}' 2>&1) || true
+AAP_ROUTE=$(oc get route osac-aap -n "${E2E_NAMESPACE}" -o jsonpath='{.spec.host}' 2>/dev/null) || true
 AAP_ADMIN_PW=$(oc get secret osac-aap-controller-admin-password -n "${E2E_NAMESPACE}" \
-    -o jsonpath='{.data.password}' 2>&1 | base64 -d) || true
+    -o jsonpath='{.data.password}' 2>/dev/null | base64 -d) || true
 if [[ -n "${AAP_ADMIN_PW}" && -n "${GITHUB_ACTIONS:-}" ]]; then
     echo "::add-mask::${AAP_ADMIN_PW}"
 fi
@@ -208,7 +208,7 @@ find "${ARTIFACT_DIR}" \( -name "pods-describe.txt" -o -name "*.log" -o -name "*
     | xargs -0 sed -i -E 's/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/REDACTED_JWT/g' || true
 
 # Base64-encoded database passwords and API tokens (operator logs, AAP job stdout)
-find "${ARTIFACT_DIR}" -type f \( -name "*.log" -o -name "*.txt" \) -print0 \
+find "${ARTIFACT_DIR}" -type f \( -name "*.log" -o -name "*.txt" -o -name "*.json" \) -print0 \
     | xargs -0 sed -i -E \
         -e 's/"password":\s*"[A-Za-z0-9+/=]{16,}"/"password": "REDACTED"/g' \
         -e 's/"token":\s*"[A-Za-z0-9+/=]{16,}"/"token": "REDACTED"/g' \
