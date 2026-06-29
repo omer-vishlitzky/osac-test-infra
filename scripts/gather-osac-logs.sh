@@ -134,8 +134,8 @@ echo "Collecting MachineConfig diagnostics..."
 mkdir -p "${ARTIFACT_DIR}/mco"
 oc get mcp -o wide > "${ARTIFACT_DIR}/mco/mcp.txt" 2>&1 || true
 oc get mc --sort-by=.metadata.creationTimestamp > "${ARTIFACT_DIR}/mco/mc.txt" 2>&1 || true
-oc get secret pull-secret -n openshift-config -o jsonpath='{.data.\.dockerconfigjson}' 2>/dev/null \
-    | base64 -d 2>/dev/null | jq -r '.auths | keys[]' > "${ARTIFACT_DIR}/mco/pull-secret-registries.txt" 2>&1 || true
+oc get secret pull-secret -n openshift-config -o jsonpath='{.data.\.dockerconfigjson}' \
+    | base64 -d | jq -r '.auths | keys[]' > "${ARTIFACT_DIR}/mco/pull-secret-registries.txt" 2>&1 || true
 
 echo "Collecting service account and secret state..."
 oc get sa -n "${E2E_NAMESPACE}" -o yaml > "${ARTIFACT_DIR}/serviceaccounts.yaml" 2>&1 || true
@@ -147,9 +147,9 @@ oc get automationcontroller -n "${E2E_NAMESPACE}" -o yaml > "${ARTIFACT_DIR}/aut
 
 echo "Collecting AAP job stdout..."
 mkdir -p "${ARTIFACT_DIR}/aap-jobs"
-AAP_ROUTE=$(oc get route osac-aap -n "${E2E_NAMESPACE}" -o jsonpath='{.spec.host}' 2>/dev/null)
+AAP_ROUTE=$(oc get route osac-aap -n "${E2E_NAMESPACE}" -o jsonpath='{.spec.host}' 2>&1) || true
 AAP_ADMIN_PW=$(oc get secret osac-aap-controller-admin-password -n "${E2E_NAMESPACE}" \
-    -o jsonpath='{.data.password}' 2>/dev/null | base64 -d 2>/dev/null)
+    -o jsonpath='{.data.password}' 2>&1 | base64 -d) || true
 if [[ -n "${AAP_ADMIN_PW}" && -n "${GITHUB_ACTIONS:-}" ]]; then
     echo "::add-mask::${AAP_ADMIN_PW}"
 fi
@@ -163,30 +163,30 @@ if [[ -n "${AAP_ROUTE}" && -n "${AAP_ADMIN_PW}" ]]; then
             "https://${AAP_ROUTE}/api/controller/v2/jobs/?page=${page}&page_size=50&order_by=id" \
             > "${page_file}" 2>&1 || break
         jq -e '.results' "${page_file}" &>/dev/null || break
-        for job_id in $(jq -r '.results[]?.id // empty' "${page_file}" 2>/dev/null); do
-            status=$(jq -r ".results[] | select(.id == ${job_id}) | .status // \"unknown\"" "${page_file}" 2>/dev/null)
-            name=$(jq -r ".results[] | select(.id == ${job_id}) | .name // \"unknown\"" "${page_file}" 2>/dev/null \
+        for job_id in $(jq -r '.results[]?.id // empty' "${page_file}"); do
+            status=$(jq -r ".results[] | select(.id == ${job_id}) | .status // \"unknown\"" "${page_file}")
+            name=$(jq -r ".results[] | select(.id == ${job_id}) | .name // \"unknown\"" "${page_file}" \
                 | tr -c 'A-Za-z0-9._-' '_' | head -c 100)
             curl "${AAP_AUTH[@]}" \
                 "https://${AAP_ROUTE}/api/controller/v2/jobs/${job_id}/stdout/?format=txt" \
                 > "${ARTIFACT_DIR}/aap-jobs/job-${job_id}-${status}-${name}.txt" 2>&1 || true
         done
-        next=$(jq -r '.next // empty' "${page_file}" 2>/dev/null)
+        next=$(jq -r '.next // empty' "${page_file}")
         [[ -z "${next}" || "${next}" == "null" ]] && break
         page=$((page + 1))
     done
-    echo "  Captured stdout for $(ls "${ARTIFACT_DIR}/aap-jobs"/job-*.txt 2>/dev/null | wc -l) AAP jobs"
+    echo "  Captured stdout for $(ls "${ARTIFACT_DIR}/aap-jobs"/job-*.txt 2>&1 | wc -l) AAP jobs"
     curl "${AAP_AUTH[@]}" \
         "https://${AAP_ROUTE}/api/controller/v2/project_updates/?page_size=50&order_by=id" \
         > "${ARTIFACT_DIR}/aap-jobs/project-updates.json" 2>&1 || true
-    for pu_id in $(jq -r '.results[]?.id // empty' "${ARTIFACT_DIR}/aap-jobs/project-updates.json" 2>/dev/null); do
+    for pu_id in $(jq -r '.results[]?.id // empty' "${ARTIFACT_DIR}/aap-jobs/project-updates.json"); do
         status=$(jq -r ".results[] | select(.id == ${pu_id}) | .status // \"unknown\"" \
-            "${ARTIFACT_DIR}/aap-jobs/project-updates.json" 2>/dev/null)
+            "${ARTIFACT_DIR}/aap-jobs/project-updates.json")
         curl "${AAP_AUTH[@]}" \
             "https://${AAP_ROUTE}/api/controller/v2/project_updates/${pu_id}/stdout/?format=txt" \
             > "${ARTIFACT_DIR}/aap-jobs/project-update-${pu_id}-${status}.txt" 2>&1 || true
     done
-    echo "  Captured $(ls "${ARTIFACT_DIR}/aap-jobs"/project-update-*.txt 2>/dev/null | wc -l) AAP project updates"
+    echo "  Captured $(ls "${ARTIFACT_DIR}/aap-jobs"/project-update-*.txt 2>&1 | wc -l) AAP project updates"
 else
     echo "  AAP route or admin password not found, skipping job stdout capture"
 fi
@@ -201,33 +201,33 @@ echo "Redacting sensitive data..."
 
 # AAP RESOURCE_SERVER SECRET_KEY in all YAML (AutomationController CR, AAP CR, annotations)
 find "${ARTIFACT_DIR}" -type f -name "*.yaml" -print0 \
-    | xargs -0 sed -i -E 's/(SECRET_KEY[":]+\s*)[A-Za-z0-9_-]{40,}/\1REDACTED/g' 2>/dev/null || true
+    | xargs -0 sed -i -E 's/(SECRET_KEY[":]+\s*)[A-Za-z0-9_-]{40,}/\1REDACTED/g' || true
 
 # JWT tokens in pod descriptions, logs, and AAP job stdout
 find "${ARTIFACT_DIR}" \( -name "pods-describe.txt" -o -name "*.log" -o -name "*.txt" \) -print0 \
-    | xargs -0 sed -i -E 's/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/REDACTED_JWT/g' 2>/dev/null || true
+    | xargs -0 sed -i -E 's/eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/REDACTED_JWT/g' || true
 
 # Base64-encoded database passwords and API tokens (operator logs, AAP job stdout)
 find "${ARTIFACT_DIR}" -type f \( -name "*.log" -o -name "*.txt" \) -print0 \
     | xargs -0 sed -i -E \
         -e 's/"password":\s*"[A-Za-z0-9+/=]{16,}"/"password": "REDACTED"/g' \
         -e 's/"token":\s*"[A-Za-z0-9+/=]{16,}"/"token": "REDACTED"/g' \
-    2>/dev/null || true
+    || true
 
 # Fulfillment: break-glass credentials in controller and grpc-server logs
 find "${ARTIFACT_DIR}" -name "pod-fulfillment-*.log" -print0 \
-    | xargs -0 sed -i -E 's/"break_glass_credentials":\{[^}]+\}/"break_glass_credentials":{"password":"REDACTED","username":"REDACTED"}/g' 2>/dev/null || true
+    | xargs -0 sed -i -E 's/"break_glass_credentials":\{[^}]+\}/"break_glass_credentials":{"password":"REDACTED","username":"REDACTED"}/g' || true
 
 # Broad sweep: .dockerconfigjson base64 blobs
 find "${ARTIFACT_DIR}" -type f \( -name "*.yaml" -o -name "*.json" \) -print0 \
-    | xargs -0 sed -i -E 's/(\.dockerconfigjson:\s*)[A-Za-z0-9+/=]{50,}/\1REDACTED/g' 2>/dev/null || true
+    | xargs -0 sed -i -E 's/(\.dockerconfigjson:\s*)[A-Za-z0-9+/=]{50,}/\1REDACTED/g' || true
 
 # Broad sweep: curl -u "admin:password" patterns
 find "${ARTIFACT_DIR}" -type f \( -name "*.log" -o -name "*.txt" \) -print0 \
-    | xargs -0 sed -i -E 's/-u "admin:[^"]*"/-u "admin:REDACTED"/g' 2>/dev/null || true
+    | xargs -0 sed -i -E 's/-u "admin:[^"]*"/-u "admin:REDACTED"/g' || true
 
 # Clean up empty files from failed log captures
-find "${ARTIFACT_DIR}" -type f -empty -delete 2>/dev/null || true
+find "${ARTIFACT_DIR}" -type f -empty -delete || true
 
 FILE_COUNT=$(find "${ARTIFACT_DIR}" -type f | wc -l)
 TOTAL_SIZE=$(du -sh "${ARTIFACT_DIR}" | cut -f1)
