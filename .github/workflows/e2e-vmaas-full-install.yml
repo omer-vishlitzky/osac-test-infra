@@ -369,7 +369,7 @@ jobs:
 
       - name: Gather artifacts
         if: always()
-        uses: osac-project/osac-test-infra/.github/actions/gather-artifacts@main
+        uses: ./.github/actions/gather-artifacts
         with:
           namespace: ${{ inputs.namespace }}
           kubeconfig-path: ${{ runner.temp }}/kubeconfig
