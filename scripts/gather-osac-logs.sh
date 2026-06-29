@@ -40,13 +40,14 @@ collect_namespace_logs() {
     oc get statefulsets -n "${ns}" -o wide > "${dir}/statefulsets.txt" 2>&1 || true
     for pod in $(oc get pods -n "${ns}" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null); do
         for container in $(oc get pod "${pod}" -n "${ns}" -o jsonpath='{.spec.containers[*].name}' 2>/dev/null); do
-            oc logs "${pod}" -n "${ns}" -c "${container}" > "${dir}/pod-${pod}-${container}.log" 2>&1 || true
-            oc logs "${pod}" -n "${ns}" -c "${container}" --previous > "${dir}/pod-${pod}-${container}-previous.log" 2>/dev/null || true
+            oc logs "${pod}" -n "${ns}" -c "${container}" > "${dir}/pod-${pod}-${container}.log" 2>&1 &
+            oc logs "${pod}" -n "${ns}" -c "${container}" --previous > "${dir}/pod-${pod}-${container}-previous.log" 2>/dev/null &
         done
         for container in $(oc get pod "${pod}" -n "${ns}" -o jsonpath='{.spec.initContainers[*].name}' 2>/dev/null); do
-            oc logs "${pod}" -n "${ns}" -c "${container}" > "${dir}/pod-${pod}-init-${container}.log" 2>&1 || true
+            oc logs "${pod}" -n "${ns}" -c "${container}" > "${dir}/pod-${pod}-init-${container}.log" 2>&1 &
         done
     done
+    wait
 }
 
 collect_namespace_logs "${E2E_NAMESPACE}" "${ARTIFACT_DIR}"
