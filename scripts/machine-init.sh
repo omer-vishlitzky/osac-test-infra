@@ -343,7 +343,7 @@ setup_cluster_tool() {
         if [[ -d "${CLUSTER_TOOL_DIR}" ]]; then
             git -C "${CLUSTER_TOOL_DIR}" pull --ff-only
         else
-            git clone https://github.com/omer-vishlitzky/cluster-tool.git "${CLUSTER_TOOL_DIR}"
+            git clone https://github.com/osac-project/cluster-tool.git "${CLUSTER_TOOL_DIR}"
         fi
         install -m 0755 "${CLUSTER_TOOL_DIR}/cluster-tool" "${CLUSTER_TOOL_BIN}"
         echo "    cluster-tool installed at ${CLUSTER_TOOL_BIN}"
@@ -573,7 +573,7 @@ echo ""
 echo "Next steps:"
 echo "  1. Set up Vault:     vault/scripts/vault-setup.sh"
 echo "  2. Install runners:  scripts/runners/action-runners-setup.sh <TOKEN> [NUM_RUNNERS]"
-echo "  3. Pull a flavor:    cluster-tool pull quay.io/rh-ee-ovishlit/cluster-flavors:vmaas-kustomize"
-echo "  4. Test a boot:      cluster-tool boot --flavor vmaas-kustomize --name test-1"
+echo "  3. Pull a flavor:    cluster-tool pull quay.io/osac-project/cluster-flavors:sno-4.19-x86_64"
+echo "  4. Test a boot:      cluster-tool boot --flavor sno-4.19-x86_64 --name test-1 --pull-secret /path/to/pull-secret.json"
 echo "  5. Verify cluster:   KUBECONFIG=~/.kube/test-1.kubeconfig oc get nodes"
 echo "  6. Clean up test:    cluster-tool destroy test-1"

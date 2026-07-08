@@ -142,7 +142,7 @@ As `github-runner`, pull the required cluster flavors:
 
 ```bash
 su - github-runner
-sudo python3 /usr/local/bin/cluster-tool pull quay.io/rh-ee-ovishlit/cluster-flavors:vmaas-helm
+sudo python3 /usr/local/bin/cluster-tool pull quay.io/osac-project/cluster-flavors:sno-4.19-x86_64
 ```
 
 This creates the `state.json` file that the e2e workflow checks during its preflight.
@@ -244,11 +244,9 @@ sudo bash scripts/runners/setup-runner-podman.sh
 
 ### QEMU machine type error on RHEL 10 / Fedora
 
-If `virsh define` fails with `unsupported machine type 'pc-i440fx-rhel7.6.0'`, update cluster-tool to the `fix-machine-type-detection` branch:
+If `virsh define` fails with `unsupported machine type 'pc-i440fx-rhel7.6.0'`, update cluster-tool to latest:
 
 ```bash
-sudo git -C /opt/cluster-tool remote add eliorerz https://github.com/eliorerz/cluster-tool.git 2>/dev/null || true
-sudo git -C /opt/cluster-tool fetch eliorerz fix-machine-type-detection
-sudo git -C /opt/cluster-tool checkout fix-machine-type-detection
+sudo git -C /opt/cluster-tool pull --ff-only
 sudo cp /opt/cluster-tool/cluster-tool /usr/local/bin/cluster-tool
 ```
