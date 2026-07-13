@@ -389,9 +389,16 @@ jobs:
           KUBELET_EOF
           echo "Waiting for MCP master to finish updating (node will reboot on SNO)..."
           oc wait --for=condition=Updated mcp/master --timeout=600s
-          echo "Waiting 180s for MCP to settle..."
-          sleep 180
-          echo "Cluster prerequisites applied."
+          echo "Waiting for API server to stabilize after MCP update..."
+          SECONDS=0
+          until oc get --raw /readyz &>/dev/null; do
+            if (( SECONDS > 300 )); then
+              echo "API server not ready after 300s"
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "Cluster prerequisites applied (API ready after ${SECONDS}s)."
 
       - name: Install infrastructure operators
         env:
