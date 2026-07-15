@@ -521,6 +521,11 @@ jobs:
               "${SET_ARGS[@]}" \
               --timeout 10m \
               --wait
+
+            echo "Waiting for rollout to complete..."
+            for deploy in $(oc get deploy -n "${INSTALLER_NAMESPACE}" -o name); do
+              oc rollout status "${deploy}" -n "${INSTALLER_NAMESPACE}" --timeout=300s
+            done
           fi
 
       - name: Run E2E tests
