@@ -12,6 +12,10 @@ inputs:
   pr-number:
     required: false
     default: ""
+  allowed-authors:
+    description: "Space-separated list of GitHub logins always authorized to run tests (e.g. bot accounts that cannot be org members)"
+    required: false
+    default: ""
 
 runs:
   using: composite
@@ -35,7 +39,18 @@ runs:
         PR_NUMBER: ${{ inputs.pr-number }}
         PR_REPO: ${{ github.repository }}
         GH_TOKEN: ${{ steps.vault-github.outputs.GH_ORG_TOKEN }}
+        ALLOWED_AUTHORS: ${{ inputs.allowed-authors }}
       run: |
+        echo "::group::Check allowed authors"
+        for allowed in ${ALLOWED_AUTHORS}; do
+          if [[ "${PR_AUTHOR}" == "${allowed}" ]]; then
+            echo "Fork PR authorized: '${PR_AUTHOR}' is in the allowed-authors list."
+            echo "::endgroup::"
+            exit 0
+          fi
+        done
+        echo "::endgroup::"
+
         echo "::group::Check ok-to-test label"
         LABELS_FILE="${RUNNER_TEMP}/labels.json"
         if [[ -n "${PR_NUMBER}" ]]; then
