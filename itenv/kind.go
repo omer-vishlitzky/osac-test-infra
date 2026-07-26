@@ -655,7 +655,7 @@ func (k *Kind) createKubeClientSet(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to create client set for kind cluster '%s': %w", k.name, err)
 	}
-	k.logger.DebugContext(ctx, "Created Kubernetes client")
+	k.logger.DebugContext(ctx, "Created Kubernetes client set")
 	return nil
 }
 

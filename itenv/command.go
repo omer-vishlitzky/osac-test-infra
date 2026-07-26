@@ -156,14 +156,14 @@ func (c *Command) Execute(ctx context.Context) error {
 	err := cmd.Run()
 	var attrs []slog.Attr
 	c.appendStateAttrs(cmd, &attrs)
-	if c.quiet && err != nil {
-		outText := outBuffer.String()
-		errText := errBuffer.String()
-		attrs = append(
-			attrs,
-			slog.String("stdout", outText),
-			slog.String("stderr", errText),
-		)
+	if err != nil {
+		if c.quiet {
+			attrs = append(
+				attrs,
+				slog.String("stdout", outBuffer.String()),
+				slog.String("stderr", errBuffer.String()),
+			)
+		}
 		logger.LogAttrs(ctx, slog.LevelDebug, "Command failed", attrs...)
 	} else if logger.Enabled(ctx, slog.LevelDebug) {
 		logger.LogAttrs(ctx, slog.LevelDebug, "Command succeeded", attrs...)
@@ -194,12 +194,14 @@ func (c *Command) Evaluate(ctx context.Context) (stdoutBytes, stderrBytes []byte
 	stderrBytes = errBuffer.Bytes()
 	var attrs []slog.Attr
 	c.appendStateAttrs(cmd, &attrs)
-	if c.quiet && err != nil {
-		attrs = append(
-			attrs,
-			slog.String("stdout", string(stdoutBytes)),
-			slog.String("stderr", string(stderrBytes)),
-		)
+	if err != nil {
+		if c.quiet {
+			attrs = append(
+				attrs,
+				slog.String("stdout", string(stdoutBytes)),
+				slog.String("stderr", string(stderrBytes)),
+			)
+		}
 		logger.LogAttrs(ctx, slog.LevelDebug, "Command failed", attrs...)
 	} else if logger.Enabled(ctx, slog.LevelDebug) {
 		logger.LogAttrs(ctx, slog.LevelDebug, "Command succeeded", attrs...)
