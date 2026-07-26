@@ -283,9 +283,11 @@ func (k *Kind) Stop(ctx context.Context) error {
 	if err != nil {
 		errs = append(errs, fmt.Errorf("failed to delete kind cluster '%s': %w", k.name, err))
 	}
-	err = os.Remove(k.kubeconfigFile)
-	if err != nil {
-		errs = append(errs, fmt.Errorf("failed to remove kubeconfig file '%s': %w", k.kubeconfigFile, err))
+	if k.kubeconfigFile != "" {
+		err = os.Remove(k.kubeconfigFile)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("failed to remove kubeconfig file '%s': %w", k.kubeconfigFile, err))
+		}
 	}
 	if len(errs) > 0 {
 		return fmt.Errorf("failed to stop kind cluster '%s': %v", k.name, errs)
@@ -775,7 +777,7 @@ func (k *Kind) InstallCa(ctx context.Context) (err error) {
 		return nil
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create or update CA secret: %w", err)
 	}
 
 	// Create or update the issuer:
@@ -796,7 +798,7 @@ func (k *Kind) InstallCa(ctx context.Context) (err error) {
 		return nil
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create or update CA issuer: %w", err)
 	}
 
 	// Create or update the bundle that will copy the CA certificate to all the namespaces:
@@ -843,7 +845,7 @@ func (k *Kind) InstallCa(ctx context.Context) (err error) {
 		return nil
 	})
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to create or update CA bundle: %w", err)
 	}
 	return nil
 }
@@ -889,6 +891,8 @@ func (k *Kind) InstallEnvoyGateway(ctx context.Context) (err error) {
 	k.logger.DebugContext(ctx, "Installing Envoy Gateway")
 	installCmd, err := NewCommand().
 		SetLogger(k.logger).
+		SetHome(k.home).
+		SetQuiet(k.quiet).
 		SetName(helmCmd).
 		SetArgs(
 			"install",
