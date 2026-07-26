@@ -142,7 +142,7 @@ func (c *Command) Execute(ctx context.Context) error {
 	)
 	outBuffer := &bytes.Buffer{}
 	errBuffer := &bytes.Buffer{}
-	cmd := exec.Command(c.name, c.args...)
+	cmd := exec.CommandContext(ctx, c.name, c.args...)
 	cmd.Dir = c.dir
 	cmd.Stdout = outBuffer
 	cmd.Stderr = errBuffer
@@ -178,7 +178,7 @@ func (c *Command) Evaluate(ctx context.Context) (stdoutBytes, stderrBytes []byte
 	)
 	outBuffer := &bytes.Buffer{}
 	errBuffer := &bytes.Buffer{}
-	cmd := exec.Command(c.name, c.args...)
+	cmd := exec.CommandContext(ctx, c.name, c.args...)
 	cmd.Dir = c.dir
 	cmd.Stdout = outBuffer
 	cmd.Stderr = errBuffer

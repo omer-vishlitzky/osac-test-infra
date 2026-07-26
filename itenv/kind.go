@@ -626,7 +626,10 @@ func (k *Kind) createKubeClient(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("failed to create REST config for kind cluster '%s': %w", k.name, err)
 	}
-	scheme := kubescheme.Scheme
+	scheme := runtime.NewScheme()
+	if err = kubescheme.AddToScheme(scheme); err != nil {
+		return fmt.Errorf("failed to add core types to scheme: %w", err)
+	}
 	for _, fn := range k.schemeFuncs {
 		if err = fn(scheme); err != nil {
 			return fmt.Errorf("failed to register scheme: %w", err)
