@@ -474,12 +474,14 @@ jobs:
             fi
           fi
 
+          AAP_PROJECT_OVERRIDE=""
           if [[ "${COMPONENT_IMAGE_KEY}" == "aap.bootstrap.image" && -n "${COMPONENT_REF_NAME:-}" ]]; then
             AAP_GIT_URI="https://github.com/${COMPONENT_REPO_NAME}"
             MERGED_OVERRIDES=$(echo "${MERGED_OVERRIDES}" | \
               jq -c --arg bk "aap.configAsCode.projectGitBranch" --arg bv "${COMPONENT_REF_NAME}" \
                     --arg uk "aap.configAsCode.projectGitUri" --arg uv "${AAP_GIT_URI}" \
                     '. + {($bk): $bv, ($uk): $uv}')
+            AAP_PROJECT_OVERRIDE="true"
             echo "AAP project override: branch=${COMPONENT_REF_NAME} uri=${AAP_GIT_URI}"
           fi
 
@@ -504,12 +506,27 @@ jobs:
 
             yq -i '(.dependencies[].version) = "0.0.0"' charts/osac/Chart.yaml
             helm dependency update charts/osac/
+
+            # When AAP project overrides are present, run WITH hooks so the
+            # bootstrap job re-runs and syncs the AAP project to the PR ref.
+            # Without this, --no-hooks updates the ConfigAsCode Secret but
+            # the bootstrap that reads it never executes, leaving AAP with
+            # the baseline playbooks instead of the PR's changes.
+            HOOK_ARGS=()
+            if [[ -n "${AAP_PROJECT_OVERRIDE}" ]]; then
+              echo "AAP project override detected — running upgrade with hooks"
+              oc delete job -n "${INSTALLER_NAMESPACE}" -l app.kubernetes.io/name=osac-aap \
+                --ignore-not-found 2>/dev/null || true
+            else
+              HOOK_ARGS=(--no-hooks)
+            fi
+
             helm upgrade osac charts/osac/ \
               --namespace "${INSTALLER_NAMESPACE}" \
               --reuse-values \
-              --no-hooks \
+              "${HOOK_ARGS[@]}" \
               "${SET_ARGS[@]}" \
-              --timeout 10m \
+              --timeout 15m \
               --wait
 
             echo "Waiting for rollout to complete..."
