@@ -1,0 +1,75 @@
+---
+name: Kind Dev Environment
+description: >
+  Create a Kind cluster with OSAC infrastructure using kind-dev/setup.sh from
+  osac-workspace. Single source of truth for Kind-based development and CI
+  environments across all OSAC component repos.
+
+inputs:
+  cluster-name:
+    description: Kind cluster name
+    default: osac-dev
+  mode:
+    description: >
+      Setup mode: skip-osac (cluster + infra: cert-manager, trust-manager,
+      envoy gateway, postgres, keycloak) or cluster-only (just Kind + CoreDNS)
+    default: skip-osac
+  osac-workspace-ref:
+    description: Git ref for osac-workspace checkout (kind-dev scripts)
+    default: main
+  fulfillment-service-ref:
+    description: Git ref for fulfillment-service checkout (postgres/keycloak charts)
+    default: main
+
+runs:
+  using: composite
+  steps:
+    - name: Install Kind
+      uses: helm/kind-action@v1
+      with:
+        install_only: true
+
+    - name: Install Helm
+      uses: azure/setup-helm@v4
+
+    - name: Ensure Python requests module
+      shell: bash
+      run: pip3 install --quiet requests
+
+    - name: Checkout osac-workspace (kind-dev)
+      uses: actions/checkout@v7
+      with:
+        repository: osac-project/osac-workspace
+        ref: ${{ inputs.osac-workspace-ref }}
+        path: _osac-workspace
+        sparse-checkout: kind-dev
+
+    - name: Checkout fulfillment-service (charts)
+      if: inputs.mode != 'cluster-only'
+      uses: actions/checkout@v7
+      with:
+        repository: osac-project/fulfillment-service
+        ref: ${{ inputs.fulfillment-service-ref }}
+        path: _osac-workspace/fulfillment-service
+        sparse-checkout: it/charts
+
+    - name: Run kind-dev setup
+      shell: bash
+      env:
+        CLUSTER_NAME: ${{ inputs.cluster-name }}
+      run: |
+        cd _osac-workspace
+        case "${{ inputs.mode }}" in
+          skip-osac)    ./kind-dev/setup.sh --skip-osac ;;
+          cluster-only) ./kind-dev/setup.sh --cluster-only ;;
+          *)            ./kind-dev/setup.sh ;;
+        esac
+
+    - name: Export KUBECONFIG
+      shell: bash
+      env:
+        CLUSTER_NAME: ${{ inputs.cluster-name }}
+      run: |
+        KUBECONFIG_PATH="${HOME}/.kube/${CLUSTER_NAME}-kind.kubeconfig"
+        echo "KUBECONFIG=${KUBECONFIG_PATH}" >> "$GITHUB_ENV"
+        echo "KIND_CLUSTER=${CLUSTER_NAME}" >> "$GITHUB_ENV"
