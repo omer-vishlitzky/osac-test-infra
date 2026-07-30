@@ -100,16 +100,41 @@ SUSHY_EMULATOR_BOOT_LOADER_MAP = {
 SEOF
 
 echo "Starting sushy-emulator on ${GW_IP}:${SUSHY_PORT}..."
-nohup sushy-emulator --config "${SUSHY_CONFIG_DIR}/sushy-emulator.conf" \
-  > "${SUSHY_CONFIG_DIR}/sushy.log" 2>&1 &
-echo $! > "${SUSHY_PID_FILE}"
-sleep 2
+SUSHY_MAX_ATTEMPTS=3
+for sushy_attempt in $(seq 1 "${SUSHY_MAX_ATTEMPTS}"); do
+  nohup sushy-emulator --config "${SUSHY_CONFIG_DIR}/sushy-emulator.conf" \
+    > "${SUSHY_CONFIG_DIR}/sushy.log" 2>&1 &
+  echo $! > "${SUSHY_PID_FILE}"
 
-if ! kill -0 "$(cat "${SUSHY_PID_FILE}")" 2>/dev/null; then
-  echo "ERROR: sushy-emulator failed to start. Log:" >&2
-  cat "${SUSHY_CONFIG_DIR}/sushy.log" >&2
-  exit 1
-fi
+  echo "  Waiting for sushy-emulator HTTP endpoint (attempt ${sushy_attempt}/${SUSHY_MAX_ATTEMPTS})..."
+  SUSHY_READY=false
+  for i in $(seq 1 15); do
+    if ! kill -0 "$(cat "${SUSHY_PID_FILE}")" 2>/dev/null; then
+      echo "  Process died. Log:"
+      cat "${SUSHY_CONFIG_DIR}/sushy.log"
+      break
+    fi
+    if curl -sf "http://${GW_IP}:${SUSHY_PORT}/redfish/v1/"; then
+      SUSHY_READY=true
+      break
+    fi
+    sleep 2
+  done
+
+  if [[ "${SUSHY_READY}" == "true" ]]; then
+    break
+  fi
+
+  echo "  sushy-emulator not responding, killing PID $(cat "${SUSHY_PID_FILE}")..."
+  kill "$(cat "${SUSHY_PID_FILE}")" 2>/dev/null || true
+  sleep 2
+
+  if [[ "${sushy_attempt}" -eq "${SUSHY_MAX_ATTEMPTS}" ]]; then
+    echo "ERROR: sushy-emulator failed after ${SUSHY_MAX_ATTEMPTS} attempts. Log:"
+    cat "${SUSHY_CONFIG_DIR}/sushy.log"
+    exit 1
+  fi
+done
 echo "sushy-emulator running (PID $(cat "${SUSHY_PID_FILE}"))."
 
 # --- Step 5: Create virtual BMH VMs ---
