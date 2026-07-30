@@ -114,7 +114,7 @@ for sushy_attempt in $(seq 1 "${SUSHY_MAX_ATTEMPTS}"); do
       cat "${SUSHY_CONFIG_DIR}/sushy.log"
       break
     fi
-    if curl -sf "http://${GW_IP}:${SUSHY_PORT}/redfish/v1/"; then
+    if curl -sf --connect-timeout 3 --max-time 5 "http://${GW_IP}:${SUSHY_PORT}/redfish/v1/"; then
       SUSHY_READY=true
       break
     fi
@@ -125,9 +125,14 @@ for sushy_attempt in $(seq 1 "${SUSHY_MAX_ATTEMPTS}"); do
     break
   fi
 
-  echo "  sushy-emulator not responding, killing PID $(cat "${SUSHY_PID_FILE}")..."
-  kill "$(cat "${SUSHY_PID_FILE}")" 2>/dev/null || true
-  sleep 2
+  SUSHY_PID=$(cat "${SUSHY_PID_FILE}")
+  echo "  sushy-emulator not responding, killing PID ${SUSHY_PID}..."
+  kill "${SUSHY_PID}" || true
+  for _ in $(seq 1 10); do
+    kill -0 "${SUSHY_PID}" 2>/dev/null || break
+    sleep 1
+  done
+  kill -9 "${SUSHY_PID}" || true
 
   if [[ "${sushy_attempt}" -eq "${SUSHY_MAX_ATTEMPTS}" ]]; then
     echo "ERROR: sushy-emulator failed after ${SUSHY_MAX_ATTEMPTS} attempts. Log:"
