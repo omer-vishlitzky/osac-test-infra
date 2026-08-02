@@ -22,13 +22,13 @@ on:
         required: false
         default: ""
       installer-ref:
-        description: "Branch/ref of osac-installer"
+        description: "Branch/ref of the OSAC monorepo"
         required: false
         default: "main"
       installer-repo:
-        description: "GitHub repo (owner/name) to clone osac-installer from"
+        description: "GitHub repo (owner/name) of the OSAC monorepo"
         required: false
-        default: "osac-project/osac-installer"
+        default: "osac-project/osac"
       image-overrides:
         description: "JSON mapping Helm value paths to image refs"
         required: false
@@ -53,7 +53,7 @@ jobs:
       test-suite: ${{ inputs.test-suite || 'vmaas' }}
       test-filter: ${{ inputs.test-filter || '' }}
       installer-ref: ${{ inputs.installer-ref || 'main' }}
-      installer-repo: ${{ inputs.installer-repo || 'osac-project/osac-installer' }}
+      installer-repo: ${{ inputs.installer-repo || 'osac-project/osac' }}
       image-overrides: ${{ inputs.image-overrides || '{}' }}
       osac-cli-version: ${{ inputs.osac-cli-version || '' }}
       runner-label: ${{ inputs.runner-label || 'osac-ci' }}

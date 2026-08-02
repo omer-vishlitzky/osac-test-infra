@@ -21,10 +21,6 @@ on:
         options:
           - all
           - osac-project/osac-test-infra
-          - osac-project/osac-aap
-          - osac-project/osac-installer
-          - osac-project/osac-operator
-          - osac-project/fulfillment-service
           - osac-project/osac
 
 concurrency:

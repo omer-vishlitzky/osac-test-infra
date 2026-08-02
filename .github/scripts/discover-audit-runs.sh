@@ -51,21 +51,6 @@ LOCAL_CALLERS=(
 # adds another suite). Intentionally hardcoded -- no code search -- so the
 # audit PAT can stay Actions-only.
 EXTERNAL_CALLERS=(
-  osac-project/osac-aap:e2e-vmaas-full-install.yml
-  osac-project/osac-aap:e2e-bmaas-full-install.yml
-  osac-project/osac-installer:e2e-vmaas-full-install.yml
-  osac-project/osac-installer:e2e-bmaas-full-install.yml
-  # Nightly wraps reusable e2e-vmaas-full-install; runs live under this
-  # caller file, not under e2e-vmaas-full-install.yml in installer.
-  osac-project/osac-installer:nightly-build.yaml
-  osac-project/osac-operator:e2e-vmaas-full-install.yml
-  osac-project/osac-operator:e2e-bmaas-full-install.yml
-  osac-project/fulfillment-service:e2e-vmaas-full-install.yml
-  osac-project/fulfillment-service:e2e-bmaas-full-install.yml
-  # fulfillment-service and osac-operator's e2e runs also happen here now
-  # (mono-repo merge, OSAC-1732) -- kept alongside their still-active
-  # standalone-repo entries above, not in place of them, since both repos
-  # keep running e2e until each one's own cutover/archive.
   osac-project/osac:e2e-vmaas-full-install.yml
   osac-project/osac:e2e-bmaas-full-install.yml
   osac-project/osac:e2e-caas-full-install.yml
@@ -75,10 +60,6 @@ EXTERNAL_CALLERS=(
 KNOWN_TARGET_REPOS=(
   all
   osac-project/osac-test-infra
-  osac-project/osac-aap
-  osac-project/osac-installer
-  osac-project/osac-operator
-  osac-project/fulfillment-service
   osac-project/osac
 )
 

@@ -50,10 +50,10 @@ on:
         type: string
         default: "main"
       installer-repo:
-        description: "GitHub repo (owner/name) to clone osac-installer from"
+        description: "GitHub repo (owner/name) of the OSAC monorepo"
         required: false
         type: string
-        default: "osac-project/osac-installer"
+        default: "osac-project/osac"
       test-infra-repository:
         description: "Repository to checkout for tests/Containerfile (for cross-repo calls)"
         required: false

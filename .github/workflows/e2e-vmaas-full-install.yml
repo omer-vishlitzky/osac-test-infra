@@ -50,10 +50,10 @@ on:
         type: string
         default: "main"
       installer-repo:
-        description: "GitHub repo (owner/name) to clone osac-installer from"
+        description: "GitHub repo (owner/name) of the OSAC monorepo"
         required: false
         type: string
-        default: "osac-project/osac-installer"
+        default: "osac-project/osac"
       test-infra-repository:
         description: "Repository to checkout for tests/Containerfile (for cross-repo calls)"
         required: false
@@ -70,38 +70,11 @@ on:
           '[{"repo":"osac-project/osac","ref":"my-branch","containerfile":"fulfillment-service/Containerfile","imageKey":"service.images.service"},{"repo":"osac-project/osac","ref":"my-branch","containerfile":"osac-operator/Containerfile","imageKey":"operator.image.repository"}]'.
           Each entry supports repo, ref, imageKey (required), and containerfile
           (default "Containerfile"), buildType ("containerfile" default, or "ansible-builder").
-          A single-repo caller passes one entry; a monorepo caller passes one entry per
-          component it wants built from the same checkout. Empty array (default) builds
-          nothing from source -- use image-overrides for pre-built images instead. Supersedes
-          the deprecated component-* inputs below.
+          Empty array (default) builds nothing from source -- use image-overrides for
+          pre-built images instead.
         required: false
         type: string
         default: "[]"
-      component-repo:
-        description: "DEPRECATED, use components instead. GitHub repo (owner/name) of a component to build from source. Requires component-ref and component-image-key."
-        required: false
-        type: string
-        default: ""
-      component-ref:
-        description: "DEPRECATED, use components instead. Branch or tag name of the component repository to build (must be a named ref, not a SHA)"
-        required: false
-        type: string
-        default: ""
-      component-image-key:
-        description: "DEPRECATED, use components instead. Helm value path for the component image (e.g. service.images.service)"
-        required: false
-        type: string
-        default: ""
-      component-containerfile:
-        description: "DEPRECATED, use components instead. Path to Containerfile (or execution-environment.yaml for ansible-builder) relative to component repo root"
-        required: false
-        type: string
-        default: "Containerfile"
-      component-build-type:
-        description: "DEPRECATED, use components instead. Build method: 'containerfile' (default) or 'ansible-builder'"
-        required: false
-        type: string
-        default: "containerfile"
       osac-cli-version:
         description: "OSAC CLI version for the test image (e.g. 0.0.73). Defaults to latest GitHub release."
         required: false
@@ -168,27 +141,8 @@ jobs:
         id: components
         env:
           COMPONENTS_JSON: ${{ inputs.components }}
-          LEGACY_COMPONENT_REPO: ${{ inputs.component-repo }}
-          LEGACY_COMPONENT_REF: ${{ inputs.component-ref }}
-          LEGACY_COMPONENT_IMAGE_KEY: ${{ inputs.component-image-key }}
-          LEGACY_COMPONENT_CONTAINERFILE: ${{ inputs.component-containerfile }}
-          LEGACY_COMPONENT_BUILD_TYPE: ${{ inputs.component-build-type }}
         run: |
           echo "::group::Resolve and validate components input"
-          # Backward compatibility: callers that haven't migrated off the
-          # deprecated single component-* inputs yet. Synthesize a one-entry
-          # components[] array from them so those callers keep working
-          # unchanged. Remove this once every caller uses `components`.
-          if { [[ -z "${COMPONENTS_JSON}" ]] || [[ "${COMPONENTS_JSON}" == "[]" ]]; } && [[ -n "${LEGACY_COMPONENT_REPO}" ]]; then
-            echo "Using deprecated component-* inputs as a single components[] entry."
-            COMPONENTS_JSON=$(jq -nc \
-              --arg repo "${LEGACY_COMPONENT_REPO}" \
-              --arg ref "${LEGACY_COMPONENT_REF}" \
-              --arg key "${LEGACY_COMPONENT_IMAGE_KEY}" \
-              --arg file "${LEGACY_COMPONENT_CONTAINERFILE:-Containerfile}" \
-              --arg type "${LEGACY_COMPONENT_BUILD_TYPE:-containerfile}" \
-              '[{"repo":$repo,"ref":$ref,"imageKey":$key,"containerfile":$file,"buildType":$type}]')
-          fi
 
           if ! echo "${COMPONENTS_JSON}" | jq -e 'type == "array"' >/dev/null; then
             echo "::error::components must be a JSON array"
@@ -386,8 +340,7 @@ jobs:
             # "fulfillment-service/Containerfile" from a monorepo checkout),
             # everything about this component -- build context, go.mod,
             # cmd/, CRDs -- lives under that subdirectory, not at the
-            # checkout root. Mirrors the same scoping in
-            # replace-installer-submodule.sh.
+            # checkout root.
             build_dir="${src}"
             containerfile_name="${file}"
             if [[ "${file}" == */* ]]; then
@@ -497,22 +450,30 @@ jobs:
           export PATH="${TOOL_DIR}:${PATH}"
           echo "${TOOL_DIR}" >> "$GITHUB_PATH"
 
-          # Clone osac-installer (reused by the next step)
+          # Clone the OSAC monorepo for installer charts.  When components
+          # were built from source earlier in this job, pin to the same
+          # commit SHA — the branch may have moved since the component
+          # clone, and a second git-clone at the branch name would race.
           INSTALLER_CLONE_DIR="$RUNNER_TEMP/osac-installer-clone"
-          git clone --recurse-submodules --depth 1 --branch "${INSTALLER_REF}" \
-            "https://github.com/${INSTALLER_REPO}.git" "${INSTALLER_CLONE_DIR}"
-          # Resolved commit, not just installer-ref -- compared below against each
-          # component's own resolved commit, since two clones of the same moving
-          # branch, done at different points in the job, can't be proven identical
-          # by ref name alone.
-          INSTALLER_SHA=$(git -C "${INSTALLER_CLONE_DIR}" rev-parse HEAD)
+          PINNED_SHA=$(echo "${COMPONENT_BUILD_RESULTS:-[]}" | jq -r '.[0].sha // empty')
 
-          # Once osac-installer is merged into a mono-repo (osac-project/osac),
-          # the actual installer content (Makefile, charts/, values/) lives one
-          # level down at osac-installer/, not at the clone root. Detected by
-          # directory presence rather than assumed from installer-repo's name,
-          # so this keeps working for both the standalone osac-installer repo
-          # and a mono-repo checkout without needing to know which in advance.
+          if [[ -n "${PINNED_SHA}" ]]; then
+            echo "Cloning installer at component-resolved commit (${PINNED_SHA})."
+            git init "${INSTALLER_CLONE_DIR}"
+            git -C "${INSTALLER_CLONE_DIR}" fetch --depth 1 \
+              "https://github.com/${INSTALLER_REPO}.git" "${PINNED_SHA}"
+            git -C "${INSTALLER_CLONE_DIR}" checkout FETCH_HEAD
+            if [[ -f "${INSTALLER_CLONE_DIR}/.gitmodules" ]]; then
+              git -C "${INSTALLER_CLONE_DIR}" submodule update --init --recursive --depth 1
+            fi
+          else
+            git clone --recurse-submodules --depth 1 --branch "${INSTALLER_REF}" \
+              "https://github.com/${INSTALLER_REPO}.git" "${INSTALLER_CLONE_DIR}"
+          fi
+
+          # The actual installer content (Makefile, charts/, values/) lives one
+          # level down at osac-installer/ in the monorepo. Detected by directory
+          # presence rather than assumed from installer-repo's name.
           if [[ -d "${INSTALLER_CLONE_DIR}/osac-installer" ]]; then
             INSTALLER_DIR="${INSTALLER_CLONE_DIR}/osac-installer"
           else
@@ -520,36 +481,6 @@ jobs:
           fi
           echo "INSTALLER_DIR=${INSTALLER_DIR}" >> "$GITHUB_ENV"
           cd "${INSTALLER_DIR}"
-
-          COUNT=$(echo "${COMPONENT_BUILD_RESULTS:-[]}" | jq 'length')
-          for i in $(seq 0 $((COUNT - 1))); do
-            repo=$(echo "${COMPONENT_BUILD_RESULTS}" | jq -r ".[$i].repo")
-            ref=$(echo "${COMPONENT_BUILD_RESULTS}" | jq -r ".[$i].ref")
-            sha=$(echo "${COMPONENT_BUILD_RESULTS}" | jq -r ".[$i].sha")
-            file=$(echo "${COMPONENT_BUILD_RESULTS}" | jq -r ".[$i].containerfile")
-
-            # A component built from the same repo as the installer is already
-            # a sibling directory inside this exact clone -- osac-installer's
-            # own chart dependency paths resolve straight to it, no splice
-            # needed. Only components that are still genuinely separate repos
-            # (e.g. osac-ui) need their source spliced into base/. Compared by
-            # resolved commit, not ref name: the component was cloned earlier
-            # in this job and the installer just now, so if the branch moved
-            # in between, matching ref strings could still mean different
-            # commits.
-            if [[ "${repo}" == "${INSTALLER_REPO}" ]]; then
-              if [[ "${sha}" != "${INSTALLER_SHA}" ]]; then
-                echo "::error::Component ${repo}@${ref} (commit ${sha}) shares the installer's repo, but the installer clone (installer-ref ${INSTALLER_REF}) resolved to a different commit (${INSTALLER_SHA}). Skipping the splice would silently test the wrong installer state -- pass a matching installer-ref (usually the same PR ref) and retry." >&2
-                exit 1
-              fi
-              echo "Component ${repo}@${ref} (${file}) shares this installer's own checkout at the same commit (${sha}) -- skipping splice."
-              continue
-            fi
-
-            COMPONENT_REPO_NAME="${repo}" COMPONENT_REF_NAME="${ref}" \
-              bash "${GITHUB_WORKSPACE}/.github/scripts/replace-installer-submodule.sh" \
-              "${INSTALLER_DIR}" "$RUNNER_TEMP/component-${i}-src" "${file}"
-          done
 
           # OLM Subscriptions need a working CatalogSource to resolve operators.
           # After snapshot boot the marketplace pods may still be reconnecting.
