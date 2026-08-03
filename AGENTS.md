@@ -57,6 +57,7 @@ osac-test-infra/
 │   ├── storage/        # Tenant storage lifecycle
 │   ├── catalog/        # CatalogItem lifecycle
 │   ├── bmaas/          # BareMetalInstance lifecycle
+│   │                   # Cross-cutting concern fixtures live in tests/conftest.py
 │   └── core/           # Client wrappers, helpers, runner primitives
 ├── Makefile            # Build targets: test, lint, format, test-<suite>, plus infra orchestration
 ├── Containerfile       # UBI9 + oc/kubectl/grpcurl/osac CLI
@@ -372,6 +373,25 @@ grpc_output = grpc.get_compute_instance(ci_id=ci_uuid)
 
 # Compare field values (parse cli_output as needed)
 ```
+
+## Cross-Cutting Concern Testing
+
+Features like metering, storage, networking, and catalog span multiple domains. Use the **composable fixture pattern** instead of duplicating verification logic:
+
+1. **Verifier class** in `tests/core/<concern>.py`
+2. **Fixture + marker** in `tests/conftest.py`
+3. **Tests inject the fixture** + add `@pytest.mark.<concern>` marker
+
+```python
+@pytest.mark.metering
+def test_vm_lifecycle(grpc, cli, k8s_hub_client, default_subnet, metering):
+    uuid = cli.create_compute_instance(...)
+    metering.expect("osac.resource.created.v1", resource_id=uuid)
+    # ... lifecycle ...
+    # metering.verify() runs on fixture teardown
+```
+
+Tests fail fast when concern infra is missing (e.g., `METERING_ADAPTER_URL` not set). Use `pytest -m "not metering"` to exclude metering tests when the test adapter is unavailable.
 
 ## Security & Secrets
 

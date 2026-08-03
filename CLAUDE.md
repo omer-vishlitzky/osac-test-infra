@@ -118,6 +118,58 @@ All state transitions use polling utilities (`poll_until` in `tests/core/runner.
 
 All gRPC calls use insecure connections (`-insecure` flag) and require Bearer token authentication; the token is bound to the `GRPCClient` instance at construction (see the `grpc`/`jwt_grpc_tenant*` fixtures), not passed per call.
 
+## Cross-Cutting Concern Testing
+
+OSAC features like metering, storage, networking, and catalog span multiple domains (VMaaS, CaaS, BMaaS). Instead of duplicating verification logic, we use a **composable fixture pattern**:
+
+### Pattern
+
+1. **Verifier class** in `tests/core/<concern>.py` — encapsulates the verification logic (e.g., HTTP client for metering, PV checker for storage)
+2. **Fixture + marker** in `tests/conftest.py` — lifecycle management (start/yield/verify/stop) + `@pytest.mark.<concern>` for filtering + fail-fast when infrastructure is missing
+3. **Tests inject the fixture** — any test in any domain can add the concern by requesting the fixture and registering expectations
+
+### Example: Metering
+
+```python
+@pytest.mark.metering
+def test_compute_instance_lifecycle(grpc, cli, k8s_hub_client, default_subnet, metering):
+    uuid = cli.create_compute_instance(...)
+    metering.expect("osac.resource.created.v1", resource_id=uuid)
+
+    # ... normal lifecycle test ...
+
+    cli.delete_compute_instance(uuid=uuid)
+    metering.expect("osac.resource.deleted.v1", resource_id=uuid)
+    # metering.verify() runs automatically on fixture teardown
+```
+
+### Filtering and skipping
+
+```bash
+pytest -m metering tests/           # only metering-annotated tests
+pytest -m "not metering" tests/     # skip all metering tests
+pytest -m "metering and storage"    # tests with both concerns
+```
+
+Tests **fail fast** when concern infrastructure is missing (e.g., no `METERING_ADAPTER_URL` → pytest fails at collection). Use `-m "not metering"` to exclude when the test adapter is unavailable.
+
+### Adding a new concern
+
+1. Create `tests/core/<concern>.py` with a collector/verifier class
+2. Add fixture + marker + skip logic in `tests/conftest.py`
+3. Inject the fixture into any test that should verify the concern
+
+### Directory structure
+
+```
+tests/
+  conftest.py           # Concern fixtures, markers, conditional skips (alongside session fixtures)
+  core/
+    metering.py         # MeteringCollector (HTTP client + expect/verify)
+  vmaas/                # Tests inject metering fixture here
+  caas/                 # Same pattern when CaaS metering arrives
+```
+
 ## Error Handling
 
 - Pytest fixtures handle cleanup via teardown hooks
