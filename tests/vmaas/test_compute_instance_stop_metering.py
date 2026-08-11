@@ -49,11 +49,7 @@ def test_compute_instance_stop_metering(
     metering.expect("osac.resource.started.v1", resource_id=uuid)
     metering.verify()
 
-    # Stop the VM by patching runStrategy to Halted
-    _, rc = k8s_hub_client.patch(
-        resource="computeinstance", name=ci_name, patch='{"spec":{"runStrategy":"Halted"}}'
-    )
-    assert rc == 0, "runStrategy patch to Halted should succeed"
+    grpc.update_compute_instance_run_strategy(ci_id=uuid, run_strategy="Halted")
 
     vm_ns: str = k8s_hub_client.get_compute_instance_vm_namespace(name=ci_name)
     poll_until(
