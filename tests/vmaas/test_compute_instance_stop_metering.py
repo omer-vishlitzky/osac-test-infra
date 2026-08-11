@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from datetime import UTC, datetime
 
 import pytest
@@ -79,13 +80,16 @@ def test_compute_instance_stop_metering(
     )
 
     # Verify heartbeats stop after VM becomes non-billable.
-    # Record timestamp after suspended.v1 is confirmed, then wait and assert
-    # no heartbeat events appear for this resource.
-    stop_confirmed_at = datetime.now(UTC).isoformat()
+    # The heartbeat generator queries the projection DB, which is updated
+    # after the Kafka publish (publishAndUpsert). One more heartbeat sweep
+    # may fire against the stale projection. Wait past one full heartbeat
+    # interval so in-flight heartbeats drain, then assert silence.
+    time.sleep(90)
+    no_more_after = datetime.now(UTC).isoformat()
     metering.assert_no_events(
         "osac.resource.heartbeat.v1",
         resource_id=uuid,
-        since=stop_confirmed_at,
+        since=no_more_after,
         within=90,
     )
 
