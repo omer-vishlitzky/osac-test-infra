@@ -9,6 +9,7 @@ on:
       - 'LICENSE'
       - '*.md'
       - 'docs/**'
+  merge_group:
   schedule:
     - cron: "0 */12 * * *"
   workflow_dispatch:
@@ -62,3 +63,13 @@ jobs:
       fork-pr-author: ${{ github.event.pull_request.head.repo.fork && github.event.pull_request.user.login || '' }}
       pr-number: ${{ github.event.pull_request.number }}
       notify-on-failure: ${{ github.event_name == 'schedule' }}
+
+  e2e-vmaas-gate:
+    if: always()
+    needs: [e2e-vmaas-full-install]
+    runs-on: ubuntu-latest
+    steps:
+      - if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: |
+          echo "e2e-vmaas-full-install: ${{ needs.e2e-vmaas-full-install.result }}"
+          exit 1

@@ -4,6 +4,7 @@ name: E2E CaaS Full Install
 on:
   pull_request:
     branches: [main]
+  merge_group:
   schedule:
     - cron: "0 */4 * * *"
   workflow_dispatch:
@@ -56,3 +57,13 @@ jobs:
       fork-pr-author: ${{ github.event.pull_request.head.repo.fork && github.event.pull_request.user.login || '' }}
       pr-number: ${{ github.event.pull_request.number }}
       notify-on-failure: ${{ github.event_name == 'schedule' }}
+
+  e2e-caas-gate:
+    if: always()
+    needs: [e2e-caas-full-install]
+    runs-on: ubuntu-latest
+    steps:
+      - if: contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')
+        run: |
+          echo "e2e-caas-full-install: ${{ needs.e2e-caas-full-install.result }}"
+          exit 1

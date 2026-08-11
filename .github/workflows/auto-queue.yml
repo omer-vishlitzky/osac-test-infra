@@ -1,0 +1,61 @@
+---
+name: auto-queue
+
+on:
+  pull_request_target:
+    types: [opened, reopened, ready_for_review, synchronize, labeled, unlabeled]
+    branches: [main]
+
+jobs:
+  enable-auto-merge:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check repo collaborator
+        id: org-check
+        env:
+          GH_TOKEN: ${{ secrets.MERGE_QUEUE_TOKEN }}
+        run: |
+          author="${{ github.event.pull_request.user.login }}"
+          echo "author=$author"
+          echo "draft=${{ github.event.pull_request.draft }}"
+          if gh api "repos/${{ github.repository }}/collaborators/$author"; then
+            echo "org_member=true"
+            echo "org_member=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "org_member=false"
+            echo "org_member=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check blocking labels
+        if: steps.org-check.outputs.org_member == 'true'
+        id: label-check
+        env:
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          echo "labels=$LABELS"
+          blocked=false
+          for label in "do-not-merge/hold" "needs-rebase"; do
+            if echo "$LABELS" | jq -e "index(\"$label\")" > /dev/null; then
+              echo "Blocking label found: $label"
+              blocked=true
+            fi
+          done
+          echo "blocked=$blocked"
+          echo "blocked=$blocked" >> "$GITHUB_OUTPUT"
+
+      - name: Enable auto-merge
+        if: >-
+          github.event.pull_request.draft == false
+          && steps.org-check.outputs.org_member == 'true'
+          && steps.label-check.outputs.blocked == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.MERGE_QUEUE_TOKEN }}
+        run: gh pr merge ${{ github.event.pull_request.number }} --repo ${{ github.repository }} --auto --rebase
+
+      - name: Disable auto-merge
+        if: >-
+          steps.org-check.outputs.org_member == 'true'
+          && steps.label-check.outputs.blocked == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.MERGE_QUEUE_TOKEN }}
+        run: gh pr merge ${{ github.event.pull_request.number }} --repo ${{ github.repository }} --disable-auto
