@@ -672,6 +672,25 @@ jobs:
           AGENT_VM_STORAGE_DIR="/data/osac-storage" \
               bash "${INSTALLER_DIR}/scripts/setup-caas-agents.sh"
 
+      - name: Create test adapter route for metering tests
+        id: metering-adapter
+        env:
+          KUBECONFIG: ${{ runner.temp }}/kubeconfig
+        shell: bash
+        run: |
+          NS="${{ inputs.namespace || env.INSTALLER_NAMESPACE }}"
+          SVC_NAME=$(oc get svc -n "${NS}" -l app.kubernetes.io/component=echo-adapter -o jsonpath='{.items[0].metadata.name}')
+          if [ -z "${SVC_NAME}" ]; then
+            echo "::error::No echo-adapter Service found in namespace ${NS} — metering test adapter not deployed"
+            exit 1
+          fi
+          oc expose "svc/${SVC_NAME}" -n "${NS}" --name=metering-test-adapter
+          ROUTE_HOST=$(oc get route metering-test-adapter -n "${NS}" -o jsonpath='{.spec.host}')
+          if [ -z "${ROUTE_HOST}" ]; then
+            echo "::error::Metering test adapter route not available — metering tests will fail"
+            exit 1
+          fi
+          echo "url=http://${ROUTE_HOST}" >> "$GITHUB_OUTPUT"
       - name: Run E2E tests
         id: test
         env:
@@ -680,6 +699,7 @@ jobs:
           OSAC_NAMESPACE: ${{ inputs.namespace }}
           OSAC_CLUSTER_TEMPLATE: ${{ inputs.cluster-template }}
           E2E_IMAGE: "osac-e2e-tests:${{ github.run_id }}"
+          METERING_ADAPTER_URL: ${{ steps.metering-adapter.outputs.url }}
         run: |
           KUBECONFIG_PATH="$RUNNER_TEMP/kubeconfig"
 
@@ -708,6 +728,7 @@ jobs:
             -e OSAC_NAMESPACE="${OSAC_NAMESPACE}" \
             -e OSAC_CLUSTER_TEMPLATE="${OSAC_CLUSTER_TEMPLATE}" \
             -e OSAC_PULL_SECRET_PATH=/root/pull-secret \
+            -e METERING_ADAPTER_URL="${METERING_ADAPTER_URL}" \
             "${E2E_IMAGE}" \
             pytest ${TEST_ARGS} ${FILTER_ARGS} \
               --junitxml=/tmp/test-output/junit.xml -v
