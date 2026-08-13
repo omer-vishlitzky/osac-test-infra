@@ -419,6 +419,7 @@ jobs:
           INSTALLER_REF: ${{ inputs.installer-ref }}
           INSTALLER_REPO: ${{ inputs.installer-repo }}
         run: |
+          set -o pipefail
           if ! command -v helm &>/dev/null; then
             curl --retry 5 --retry-delay 2 -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
           fi

@@ -295,6 +295,7 @@ jobs:
           INSTALLER_REPO: ${{ inputs.installer-repo }}
           IMAGE_OVERRIDES: ${{ inputs.image-overrides }}
         run: |
+          set -o pipefail
           # --- Wait for KubeVirt ---
           echo "Waiting for KubeVirt to be Available..."
           for attempt in $(seq 1 60); do

@@ -6,6 +6,7 @@ ARG OSAC_CLI_BIN=""
 
 RUN dnf install -y python3.11 python3.11-pip make jq openssh-clients && dnf clean all
 
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 RUN curl --retry 5 --retry-delay 2 -Lsf "https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/stable/openshift-client-linux.tar.gz" \
     | tar xz --no-same-owner -C /usr/local/bin oc kubectl
 
