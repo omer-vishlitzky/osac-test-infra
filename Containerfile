@@ -6,12 +6,12 @@ ARG OSAC_CLI_BIN=""
 
 RUN dnf install -y python3.11 python3.11-pip make jq openssh-clients && dnf clean all
 
-RUN curl -Lsf "https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/stable/openshift-client-linux.tar.gz" \
+RUN curl --retry 5 --retry-delay 2 -Lsf "https://mirror.openshift.com/pub/openshift-v4/x86_64/clients/ocp/stable/openshift-client-linux.tar.gz" \
     | tar xz --no-same-owner -C /usr/local/bin oc kubectl
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
-RUN curl -Lsf "https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VERSION}/grpcurl_${GRPCURL_VERSION}_linux_x86_64.tar.gz" \
+RUN curl --retry 5 --retry-delay 2 -Lsf "https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VERSION}/grpcurl_${GRPCURL_VERSION}_linux_x86_64.tar.gz" \
     | tar xz --no-same-owner -C /usr/local/bin grpcurl
 
 COPY ${OSAC_CLI_BIN:-.dockerignore} /tmp/osac-cli-candidate
@@ -24,16 +24,16 @@ RUN set -euo pipefail; \
     else \
       rm -f /tmp/osac-cli-candidate; \
       if [ -z "${OSAC_VERSION}" ]; then \
-        OSAC_TAG=$(curl -Lsf "https://api.github.com/repos/osac-project/osac/releases?per_page=100" | jq -r '[.[] | select(.tag_name | test("^fulfillment-service/v[0-9]+\\.[0-9]+\\.[0-9]+$"))][0].tag_name // empty'); \
+        OSAC_TAG=$(curl --retry 5 --retry-delay 2 -Lsf "https://api.github.com/repos/osac-project/osac/releases?per_page=100" | jq -r '[.[] | select(.tag_name | test("^fulfillment-service/v[0-9]+\\.[0-9]+\\.[0-9]+$"))][0].tag_name // empty'); \
         [ -n "${OSAC_TAG}" ] || { echo "ERROR: no fulfillment-service release (fulfillment-service/vX.Y.Z tag) found on osac-project/osac"; exit 1; }; \
         OSAC_VERSION="${OSAC_TAG#fulfillment-service/v}"; \
         echo "Resolved latest OSAC CLI version: ${OSAC_VERSION}"; \
       else \
         OSAC_TAG="fulfillment-service/v${OSAC_VERSION}"; \
       fi; \
-      curl -Lsfo /usr/local/bin/osac "https://github.com/osac-project/osac/releases/download/${OSAC_TAG}/osac_Linux_x86_64" \
+      curl --retry 5 --retry-delay 2 -Lsfo /usr/local/bin/osac "https://github.com/osac-project/osac/releases/download/${OSAC_TAG}/osac_Linux_x86_64" \
         || { echo "ERROR: osac binary download failed"; exit 1; }; \
-      curl -Lsfo /tmp/checksums.txt "https://github.com/osac-project/osac/releases/download/${OSAC_TAG}/osac_${OSAC_VERSION}_checksums.txt" \
+      curl --retry 5 --retry-delay 2 -Lsfo /tmp/checksums.txt "https://github.com/osac-project/osac/releases/download/${OSAC_TAG}/osac_${OSAC_VERSION}_checksums.txt" \
         || { echo "ERROR: checksums file download failed"; exit 1; }; \
       line="$(grep -E '[[:space:]]osac_Linux_x86_64$' /tmp/checksums.txt || true)"; \
       [ -n "$line" ] || { echo "ERROR: osac_Linux_x86_64 entry not found in checksums file"; exit 1; }; \

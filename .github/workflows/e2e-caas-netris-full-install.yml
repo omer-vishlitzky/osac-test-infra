@@ -426,6 +426,8 @@ jobs:
           IMAGE_OVERRIDES="{}"
           NODE_NAME=$(oc get nodes -o jsonpath='{.items[0].metadata.name}')
 
+          declare -A REPO_PINNED_SHA
+
           for i in $(seq 0 $((COUNT - 1))); do
             repo=$(echo "${COMPONENTS_JSON}" | jq -r ".[$i].repo")
             ref=$(echo "${COMPONENTS_JSON}" | jq -r ".[$i].ref")
@@ -438,7 +440,18 @@ jobs:
             src="$RUNNER_TEMP/component-${i}-src"
 
             echo "::group::Build component[$i]: ${repo}@${ref} (${file})"
-            git clone --depth 1 --branch "${ref}" "https://github.com/${repo}.git" "${src}"
+            if [[ -n "${REPO_PINNED_SHA[$repo]:-}" ]]; then
+              sha="${REPO_PINNED_SHA[$repo]}"
+              echo "Cloning ${repo} at pinned SHA ${sha} (first clone resolved this from ref '${ref}')."
+              git init "${src}"
+              git -C "${src}" fetch --depth 1 "https://github.com/${repo}.git" "${sha}"
+              git -C "${src}" checkout FETCH_HEAD
+            else
+              git clone --depth 1 --branch "${ref}" "https://github.com/${repo}.git" "${src}"
+              sha=$(git -C "${src}" rev-parse HEAD)
+              REPO_PINNED_SHA[$repo]="${sha}"
+              echo "Pinned ${repo} to SHA ${sha} (resolved from ref '${ref}')."
+            fi
 
             # Derive component_dir (for CLI build, CRD discovery) from
             # the containerfile path, and build_context (for podman build)

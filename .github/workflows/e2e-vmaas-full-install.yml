@@ -321,6 +321,13 @@ jobs:
           # 'podman load' via oc debug makes the image available to the kubelet.
           NODE_NAME=$(oc get nodes -o jsonpath='{.items[0].metadata.name}')
 
+          # Track the resolved SHA per repo so every component from the same
+          # repo is built from the exact same commit.  This eliminates two
+          # race conditions: (1) merge-queue branches being deleted between
+          # sequential clones, and (2) main advancing between clones, which
+          # produces divergent SHAs and fails the installer-pin check.
+          declare -A REPO_PINNED_SHA
+
           for i in $(seq 0 $((COUNT - 1))); do
             repo=$(echo "${COMPONENTS_JSON}" | jq -r ".[$i].repo")
             ref=$(echo "${COMPONENTS_JSON}" | jq -r ".[$i].ref")
@@ -333,11 +340,18 @@ jobs:
             src="$RUNNER_TEMP/component-${i}-src"
 
             echo "::group::Build component[$i]: ${repo}@${ref} (${file})"
-            git clone --depth 1 --branch "${ref}" "https://github.com/${repo}.git" "${src}"
-            # Resolved commit, not just the ref name -- a branch can move between
-            # this clone and the installer's own clone later in the job, so
-            # comparing ref strings alone can't prove they're the same commit.
-            sha=$(git -C "${src}" rev-parse HEAD)
+            if [[ -n "${REPO_PINNED_SHA[$repo]:-}" ]]; then
+              sha="${REPO_PINNED_SHA[$repo]}"
+              echo "Cloning ${repo} at pinned SHA ${sha} (first clone resolved this from ref '${ref}')."
+              git init "${src}"
+              git -C "${src}" fetch --depth 1 "https://github.com/${repo}.git" "${sha}"
+              git -C "${src}" checkout FETCH_HEAD
+            else
+              git clone --depth 1 --branch "${ref}" "https://github.com/${repo}.git" "${src}"
+              sha=$(git -C "${src}" rev-parse HEAD)
+              REPO_PINNED_SHA[$repo]="${sha}"
+              echo "Pinned ${repo} to SHA ${sha} (resolved from ref '${ref}')."
+            fi
 
             # Derive component_dir (for CLI build, CRD discovery) from
             # the containerfile path, and build_context (for podman build)
@@ -426,14 +440,14 @@ jobs:
           set -o pipefail
           # Ensure helm, yq, and grpcurl are available
           if ! command -v helm &>/dev/null; then
-            curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+            curl --retry 5 --retry-delay 2 -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
           fi
           TOOL_DIR="${RUNNER_TEMP}/bin"
           mkdir -p "${TOOL_DIR}"
           if ! command -v yq &>/dev/null; then
             YQ_VERSION="v4.53.3"
             YQ_SHA256="fa52a4e758c63d38299163fbdd1edfb4c4963247918bf9c1c5d31d84789eded4"
-            curl -fsSL -o "${TOOL_DIR}/yq" \
+            curl --retry 5 --retry-delay 2 -fsSL -o "${TOOL_DIR}/yq" \
               "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64"
             echo "${YQ_SHA256}  ${TOOL_DIR}/yq" | sha256sum -c -
             chmod +x "${TOOL_DIR}/yq"
@@ -442,14 +456,14 @@ jobs:
             GRPCURL_VERSION="1.9.1"
             GRPCURL_TARBALL="grpcurl_${GRPCURL_VERSION}_linux_x86_64.tar.gz"
             GRPCURL_ARCHIVE="${RUNNER_TEMP}/${GRPCURL_TARBALL}"
-            curl -fsSL -o "${GRPCURL_ARCHIVE}" \
+            curl --retry 5 --retry-delay 2 -fsSL -o "${GRPCURL_ARCHIVE}" \
               "https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VERSION}/${GRPCURL_TARBALL}"
             # grpcurl publishes one combined checksums.txt per release (no
             # per-asset .sha256), unlike yq above -- fetch it and verify
             # against the matching line, rewriting the filename to the
             # archive's actual local path so sha256sum -c can find it
             # regardless of cwd.
-            curl -fsSL "https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VERSION}/grpcurl_${GRPCURL_VERSION}_checksums.txt" \
+            curl --retry 5 --retry-delay 2 -fsSL "https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VERSION}/grpcurl_${GRPCURL_VERSION}_checksums.txt" \
               | grep " ${GRPCURL_TARBALL}\$" \
               | sed "s|${GRPCURL_TARBALL}|${GRPCURL_ARCHIVE}|" \
               | sha256sum -c -
@@ -548,6 +562,7 @@ jobs:
             image_key=$(echo "${COMPONENT_BUILD_RESULTS}" | jq -r ".[$i].imageKey")
             repo=$(echo "${COMPONENT_BUILD_RESULTS}" | jq -r ".[$i].repo")
             ref=$(echo "${COMPONENT_BUILD_RESULTS}" | jq -r ".[$i].ref")
+            sha=$(echo "${COMPONENT_BUILD_RESULTS}" | jq -r ".[$i].sha")
 
             if [[ "${image_key}" == *.repository ]]; then
               # Split "localhost/component-N-pr:RUN_ID" into repo + tag
@@ -568,15 +583,16 @@ jobs:
               echo "Component[$i] image override: ${image_key}=${image}"
             fi
 
-            # When testing an osac-aap PR, also override the AAP project SCM
-            # branch/URI so the project syncs to the PR ref during bootstrap.
+            # Override AAP project SCM to the resolved commit SHA (not the
+            # branch name) so the project sync survives ephemeral refs like
+            # merge-queue branches that GitHub deletes after merge/dequeue.
             if [[ "${image_key}" == "aap.bootstrap.image" ]]; then
               aap_git_uri="https://github.com/${repo}"
               MERGED_OVERRIDES=$(echo "${MERGED_OVERRIDES}" | \
-                jq -c --arg bk "aap.configAsCode.projectGitBranch" --arg bv "${ref}" \
+                jq -c --arg bk "aap.configAsCode.projectGitBranch" --arg bv "${sha}" \
                       --arg uk "aap.configAsCode.projectGitUri" --arg uv "${aap_git_uri}" \
                       '. + {($bk): $bv, ($uk): $uv}')
-              echo "Component[$i] AAP project override: branch=${ref} uri=${aap_git_uri}"
+              echo "Component[$i] AAP project override: sha=${sha} uri=${aap_git_uri}"
             fi
 
             # ansible.controller.execution_environment's own `pull` field
