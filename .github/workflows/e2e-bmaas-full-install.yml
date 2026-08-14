@@ -537,7 +537,6 @@ jobs:
             image=$(echo "${COMPONENT_BUILD_RESULTS}" | jq -r ".[$i].image")
             image_key=$(echo "${COMPONENT_BUILD_RESULTS}" | jq -r ".[$i].imageKey")
             repo=$(echo "${COMPONENT_BUILD_RESULTS}" | jq -r ".[$i].repo")
-            ref=$(echo "${COMPONENT_BUILD_RESULTS}" | jq -r ".[$i].ref")
             sha=$(echo "${COMPONENT_BUILD_RESULTS}" | jq -r ".[$i].sha")
 
             if [[ "${image_key}" == *.repository ]]; then
