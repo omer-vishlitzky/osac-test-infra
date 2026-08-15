@@ -63,6 +63,9 @@ class K8sClient:
             timeout=timeout + 30,
         )
 
+    def scale_deployment(self, *, deployment: str, namespace: str, replicas: int) -> None:
+        run(*self._base(), "scale", f"deployment/{deployment}", f"--replicas={replicas}", "-n", namespace)
+
     def get_deployment_name_by_label(self, *, label: str, namespace: str) -> str:
         return run(
             *self._base(), "get", "deployment", "-n", namespace, "-l", label, "-o", "jsonpath={.items[0].metadata.name}"
