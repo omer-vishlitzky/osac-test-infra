@@ -1,10 +1,10 @@
 REPORTS_DIR ?= reports
 
-.PHONY: test lint format test-vmaas test-caas test-storage test-bmaas test-metering test-disruptive test-references
+.PHONY: test lint format test-vmaas test-vmaas-full test-caas test-storage test-bmaas test-metering test-disruptive test-references
 
 test:
 	mkdir -p $(REPORTS_DIR)
-	pytest tests/ -v $(if $(TEST),-k "$(TEST)") --junitxml=$(REPORTS_DIR)/results.xml
+	pytest tests/ -v $(if $(TEST),-k "$(TEST)") --junitxml=$(REPORTS_DIR)/junit.xml
 
 lint:
 	ruff check tests/
@@ -15,31 +15,35 @@ format:
 
 test-vmaas:
 	mkdir -p $(REPORTS_DIR)
-	pytest tests/vmaas/ -v $(if $(TEST),-k "$(TEST)") --junitxml=$(REPORTS_DIR)/vmaas.xml
+	pytest tests/vmaas/ -v $(if $(TEST),-k "$(TEST)") --junitxml=$(REPORTS_DIR)/junit.xml
+
+test-vmaas-full:
+	mkdir -p $(REPORTS_DIR)
+	pytest tests/vmaas/ tests/references/ -v $(if $(TEST),-k "$(TEST)") --junitxml=$(REPORTS_DIR)/junit.xml
 
 test-caas:
 	mkdir -p $(REPORTS_DIR)
-	pytest tests/caas/ -v $(if $(TEST),-k "$(TEST)") --junitxml=$(REPORTS_DIR)/caas.xml
+	pytest tests/caas/ -v $(if $(TEST),-k "$(TEST)") --junitxml=$(REPORTS_DIR)/junit.xml
 
 test-storage:
 	mkdir -p $(REPORTS_DIR)
-	pytest tests/storage/ -v $(if $(TEST),-k "$(TEST)") --junitxml=$(REPORTS_DIR)/storage.xml
+	pytest tests/storage/ -v $(if $(TEST),-k "$(TEST)") --junitxml=$(REPORTS_DIR)/junit.xml
 
 test-bmaas:
 	mkdir -p $(REPORTS_DIR)
-	pytest tests/bmaas/ -v $(if $(TEST),-k "$(TEST)") --junitxml=$(REPORTS_DIR)/bmaas.xml
+	pytest tests/bmaas/ -v $(if $(TEST),-k "$(TEST)") --junitxml=$(REPORTS_DIR)/junit.xml
 
 test-metering:
 	mkdir -p $(REPORTS_DIR)
-	pytest -m metering tests/ -v $(if $(TEST),-k "$(TEST)") --junitxml=$(REPORTS_DIR)/metering.xml
+	pytest -m metering tests/ -v $(if $(TEST),-k "$(TEST)") --junitxml=$(REPORTS_DIR)/junit.xml
 
 test-disruptive:
 	mkdir -p $(REPORTS_DIR)
-	pytest -m disruptive -n 0 tests/ -v $(if $(TEST),-k "$(TEST)") --junitxml=$(REPORTS_DIR)/disruptive.xml
+	pytest -m disruptive -n 0 tests/ -v $(if $(TEST),-k "$(TEST)") --junitxml=$(REPORTS_DIR)/junit.xml
 
 test-references:
 	mkdir -p $(REPORTS_DIR)
-	pytest tests/references/ -v $(if $(TEST),-k "$(TEST)") --junitxml=$(REPORTS_DIR)/references.xml
+	pytest tests/references/ -v $(if $(TEST),-k "$(TEST)") --junitxml=$(REPORTS_DIR)/junit.xml
 
 # ─── Infrastructure orchestration ───────────────────────────────────
 
