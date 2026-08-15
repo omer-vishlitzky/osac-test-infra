@@ -48,6 +48,23 @@ class K8sClient:
             args.append("--wait=false")
         run(*args, timeout=600)
 
+    def rollout_restart(self, *, deployment: str, namespace: str | None = None) -> None:
+        ns = namespace if namespace is not None else self.namespace
+        run(*self._base(), "rollout", "restart", f"deployment/{deployment}", "-n", ns)
+
+    def wait_for_rollout(self, *, deployment: str, namespace: str | None = None, timeout: int = 120) -> None:
+        ns = namespace if namespace is not None else self.namespace
+        run(
+            *self._base(),
+            "rollout",
+            "status",
+            f"deployment/{deployment}",
+            "-n",
+            ns,
+            f"--timeout={timeout}s",
+            timeout=timeout + 30,
+        )
+
     def is_present(self, *, resource: str, name: str) -> bool:
         _, rc = run_unchecked(*self._base(), "get", resource, name, "-n", self.namespace)
         return rc == 0
