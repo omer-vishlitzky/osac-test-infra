@@ -14,10 +14,6 @@ on:
     - cron: "0 */3 * * *"
   workflow_dispatch:
     inputs:
-      test-suite:
-        description: "Test suite (bmaas, or empty for all)"
-        required: false
-        default: "bmaas"
       test-filter:
         description: "pytest -k filter"
         required: false
@@ -51,7 +47,6 @@ jobs:
   e2e-bmaas-full-install:
     uses: ./.github/workflows/e2e-bmaas-full-install.yml
     with:
-      test-suite: ${{ inputs.test-suite || 'bmaas' }}
       test-filter: ${{ inputs.test-filter || '' }}
       installer-ref: ${{ inputs.installer-ref || 'main' }}
       installer-repo: ${{ inputs.installer-repo || 'osac-project/osac' }}

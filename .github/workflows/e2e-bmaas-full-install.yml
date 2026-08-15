@@ -4,10 +4,6 @@ name: E2E BMaaS Full Install
 on:
   workflow_call:
     inputs:
-      test-suite:
-        description: "Test suite to run (must match a Makefile test-* target)"
-        required: true
-        type: string
       test-filter:
         description: "pytest -k filter expression (optional)"
         required: false
@@ -135,7 +131,7 @@ jobs:
         id: setup
         uses: ./.github/actions/validate-and-bootstrap
         with:
-          test-suite: ${{ inputs.test-suite || 'e2e' }}
+          test-suite: bmaas
           run-id: ${{ github.run_id }}
 
       - name: Resolve and validate components input
@@ -631,7 +627,6 @@ jobs:
       - name: Run E2E tests
         id: test
         env:
-          TEST_SUITE: ${{ inputs.test-suite }}
           TEST_FILTER: ${{ inputs.test-filter }}
           OSAC_NAMESPACE: ${{ inputs.namespace }}
           OSAC_BMI_TEMPLATE: ${{ inputs.bmi-template }}
@@ -639,8 +634,6 @@ jobs:
           E2E_IMAGE: "osac-e2e-tests:${{ github.run_id }}"
         run: |
           KUBECONFIG_PATH="$RUNNER_TEMP/kubeconfig"
-
-          MAKE_TARGET="test-${TEST_SUITE}"
 
           mkdir -p "$RUNNER_TEMP/test-output"
 
@@ -655,7 +648,7 @@ jobs:
             -e OSAC_BMH_NAMESPACE="${OSAC_BMH_NAMESPACE}" \
             -e OSAC_PULL_SECRET_PATH=/root/pull-secret \
             "${E2E_IMAGE}" \
-            make ${MAKE_TARGET} REPORTS_DIR=/tmp/test-output TEST="${TEST_FILTER}"
+            make test-bmaas REPORTS_DIR=/tmp/test-output TEST="${TEST_FILTER}"
 
       - name: Gather artifacts
         if: always()
