@@ -234,9 +234,9 @@ def jwt_grpc_tenant2(fulfillment_address: str, keycloak_url: str, jwt_password: 
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    numprocesses: int = getattr(config.option, "numprocesses", 0) or 0
+    numprocesses = getattr(config.option, "numprocesses", 0)
     disruptive_tests = [item for item in items if item.get_closest_marker("disruptive")]
-    if disruptive_tests and numprocesses > 0:
+    if disruptive_tests and numprocesses:
         pytest.fail(
             f"{len(disruptive_tests)} disruptive test(s) collected but running with -n {numprocesses}. "
             "Disruptive tests must run serially with -n 0.",
