@@ -735,20 +735,36 @@ jobs:
           rm -f "$RUNNER_TEMP/caas_ssh_key" "$RUNNER_TEMP/caas_ssh_key.pub"
           ssh-keygen -t ed25519 -f "$RUNNER_TEMP/caas_ssh_key" -N '' -q
 
-          podman run --rm --network=host \
-            -v "${KUBECONFIG_PATH}":/root/.kube/config:ro,Z \
-            -v "${RUNNER_TEMP}/pull-secret.json":/root/pull-secret:ro,Z \
-            -v "${RUNNER_TEMP}/aap-license.zip":/root/aap-license.zip:ro,Z \
-            -v "${RUNNER_TEMP}/caas_ssh_key.pub":/root/.ssh/id_rsa.pub:ro,Z \
-            -v "${RUNNER_TEMP}/test-output":/tmp/test-output:Z \
-            -e KUBECONFIG=/root/.kube/config \
-            -e OSAC_NAMESPACE="${OSAC_NAMESPACE}" \
-            -e OSAC_CLUSTER_TEMPLATE="${OSAC_CLUSTER_TEMPLATE}" \
-            -e OSAC_PULL_SECRET_PATH=/root/pull-secret \
-            -e METERING_ADAPTER_URL="${METERING_ADAPTER_URL}" \
-            "${E2E_IMAGE}" \
-            pytest ${TEST_ARGS} ${FILTER_ARGS} \
+          PODMAN_CMD=(
+            podman run --rm --network=host
+            -v "${KUBECONFIG_PATH}":/root/.kube/config:ro,Z
+            -v "${RUNNER_TEMP}/pull-secret.json":/root/pull-secret:ro,Z
+            -v "${RUNNER_TEMP}/aap-license.zip":/root/aap-license.zip:ro,Z
+            -v "${RUNNER_TEMP}/caas_ssh_key.pub":/root/.ssh/id_rsa.pub:ro,Z
+            -v "${RUNNER_TEMP}/test-output":/tmp/test-output:Z
+            -e KUBECONFIG=/root/.kube/config
+            -e OSAC_NAMESPACE="${OSAC_NAMESPACE}"
+            -e OSAC_CLUSTER_TEMPLATE="${OSAC_CLUSTER_TEMPLATE}"
+            -e OSAC_PULL_SECRET_PATH=/root/pull-secret
+            -e METERING_ADAPTER_URL="${METERING_ADAPTER_URL}"
+            "${E2E_IMAGE}"
+          )
+
+          # Phase 1: parallel (non-disruptive)
+          "${PODMAN_CMD[@]}" \
+            pytest ${TEST_ARGS} ${FILTER_ARGS} -m "not disruptive" \
               --junitxml=/tmp/test-output/junit.xml -v
+
+          # Phase 2: serial (disruptive)
+          PHASE2_EXIT=0
+          "${PODMAN_CMD[@]}" \
+            pytest ${TEST_ARGS} ${FILTER_ARGS} -m "disruptive" -n 0 \
+              --junitxml=/tmp/test-output/junit-disruptive.xml -v || PHASE2_EXIT=$?
+          if [ "$PHASE2_EXIT" -eq 5 ]; then
+            echo "No disruptive tests collected — Phase 2 skipped"
+          elif [ "$PHASE2_EXIT" -ne 0 ]; then
+            exit "$PHASE2_EXIT"
+          fi
 
       - name: Gather artifacts
         if: always()
