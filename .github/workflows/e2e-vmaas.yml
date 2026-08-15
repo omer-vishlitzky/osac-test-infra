@@ -398,33 +398,41 @@ jobs:
 
           PODMAN_CMD=(
             podman run --rm --network=host
-            -v "${KUBECONFIG_PATH}":/root/.kube/config:ro,Z
-            -v "${RUNNER_TEMP}/pull-secret.json":/root/pull-secret:ro,Z
-            -v "${RUNNER_TEMP}/aap-license.zip":/root/aap-license.zip:ro,Z
-            -v "${RUNNER_TEMP}/test-output":/tmp/test-output:Z
+            -v "${KUBECONFIG_PATH}:/root/.kube/config:ro,Z"
+            -v "${RUNNER_TEMP}/pull-secret.json:/root/pull-secret:ro,Z"
+            -v "${RUNNER_TEMP}/aap-license.zip:/root/aap-license.zip:ro,Z"
+            -v "${RUNNER_TEMP}/test-output:/tmp/test-output:Z"
             -e KUBECONFIG=/root/.kube/config
             -e OSAC_VM_KUBECONFIG=/root/.kube/config
-            -e OSAC_NAMESPACE="${OSAC_NAMESPACE}"
-            -e OSAC_VM_TEMPLATE="${OSAC_VM_TEMPLATE}"
-            -e OSAC_CLUSTER_TEMPLATE="${OSAC_CLUSTER_TEMPLATE}"
+            -e "OSAC_NAMESPACE=${OSAC_NAMESPACE}"
+            -e "OSAC_VM_TEMPLATE=${OSAC_VM_TEMPLATE}"
+            -e "OSAC_CLUSTER_TEMPLATE=${OSAC_CLUSTER_TEMPLATE}"
             -e OSAC_PULL_SECRET_PATH=/root/pull-secret
             "${E2E_IMAGE}"
           )
 
           # Phase 1: parallel (non-disruptive)
+          PHASE1_EXIT=0
           "${PODMAN_CMD[@]}" \
             pytest ${TEST_ARGS} ${FILTER_ARGS} -m "not disruptive" \
-              --junitxml=/tmp/test-output/junit.xml -v
+              --junitxml=/tmp/test-output/junit.xml -v || PHASE1_EXIT=$?
+          if [ "$PHASE1_EXIT" -eq 5 ]; then
+            echo "No non-disruptive tests collected — Phase 1 skipped"
+          elif [ "$PHASE1_EXIT" -ne 0 ]; then
+            exit "$PHASE1_EXIT"
+          fi
 
-          # Phase 2: serial (disruptive)
-          PHASE2_EXIT=0
-          "${PODMAN_CMD[@]}" \
-            pytest ${TEST_ARGS} ${FILTER_ARGS} -m "disruptive" -n 0 \
-              --junitxml=/tmp/test-output/junit-disruptive.xml -v || PHASE2_EXIT=$?
-          if [ "$PHASE2_EXIT" -eq 5 ]; then
-            echo "No disruptive tests collected — Phase 2 skipped"
-          elif [ "$PHASE2_EXIT" -ne 0 ]; then
-            exit "$PHASE2_EXIT"
+          # Phase 2: serial (disruptive) — merge queue and periodic only
+          if [ "$GITHUB_EVENT_NAME" != "pull_request" ] && [ "$GITHUB_EVENT_NAME" != "pull_request_target" ]; then
+            PHASE2_EXIT=0
+            "${PODMAN_CMD[@]}" \
+              pytest ${TEST_ARGS} ${FILTER_ARGS} -m "disruptive" -n 0 \
+                --junitxml=/tmp/test-output/junit-disruptive.xml -v || PHASE2_EXIT=$?
+            if [ "$PHASE2_EXIT" -eq 5 ]; then
+              echo "No disruptive tests collected — Phase 2 skipped"
+            elif [ "$PHASE2_EXIT" -ne 0 ]; then
+              exit "$PHASE2_EXIT"
+            fi
           fi
 
       - name: Gather artifacts
