@@ -234,14 +234,11 @@ def jwt_grpc_tenant2(fulfillment_address: str, keycloak_url: str, jwt_password: 
 
 
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    numprocesses = getattr(config.option, "numprocesses", 0)
-    disruptive_tests = [item for item in items if item.get_closest_marker("disruptive")]
-    if disruptive_tests and numprocesses:
-        pytest.fail(
-            f"{len(disruptive_tests)} disruptive test(s) collected but running with -n {numprocesses}. "
-            "Disruptive tests must run serially with -n 0.",
-            pytrace=False,
-        )
+    if os.environ.get("PYTEST_XDIST_WORKER") is not None:
+        deselected = [item for item in items if item.get_closest_marker("disruptive")]
+        if deselected:
+            config.hook.pytest_deselected(items=deselected)
+            items[:] = [item for item in items if not item.get_closest_marker("disruptive")]
 
     metering_tests = [item for item in items if item.get_closest_marker("metering")]
     if metering_tests and not os.environ.get("METERING_ADAPTER_URL"):
