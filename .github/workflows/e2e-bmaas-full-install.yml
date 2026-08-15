@@ -641,55 +641,25 @@ jobs:
         run: |
           KUBECONFIG_PATH="$RUNNER_TEMP/kubeconfig"
 
-          TEST_ARGS="tests/"
+          MAKE_TARGET="test"
           if [ -n "${TEST_SUITE}" ]; then
-            TEST_ARGS="tests/${TEST_SUITE}/"
-          fi
-
-          FILTER_ARGS=""
-          if [ -n "${TEST_FILTER}" ]; then
-            FILTER_ARGS="-k ${TEST_FILTER}"
+            MAKE_TARGET="test-${TEST_SUITE}"
           fi
 
           mkdir -p "$RUNNER_TEMP/test-output"
 
-          PODMAN_CMD=(
-            podman run --rm --network=host
-            -v "${KUBECONFIG_PATH}:/root/.kube/config:ro,Z"
-            -v "${RUNNER_TEMP}/pull-secret.json:/root/pull-secret:ro,Z"
-            -v "${RUNNER_TEMP}/aap-license.zip:/root/aap-license.zip:ro,Z"
-            -v "${RUNNER_TEMP}/test-output:/tmp/test-output:Z"
-            -e KUBECONFIG=/root/.kube/config
-            -e "OSAC_NAMESPACE=${OSAC_NAMESPACE}"
-            -e "OSAC_BMI_TEMPLATE=${OSAC_BMI_TEMPLATE}"
-            -e "OSAC_BMH_NAMESPACE=${OSAC_BMH_NAMESPACE}"
-            -e OSAC_PULL_SECRET_PATH=/root/pull-secret
-            "${E2E_IMAGE}"
-          )
-
-          # Phase 1: parallel (non-disruptive)
-          PHASE1_EXIT=0
-          "${PODMAN_CMD[@]}" \
-            pytest ${TEST_ARGS} ${FILTER_ARGS} -m "not disruptive" \
-              --junitxml=/tmp/test-output/junit.xml -v || PHASE1_EXIT=$?
-          if [ "$PHASE1_EXIT" -eq 5 ]; then
-            echo "No non-disruptive tests collected — Phase 1 skipped"
-          elif [ "$PHASE1_EXIT" -ne 0 ]; then
-            exit "$PHASE1_EXIT"
-          fi
-
-          # Phase 2: serial (disruptive) — merge queue and periodic only
-          if [ "$GITHUB_EVENT_NAME" != "pull_request" ] && [ "$GITHUB_EVENT_NAME" != "pull_request_target" ]; then
-            PHASE2_EXIT=0
-            "${PODMAN_CMD[@]}" \
-              pytest ${TEST_ARGS} ${FILTER_ARGS} -m "disruptive" -n 0 \
-                --junitxml=/tmp/test-output/junit-disruptive.xml -v || PHASE2_EXIT=$?
-            if [ "$PHASE2_EXIT" -eq 5 ]; then
-              echo "No disruptive tests collected — Phase 2 skipped"
-            elif [ "$PHASE2_EXIT" -ne 0 ]; then
-              exit "$PHASE2_EXIT"
-            fi
-          fi
+          podman run --rm --network=host \
+            -v "${KUBECONFIG_PATH}":/root/.kube/config:ro,Z \
+            -v "${RUNNER_TEMP}/pull-secret.json":/root/pull-secret:ro,Z \
+            -v "${RUNNER_TEMP}/aap-license.zip":/root/aap-license.zip:ro,Z \
+            -v "${RUNNER_TEMP}/test-output":/tmp/test-output:Z \
+            -e KUBECONFIG=/root/.kube/config \
+            -e OSAC_NAMESPACE="${OSAC_NAMESPACE}" \
+            -e OSAC_BMI_TEMPLATE="${OSAC_BMI_TEMPLATE}" \
+            -e OSAC_BMH_NAMESPACE="${OSAC_BMH_NAMESPACE}" \
+            -e OSAC_PULL_SECRET_PATH=/root/pull-secret \
+            "${E2E_IMAGE}" \
+            make ${MAKE_TARGET} REPORTS_DIR=/tmp/test-output TEST="${TEST_FILTER}"
 
       - name: Gather artifacts
         if: always()
