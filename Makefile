@@ -1,10 +1,6 @@
 REPORTS_DIR ?= reports
 
-.PHONY: test lint format test-vmaas test-vmaas-full test-caas test-storage test-bmaas test-metering test-disruptive test-references
-
-test:
-	mkdir -p $(REPORTS_DIR)
-	pytest tests/ -v $(if $(TEST),-k "$(TEST)") --junitxml=$(REPORTS_DIR)/junit.xml
+.PHONY: test lint format test-vmaas test-caas test-storage test-bmaas test-disruptive
 
 lint:
 	ruff check tests/
@@ -14,10 +10,6 @@ format:
 	ruff format tests/
 
 test-vmaas:
-	mkdir -p $(REPORTS_DIR)
-	pytest tests/vmaas/ -v $(if $(TEST),-k "$(TEST)") --junitxml=$(REPORTS_DIR)/junit.xml
-
-test-vmaas-full:
 	mkdir -p $(REPORTS_DIR)
 	pytest tests/vmaas/ tests/references/ -v $(if $(TEST),-k "$(TEST)") --junitxml=$(REPORTS_DIR)/junit.xml
 
@@ -33,17 +25,9 @@ test-bmaas:
 	mkdir -p $(REPORTS_DIR)
 	pytest tests/bmaas/ -v $(if $(TEST),-k "$(TEST)") --junitxml=$(REPORTS_DIR)/junit.xml
 
-test-metering:
-	mkdir -p $(REPORTS_DIR)
-	pytest -m metering tests/ -v $(if $(TEST),-k "$(TEST)") --junitxml=$(REPORTS_DIR)/junit.xml
-
 test-disruptive:
 	mkdir -p $(REPORTS_DIR)
 	pytest -m disruptive -n 0 tests/ -v $(if $(TEST),-k "$(TEST)") --junitxml=$(REPORTS_DIR)/junit.xml
-
-test-references:
-	mkdir -p $(REPORTS_DIR)
-	pytest tests/references/ -v $(if $(TEST),-k "$(TEST)") --junitxml=$(REPORTS_DIR)/junit.xml
 
 # ─── Infrastructure orchestration ───────────────────────────────────
 
