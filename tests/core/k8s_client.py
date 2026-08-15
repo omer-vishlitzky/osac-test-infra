@@ -63,6 +63,11 @@ class K8sClient:
             timeout=timeout + 30,
         )
 
+    def get_deployment_name_by_label(self, *, label: str, namespace: str) -> str:
+        return run(
+            *self._base(), "get", "deployment", "-n", namespace, "-l", label, "-o", "jsonpath={.items[0].metadata.name}"
+        )
+
     def is_present(self, *, resource: str, name: str) -> bool:
         _, rc = run_unchecked(*self._base(), "get", resource, name, "-n", self.namespace)
         return rc == 0
