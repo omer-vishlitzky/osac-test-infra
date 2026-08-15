@@ -5,10 +5,9 @@ on:
   workflow_call:
     inputs:
       test-suite:
-        description: "Test suite to run: vmaas, caas, or empty string for all"
-        required: false
+        description: "Test suite to run (must match a Makefile test-* target)"
+        required: true
         type: string
-        default: "vmaas"
       test-filter:
         description: "pytest -k filter expression (optional)"
         required: false

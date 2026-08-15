@@ -5,10 +5,9 @@ on:
   workflow_call:
     inputs:
       test-suite:
-        description: "Test suite to run (default: bmaas)"
-        required: false
+        description: "Test suite to run (must match a Makefile test-* target)"
+        required: true
         type: string
-        default: "bmaas"
       test-filter:
         description: "pytest -k filter expression (optional)"
         required: false
