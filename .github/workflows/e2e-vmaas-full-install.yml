@@ -725,8 +725,9 @@ jobs:
             -e OSAC_CLUSTER_TEMPLATE="${OSAC_CLUSTER_TEMPLATE}" \
             -e OSAC_PULL_SECRET_PATH=/root/pull-secret \
             -e METERING_ADAPTER_URL="${METERING_ADAPTER_URL}" \
+            -e "TEST_FILTER=${TEST_FILTER}" \
             "${E2E_IMAGE}" \
-            make test-vmaas REPORTS_DIR=/tmp/test-output TEST="${TEST_FILTER}"
+            make test-vmaas REPORTS_DIR=/tmp/test-output
 
       - name: Gather artifacts
         if: always()
