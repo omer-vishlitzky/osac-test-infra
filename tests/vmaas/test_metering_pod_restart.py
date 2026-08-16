@@ -73,6 +73,6 @@ def test_metering_pod_restart_recovery(
     k8s_hub_client.wait_for_rollout(deployment=metering_deploy, namespace=namespace)
     logger.info("Metering pod recovered, waiting for reconciler to detect missed deletion")
 
-    metering.expect("osac.resource.deleted.v1", resource_id=uuid, timeout=RECONCILER_TIMEOUT)
+    metering.expect("osac.resource.correction.v1", resource_id=uuid, timeout=RECONCILER_TIMEOUT)
     metering.verify()
     logger.info("Reconciler emitted correction event for missed deletion")
