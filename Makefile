@@ -11,23 +11,23 @@ format:
 
 test-vmaas:
 	mkdir -p $(REPORTS_DIR)
-	pytest tests/vmaas/ tests/references/ -v $(if $(TEST),-k "$(TEST)") --junitxml=$(REPORTS_DIR)/junit.xml
+	pytest tests/vmaas/ tests/references/ -v $${TEST_FILTER:+-k "$$TEST_FILTER"} --junitxml=$(REPORTS_DIR)/junit.xml
 
 test-caas:
 	mkdir -p $(REPORTS_DIR)
-	pytest tests/caas/ -v $(if $(TEST),-k "$(TEST)") --junitxml=$(REPORTS_DIR)/junit.xml
+	pytest tests/caas/ -v $${TEST_FILTER:+-k "$$TEST_FILTER"} --junitxml=$(REPORTS_DIR)/junit.xml
 
 test-storage:
 	mkdir -p $(REPORTS_DIR)
-	pytest tests/storage/ -v $(if $(TEST),-k "$(TEST)") --junitxml=$(REPORTS_DIR)/junit.xml
+	pytest tests/storage/ -v $${TEST_FILTER:+-k "$$TEST_FILTER"} --junitxml=$(REPORTS_DIR)/junit.xml
 
 test-bmaas:
 	mkdir -p $(REPORTS_DIR)
-	pytest tests/bmaas/ -v $(if $(TEST),-k "$(TEST)") --junitxml=$(REPORTS_DIR)/junit.xml
+	pytest tests/bmaas/ -v $${TEST_FILTER:+-k "$$TEST_FILTER"} --junitxml=$(REPORTS_DIR)/junit.xml
 
 test-disruptive:
 	mkdir -p $(REPORTS_DIR)
-	pytest -m disruptive -n 0 tests/ -v $(if $(TEST),-k "$(TEST)") --junitxml=$(REPORTS_DIR)/junit.xml
+	pytest -m disruptive -n 0 tests/ -v $${TEST_FILTER:+-k "$$TEST_FILTER"} --junitxml=$(REPORTS_DIR)/junit.xml
 
 # ─── Infrastructure orchestration ───────────────────────────────────
 

@@ -647,8 +647,9 @@ jobs:
             -e OSAC_BMI_TEMPLATE="${OSAC_BMI_TEMPLATE}" \
             -e OSAC_BMH_NAMESPACE="${OSAC_BMH_NAMESPACE}" \
             -e OSAC_PULL_SECRET_PATH=/root/pull-secret \
+            -e "TEST_FILTER=${TEST_FILTER}" \
             "${E2E_IMAGE}" \
-            make test-bmaas REPORTS_DIR=/tmp/test-output TEST="${TEST_FILTER}"
+            make test-bmaas REPORTS_DIR=/tmp/test-output
 
       - name: Gather artifacts
         if: always()
