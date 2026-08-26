@@ -84,15 +84,10 @@ class GRPCClient:
 
     # VirtualNetwork operations
 
-    def create_virtual_network(self, *, name: str, network_class: str, ipv4_cidr: str) -> str:
+    def create_virtual_network(self, *, name: str, ipv4_cidr: str) -> str:
         response: dict[str, Any] = self.call(
             service=f"{PUBLIC_API}.VirtualNetworks/Create",
-            data={
-                "object": {
-                    "metadata": {"name": name},
-                    "spec": {"network_class": {"name": network_class}, "ipv4_cidr": ipv4_cidr},
-                }
-            },
+            data={"object": {"metadata": {"name": name}, "spec": {"ipv4_cidr": ipv4_cidr}}},
         )
         return response["object"]["id"]
 
@@ -176,12 +171,25 @@ class GRPCClient:
 
     # Tenant operations
 
-    def ensure_tenant(self, *, name: str) -> None:
-        try:
-            self.call(service=f"{PRIVATE_API}.Tenants/Create", data={"object": {"metadata": {"name": name}}})
-        except subprocess.CalledProcessError as e:
-            output = (e.stdout or "") + (e.stderr or "")
-            if not re.search(r"Code:\s*AlreadyExists", output):
+    def ensure_tenant(self, *, name: str, retries: int = 10, delay: int = 5) -> None:
+        # OSAC-3553: retry the transient `code = Unavailable` / connection-refused
+        # transport failure the first call can hit after `helm --wait` returns,
+        # before the route converges. AlreadyExists is idempotent success; any
+        # other error still fails fast. Note the two error shapes are matched
+        # differently: a completed RPC prints grpcurl's `Code: <Name>` block
+        # (AlreadyExists), while a transport failure prints the Go status string
+        # `code = Unavailable desc = ...` -- see tests/vmaas/external_ip/conftest.py.
+        for attempt in range(retries):
+            try:
+                self.call(service=f"{PRIVATE_API}.Tenants/Create", data={"object": {"metadata": {"name": name}}})
+                return
+            except subprocess.CalledProcessError as e:
+                output = (e.stdout or "") + (e.stderr or "")
+                if re.search(r"Code:\s*AlreadyExists", output):
+                    return
+                if attempt < retries - 1 and ("Unavailable" in output or "connection refused" in output.lower()):
+                    time.sleep(delay)
+                    continue
                 raise RuntimeError(f"Failed to create tenant '{name}': {output}") from e
 
     # ExternalIPPool operations (private API only)
@@ -399,7 +407,10 @@ class GRPCClient:
             raise ValueError("update_cluster_version requires at least one field to update")
         return self.call(
             service=f"{PRIVATE_API}.ClusterVersions/Update",
-            data={"object": {"id": version_id, "spec": dict(fields)}, "updateMask": {"paths": [f"spec.{k}" for k in fields]}},
+            data={
+                "object": {"id": version_id, "spec": dict(fields)},
+                "updateMask": {"paths": [f"spec.{k}" for k in fields]},
+            },
         )
 
     def delete_cluster_version(self, *, version_id: str) -> None:
@@ -443,6 +454,15 @@ class GRPCClient:
             },
         )
 
+    def update_baremetal_instance_restart_trigger(self, *, bmi_id: str, restart_trigger: int) -> dict[str, Any]:
+        return self.call(
+            service=f"{PUBLIC_API}.BareMetalInstances/Update",
+            data={
+                "object": {"id": bmi_id, "spec": {"restart_trigger": restart_trigger}},
+                "updateMask": {"paths": ["spec.restart_trigger"]},
+            },
+        )
+
     def delete_baremetal_instance(self, *, bmi_id: str) -> None:
         self.call(service=f"{PUBLIC_API}.BareMetalInstances/Delete", data={"id": bmi_id})
 
@@ -457,6 +477,11 @@ class GRPCClient:
         template: str,
         field_definitions: list[dict[str, Any]] | None = None,
     ) -> str:
+        """Create a published BareMetalInstanceCatalogItem.
+
+        ``template`` is sent as a typed reference ``{"name": ...}`` (OSAC-1330),
+        matching Cluster/ComputeInstance catalog item creates.
+        """
         obj: dict[str, Any] = {
             "metadata": {"name": name},
             "title": title,
@@ -516,6 +541,61 @@ class GRPCClient:
 
     def delete_disk_image(self, *, disk_image_id: str) -> None:
         self.call(service=f"{PUBLIC_API}.DiskImages/Delete", data={"id": disk_image_id})
+
+    # ComputeInstance creation with explicit DiskImage (public API)
+
+    def create_compute_instance_with_disk_image(
+        self,
+        *,
+        template: str,
+        disk_image_name: str,
+        subnet_ids: list[str],
+        instance_type: str | None = None,
+        name: str | None = None,
+    ) -> dict[str, Any]:
+        attachments = [{"subnet": {"id": sid}} for sid in subnet_ids]
+        spec: dict[str, Any] = {
+            "template": {"name": template},
+            "disk_image": {"name": disk_image_name},
+            "network_attachments": attachments,
+        }
+        if instance_type is not None:
+            spec["instance_type"] = {"name": instance_type}
+        obj: dict[str, Any] = {"spec": spec}
+        if name is not None:
+            obj["metadata"] = {"name": name}
+        return self.call(service=f"{PUBLIC_API}.ComputeInstances/Create", data={"object": obj})
+
+    # ComputeInstanceTemplate operations (private API)
+
+    def create_compute_instance_template(
+        self, *, template_id: str, name: str, title: str, description: str, spec_defaults: dict[str, Any] | None = None
+    ) -> str:
+        # template_id is mandatory on purpose: it is written verbatim into the
+        # osac-operator ComputeInstance CR's spec.templateID, which the CRD
+        # validates against ^[a-zA-Z_][a-zA-Z0-9._]*$. Leaving it empty makes the
+        # server assign a UUIDv7 (hyphens + leading digit) that the CRD rejects at
+        # admission, so the CR is never created. Real templates are published by
+        # AAP with a dotted/underscored id (e.g. "osac.templates.ocp_virt_vm");
+        # callers must follow that pattern.
+        obj: dict[str, Any] = {
+            "id": template_id,
+            "metadata": {"name": name},
+            "title": title,
+            "description": description,
+        }
+        if spec_defaults is not None:
+            obj["spec_defaults"] = spec_defaults
+        response: dict[str, Any] = self.call(
+            service=f"{PRIVATE_API}.ComputeInstanceTemplates/Create", data={"object": obj}
+        )
+        return response["object"]["id"]
+
+    def delete_compute_instance_template(self, *, template_id: str) -> None:
+        self.call(service=f"{PRIVATE_API}.ComputeInstanceTemplates/Delete", data={"id": template_id})
+
+    def get_compute_instance_template(self, *, template_id: str) -> dict[str, Any]:
+        return self.call(service=f"{PRIVATE_API}.ComputeInstanceTemplates/Get", data={"id": template_id})
 
     # Generic filtered list
 

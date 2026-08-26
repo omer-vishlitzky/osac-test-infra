@@ -11,13 +11,17 @@
 #
 #   --add-tunnel <host> <base_port> [label]
 #               Set up a persistent SSH tunnel from the central machine to
-#               a remote runner. Forwards remote 9100/9101 to local ports.
-#               Also registers the runner in prometheus.yml and reloads
-#               Prometheus -- no manual scrape-config edit needed.
+#               a remote runner. Forwards remote 9100 (node_exporter) and
+#               9104 (haproxy_exporter) to local <base_port> and
+#               <base_port>+1 respectively. Also registers the runner in
+#               prometheus.yml and reloads Prometheus -- no manual
+#               scrape-config edit needed.
 #               <host> is the SSH target (IP or resolvable hostname). If
 #               <host> isn't a meaningful Prometheus instance label on its
 #               own (e.g. a bare IP), pass [label] to set a friendly
 #               "instance" label instead -- it defaults to <host>.
+#               Choose <base_port> values at least 2 apart so <base_port>+1
+#               never collides with another host's registered port.
 #
 #   --remove-tunnel <label>
 #               Tear down a remote runner's tunnel and remove it from
@@ -52,6 +56,23 @@ set -euo pipefail
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 export DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-unix:path=${XDG_RUNTIME_DIR}/bus}"
 
+# This script manages the host's own quadlet-run containers, which always
+# use the shared default podman storage -- never a per-runner isolated one.
+# But when it runs as a step inside a GitHub Actions job (see above), it
+# inherits that job's shell environment, and the runner instance executing
+# it may have CONTAINERS_STORAGE_CONF set to an isolated, runner-specific
+# storage.conf (see setup-runner-podman.sh's concurrent-e2e-build race
+# fix). Left set, `podman build`/`podman inspect` here would silently
+# target that isolated storage instead of the shared one the quadlets
+# actually run from -- confirmed live on the "monitoring-central"-labeled
+# runner (osac-ci-1-runner-04), which doubles as a member of the isolated
+# e2e runner pool: deploys reported success while building into storage
+# nothing was actually serving from, and health-check container-inspect
+# checks failed outright. Unset unconditionally so this script's own
+# podman calls always see the real, shared storage regardless of which
+# runner instance happens to execute it.
+unset CONTAINERS_STORAGE_CONF
+
 MONITORING_HOME="${HOME}/.monitoring-server"
 # Resolve to the monitoring/ directory: scripts live at monitoring/scripts/
 MONITORING_REPO_DIR="${MONITORING_REPO_DIR:-$(cd "$(dirname "$0")/.." && pwd)}"
@@ -66,6 +87,13 @@ SYSTEMD_USER_DIR="${HOME}/.config/systemd/user"
 # BEGIN/END REMOTE TARGETS block in prometheus.yml -- see
 # regenerate_remote_targets() below.
 REMOTE_REGISTRY="${MONITORING_HOME}/config/remote-runners.txt"
+# Serializes --add-tunnel / --remove-tunnel against each other: both do a
+# read-check-then-write on REMOTE_REGISTRY (port collision check, or lookup,
+# followed by upsert/remove), which isn't safe if two invocations overlap --
+# e.g. two concurrent --add-tunnel calls could both pass the collision check
+# against the pre-write registry state before either writes, allocating the
+# same port pair to two hosts.
+REGISTRY_LOCK_FILE="${MONITORING_HOME}/config/.remote-runners.lock"
 
 ###############################################################################
 phase() { echo -e "\n==> Phase $1: $2"; }
@@ -127,6 +155,33 @@ registry_lookup() {
     awk -v l="${label}" '$1 == l { print $2, $3; found=1 } END { exit !found }' "${REMOTE_REGISTRY}"
 }
 
+# Reject a --add-tunnel whose base_port (node_exporter) or base_port+1
+# (haproxy_exporter, see monitoring-tunnel@.service, OSAC-2206) collides
+# with any other registered runner's port pair. An unnoticed collision
+# would make the new tunnel's local -L bind fail (port already in use by
+# another host's tunnel), or worse, silently mix two hosts' metrics under
+# the wrong instance label if it didn't fail outright.
+#
+# Excludes the target label's own existing row -- re-running --add-tunnel
+# to change an already-registered host's port shouldn't be rejected as
+# colliding with itself.
+check_port_collision() {
+    local new_label="$1" new_port="$2"
+    [[ -f "${REMOTE_REGISTRY}" ]] || return 0
+    local existing_label existing_host existing_port
+    while read -r existing_label existing_host existing_port; do
+        [[ -z "${existing_label}" || "${existing_label}" == "${new_label}" ]] && continue
+        if (( new_port == existing_port || new_port == existing_port + 1 || \
+              new_port + 1 == existing_port || new_port + 1 == existing_port + 1 )); then
+            echo "ERROR: base port ${new_port} (and/or ${new_port}+1 for haproxy_exporter)" \
+                 "collides with ${existing_label}'s registered port ${existing_port}" \
+                 "(and its +1) at ${existing_host}." >&2
+            echo "  Choose a base_port at least 2 away from every registered port." >&2
+            return 1
+        fi
+    done < "${REMOTE_REGISTRY}"
+}
+
 regenerate_remote_targets() {
     local prom_config="${MONITORING_HOME}/config/prometheus.yml"
     [[ -f "${prom_config}" ]] || return 0
@@ -141,6 +196,19 @@ regenerate_remote_targets() {
                 [[ -z "${label}" ]] && continue
                 printf '      - targets:\n          - 127.0.0.1:%s\n        labels:\n          instance: %s\n          role: agent\n' \
                     "${port}" "${label}"
+            done < "${REMOTE_REGISTRY}"
+
+            # haproxy-exporter shares the same tunnel as node_exporter, one
+            # port higher (see monitoring-tunnel@.service) -- registered base
+            # ports are always allocated 10 apart specifically to leave room
+            # for this (OSAC-2206), so base_port+1 never collides with
+            # another host's registered port.
+            echo "  - job_name: haproxy-exporter-remote"
+            echo "    static_configs:"
+            while read -r label _host port; do
+                [[ -z "${label}" ]] && continue
+                printf '      - targets:\n          - 127.0.0.1:%s\n        labels:\n          instance: %s\n          role: agent\n' \
+                    "$(( port + 1 ))" "${label}"
             done < "${REMOTE_REGISTRY}"
         } > "${body}"
     fi
@@ -243,6 +311,31 @@ esac
 # central/agent setup phases below, so they exit early.
 ###############################################################################
 if [[ "${MODE}" == "tunnel" ]]; then
+    mkdir -p "$(dirname "${REGISTRY_LOCK_FILE}")"
+    exec 200>"${REGISTRY_LOCK_FILE}"
+    flock -x 200
+
+    if ! check_port_collision "${TUNNEL_LABEL}" "${TUNNEL_BASE_PORT}"; then
+        exit 1
+    fi
+
+    # If this label is already registered under a different host/port,
+    # re-registering it here would otherwise leave the OLD
+    # monitoring-tunnel@<old_host>--<old_port>.service running forever --
+    # an orphaned SSH connection holding a local port bound to a host this
+    # label no longer points at. --remove-tunnel already stops the right
+    # instance via the same registry lookup; do the same here before
+    # starting the new one.
+    old_lookup="$(registry_lookup "${TUNNEL_LABEL}")" || true
+    if [[ -n "${old_lookup}" ]]; then
+        read -r old_host old_port <<< "${old_lookup}"
+        if [[ "${old_host}" != "${TUNNEL_HOST}" || "${old_port}" != "${TUNNEL_BASE_PORT}" ]]; then
+            old_instance="${old_host}--${old_port}"
+            systemctl --user disable --now "monitoring-tunnel@${old_instance}.service" 2>/dev/null || true
+            info "Stopped superseded tunnel: monitoring-tunnel@${old_instance}.service"
+        fi
+    fi
+
     phase 1 "Setting up SSH tunnel to ${TUNNEL_HOST} (base port ${TUNNEL_BASE_PORT})"
 
     SSH_DIR="${MONITORING_HOME}/.ssh"
@@ -274,6 +367,7 @@ if [[ "${MODE}" == "tunnel" ]]; then
     systemctl --user enable --now "monitoring-tunnel@${INSTANCE}.service"
     info "Tunnel started: monitoring-tunnel@${INSTANCE}.service"
     info "  Remote 9100 -> local ${TUNNEL_BASE_PORT} (node_exporter)"
+    info "  Remote 9104 -> local $(( TUNNEL_BASE_PORT + 1 )) (haproxy_exporter)"
 
     phase 2 "Wiring ${TUNNEL_LABEL} (${TUNNEL_HOST}) into Prometheus"
     registry_upsert "${TUNNEL_LABEL}" "${TUNNEL_HOST}" "${TUNNEL_BASE_PORT}"
@@ -290,6 +384,10 @@ if [[ "${MODE}" == "tunnel" ]]; then
 fi
 
 if [[ "${MODE}" == "remove-tunnel" ]]; then
+    mkdir -p "$(dirname "${REGISTRY_LOCK_FILE}")"
+    exec 200>"${REGISTRY_LOCK_FILE}"
+    flock -x 200
+
     phase 1 "Removing SSH tunnel for ${TUNNEL_LABEL}"
 
     lookup_result="$(registry_lookup "${TUNNEL_LABEL}")" || true
@@ -338,7 +436,12 @@ if [[ "${MODE}" == "update-central" ]]; then
         # substitution or be misinterpreted as sed syntax.
         escaped_webhook="$(printf '%s' "${SLACK_WEBHOOK_URL}" | sed -e 's/[\&|]/\\&/g')"
         tmp_alertmanager="$(mktemp)"
-        sed "s|SLACK_WEBHOOK_URL|${escaped_webhook}|g" \
+        # Scoped to lines containing "api_url:" -- a blind file-wide
+        # substitution also matched the file's own introductory TODO
+        # comment ("Replace SLACK_WEBHOOK_URL and email settings..."),
+        # duplicating the real webhook into a comment where it serves no
+        # purpose (found live on osac-ci-1 during the OSAC-2209 audit).
+        sed "/api_url:/s|SLACK_WEBHOOK_URL|${escaped_webhook}|g" \
             "${MONITORING_REPO_DIR}/config/alertmanager.yml" > "${tmp_alertmanager}"
         # cp -f, not mv -- alertmanager.yml is bind-mounted as a single file
         # into the container (see the regenerate_remote_targets comment on
@@ -353,6 +456,8 @@ if [[ "${MODE}" == "update-central" ]]; then
     fi
     cp "${MONITORING_REPO_DIR}/config/grafana/datasources.yml" "${MONITORING_HOME}/config/grafana/datasources.yml"
     cp "${MONITORING_REPO_DIR}/config/grafana/dashboards.yml"  "${MONITORING_HOME}/config/grafana/dashboards.yml"
+    mkdir -p "${MONITORING_HOME}/config/caddy"
+    cp "${MONITORING_REPO_DIR}/config/caddy/Caddyfile" "${MONITORING_HOME}/config/caddy/Caddyfile"
     # Remove stale dashboards first -- a plain cp only adds/overwrites, so a
     # dashboard removed from the repo would otherwise linger here and keep
     # being provisioned by Grafana indefinitely.
@@ -378,8 +483,9 @@ if [[ "${MODE}" == "update-central" ]]; then
     info "Remote-runner scrape targets restored from ${REMOTE_REGISTRY}."
 
     phase 2 "Installing Quadlet units"
-    for unit in node-exporter.container prometheus.container grafana.container \
-                alertmanager.container org-runner-exporter.container workflow-exporter.container; do
+    for unit in node-exporter.container haproxy-exporter.container prometheus.container grafana.container \
+                alertmanager.container org-runner-exporter.container workflow-exporter.container \
+                caddy.container; do
         cp "${MONITORING_REPO_DIR}/quadlet/${unit}" "${QUADLET_DIR}/${unit}"
         info "Installed ${unit}"
     done
@@ -387,7 +493,22 @@ if [[ "${MODE}" == "update-central" ]]; then
        "${SYSTEMD_USER_DIR}/service-health-textfile.service"
     cp "${MONITORING_REPO_DIR}/systemd/service-health-textfile.timer" \
        "${SYSTEMD_USER_DIR}/service-health-textfile.timer"
+    # Refresh the tunnel template too (OSAC-2206 added a second -L forward
+    # to it) -- this was previously never refreshed by --update-central at
+    # all, so a template change would silently never reach production
+    # through the automated CI path. Existing tunnel instances are
+    # per-instance systemd units generated from this template at
+    # `systemctl --user enable` time, so they also need restarting to pick
+    # up the new ExecStart -- a plain daemon-reload only affects units not
+    # yet started.
+    cp "${MONITORING_REPO_DIR}/systemd/monitoring-tunnel@.service" \
+       "${SYSTEMD_USER_DIR}/monitoring-tunnel@.service"
     systemctl --user daemon-reload
+    while read -r tunnel_unit; do
+        [[ -z "${tunnel_unit}" ]] && continue
+        echo "  Restarting ${tunnel_unit} ..."
+        systemctl --user restart "${tunnel_unit}"
+    done < <(systemctl --user list-units 'monitoring-tunnel@*.service' --plain --no-legend --state=active | awk '{print $1}')
 
     phase 3 "Rebuilding workflow-exporter image"
     # Cheap/cached when Containerfile.workflow-exporter hasn't changed --
@@ -402,7 +523,8 @@ if [[ "${MODE}" == "update-central" ]]; then
     # stale config the way a reload can if a file was ever replaced via
     # rename; it always re-opens everything fresh.
     for svc in alertmanager.service prometheus.service grafana.service \
-               org-runner-exporter.service workflow-exporter.service node-exporter.service; do
+               org-runner-exporter.service workflow-exporter.service node-exporter.service \
+               haproxy-exporter.service caddy.service; do
         echo "  Restarting ${svc} ..."
         systemctl --user restart "${svc}"
     done
@@ -422,6 +544,7 @@ if [[ "${MODE}" == "update-agent" ]]; then
 
     phase 2 "Installing Quadlet units"
     cp "${MONITORING_REPO_DIR}/quadlet/node-exporter.container" "${QUADLET_DIR}/node-exporter.container"
+    cp "${MONITORING_REPO_DIR}/quadlet/haproxy-exporter.container" "${QUADLET_DIR}/haproxy-exporter.container"
     cp "${MONITORING_REPO_DIR}/systemd/service-health-textfile.service" \
        "${SYSTEMD_USER_DIR}/service-health-textfile.service"
     cp "${MONITORING_REPO_DIR}/systemd/service-health-textfile.timer" \
@@ -430,6 +553,7 @@ if [[ "${MODE}" == "update-agent" ]]; then
 
     phase 3 "Restarting agent services"
     systemctl --user restart node-exporter.service
+    systemctl --user restart haproxy-exporter.service
     systemctl --user restart service-health-textfile.timer
 
     info "Agent update complete."
@@ -445,7 +569,8 @@ mkdir -p "${MONITORING_HOME}"/{config/grafana,data/textfile-collector,dashboards
 chmod 700 "${MONITORING_HOME}"
 
 if [[ "${MODE}" == "central" ]]; then
-    mkdir -p "${MONITORING_HOME}/data/"{prometheus,grafana,alertmanager}
+    mkdir -p "${MONITORING_HOME}/data/"{prometheus,grafana,alertmanager,caddy}
+    mkdir -p "${MONITORING_HOME}/config/caddy"
     mkdir -p "${MONITORING_HOME}/.ssh"
     chmod 700 "${MONITORING_HOME}/.ssh"
     # Grafana's TLS cert/key live here -- provisioned manually (real
@@ -469,6 +594,7 @@ if [[ "${MODE}" == "central" ]]; then
     cp "${MONITORING_REPO_DIR}/config/alertmanager.yml" "${MONITORING_HOME}/config/alertmanager.yml"
     cp "${MONITORING_REPO_DIR}/config/grafana/datasources.yml" "${MONITORING_HOME}/config/grafana/datasources.yml"
     cp "${MONITORING_REPO_DIR}/config/grafana/dashboards.yml"  "${MONITORING_HOME}/config/grafana/dashboards.yml"
+    cp "${MONITORING_REPO_DIR}/config/caddy/Caddyfile" "${MONITORING_HOME}/config/caddy/Caddyfile"
 
     # Copy dashboards
     cp "${MONITORING_REPO_DIR}/config/grafana/dashboards/"*.json "${MONITORING_HOME}/dashboards/"
@@ -527,6 +653,7 @@ mkdir -p "${QUADLET_DIR}" "${SYSTEMD_USER_DIR}"
 # Common units (deployed on all machines)
 COMMON_UNITS=(
     "node-exporter.container"
+    "haproxy-exporter.container"
 )
 
 # Central-only units
@@ -536,6 +663,7 @@ CENTRAL_UNITS=(
     "alertmanager.container"
     "org-runner-exporter.container"
     "workflow-exporter.container"
+    "caddy.container"
 )
 
 for unit in "${COMMON_UNITS[@]}"; do
@@ -575,6 +703,7 @@ phase 4 "Starting services"
 # exist on agents too, not just the central box.
 COMMON_SERVICES=(
     "node-exporter.service"
+    "haproxy-exporter.service"
     "service-health-textfile.timer"
 )
 
@@ -584,6 +713,7 @@ CENTRAL_SERVICES=(
     "grafana.service"
     "org-runner-exporter.service"
     "workflow-exporter.service"
+    "caddy.service"
 )
 
 for svc in "${COMMON_SERVICES[@]}"; do
@@ -601,9 +731,9 @@ fi
 # Wait for containers to be running
 echo ""
 echo "Waiting for containers to be healthy ..."
-ALL_CONTAINERS=("node-exporter")
+ALL_CONTAINERS=("node-exporter" "haproxy-exporter")
 if [[ "${MODE}" == "central" ]]; then
-    ALL_CONTAINERS+=("prometheus" "grafana" "alertmanager" "org-runner-exporter" "workflow-exporter")
+    ALL_CONTAINERS+=("prometheus" "grafana" "alertmanager" "org-runner-exporter" "workflow-exporter" "caddy")
 fi
 
 containers_ready=true
@@ -719,6 +849,7 @@ if [[ "${MODE}" == "central" ]]; then
     echo "  - Grafana:             http://127.0.0.1:3000"
     echo "  - Alertmanager:        http://127.0.0.1:9093"
     echo "  - node_exporter:       http://127.0.0.1:9100"
+    echo "  - haproxy_exporter:    http://127.0.0.1:9104"
     echo "  - org-runner-exporter: http://127.0.0.1:9102"
     echo ""
     echo "Access Grafana via SSH tunnel:"

@@ -7,22 +7,15 @@ self-hosted-runner:
     - monitoring-central
     - osac-ci-orchestrator
     - osac-ci-small
-    # Per-host labels (fleet/inventory/hosts.yml's ci_runners group) -- used
-    # as literal matrix values in fleet-podman-cleanup.yml, which is why
-    # actionlint needs them even though other workflows only ever reference
-    # a host label indirectly via a runner-label input (an expression,
-    # which actionlint can't statically resolve against this list).
-    - osac-ci-1
-    - osac-1
-    - osac-2
-    - osac-3
-    - osac-4
-    - osac-5
-    - osac-6
-    - osac-7
-    - osac-8
-    - osac-9
-    - osac-10
+    # Per-host labels (fleet/inventory/hosts.yml's ci_runners group) used to
+    # be listed here too, since fleet-podman-cleanup.yml's matrix was a
+    # literal list actionlint could statically resolve. That list drifted
+    # from the real fleet (missing 5 hosts for 11+ days after an expansion)
+    # -- fleet-podman-cleanup.yml's matrix is now generated at runtime from
+    # fleet/inventory/hosts.yml itself, so `runs-on: ${{ matrix.host }}` is
+    # an expression again, same as every other workflow's runner-label
+    # input, and no longer needs a static entry here -- one fewer place
+    # this list can go stale.
 
 paths:
   .github/workflows/**/*.yml:

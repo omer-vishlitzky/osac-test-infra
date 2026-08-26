@@ -328,7 +328,9 @@ jobs:
               git -C "${src}" fetch --depth 1 "https://github.com/${repo}.git" "${sha}"
               git -C "${src}" checkout FETCH_HEAD
             else
-              git clone --depth 1 --branch "${ref}" "https://github.com/${repo}.git" "${src}"
+              git init "${src}"
+              git -C "${src}" fetch --depth 1 "https://github.com/${repo}.git" "${ref}"
+              git -C "${src}" checkout FETCH_HEAD
               sha=$(git -C "${src}" rev-parse HEAD)
               REPO_PINNED_SHA[$repo]="${sha}"
               echo "Pinned ${repo} to SHA ${sha} (resolved from ref '${ref}')."
@@ -417,23 +419,8 @@ jobs:
           sleep 180
           oc rollout status ds/ovnkube-node -n openshift-ovn-kubernetes --timeout=300s
 
-          echo "Applying KubeletConfig (maxPods: 500)..."
-          cat <<'KUBELET_EOF' | oc apply -f -
-          apiVersion: machineconfiguration.openshift.io/v1
-          kind: KubeletConfig
-          metadata:
-            name: set-master-max-pods
-          spec:
-            machineConfigPoolSelector:
-              matchLabels:
-                pools.operator.machineconfiguration.openshift.io/master: ""
-            kubeletConfig:
-              maxPods: 500
-          KUBELET_EOF
-          echo "Waiting for MCP master to finish updating (node will reboot on SNO)..."
-          oc wait --for=condition=Updated mcp/master --timeout=600s
-          echo "Waiting 180s for MCP to settle..."
-          sleep 180
+      - name: Install grpcurl
+        uses: ./.github/actions/install-grpcurl
 
       - name: Install infrastructure operators
         env:
@@ -457,32 +444,6 @@ jobs:
             chmod +x "${YQ_DIR}/yq"
             export PATH="${YQ_DIR}:${PATH}"
             echo "${YQ_DIR}" >> "$GITHUB_PATH"
-          fi
-          # Needed by "Install OSAC"'s post-rollout gRPC readiness check below.
-          # Fleet machines install this already (scripts/machine-init.sh
-          # grpcurl), but match e2e-vmaas-full-install.yml's own defensive
-          # fallback rather than assuming every runner has been re-provisioned.
-          if ! command -v grpcurl &>/dev/null; then
-            GRPCURL_VERSION="1.9.1"
-            GRPCURL_DIR="${RUNNER_TEMP}/bin"
-            mkdir -p "${GRPCURL_DIR}"
-            GRPCURL_TARBALL="grpcurl_${GRPCURL_VERSION}_linux_x86_64.tar.gz"
-            GRPCURL_ARCHIVE="${RUNNER_TEMP}/${GRPCURL_TARBALL}"
-            curl --retry 5 --retry-delay 2 -fsSL -o "${GRPCURL_ARCHIVE}" \
-              "https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VERSION}/${GRPCURL_TARBALL}"
-            # grpcurl publishes one combined checksums.txt per release (no
-            # per-asset .sha256), unlike yq above -- fetch it and verify
-            # against the matching line, rewriting the filename to the
-            # archive's actual local path so sha256sum -c can find it
-            # regardless of cwd.
-            curl --retry 5 --retry-delay 2 -fsSL "https://github.com/fullstorydev/grpcurl/releases/download/v${GRPCURL_VERSION}/grpcurl_${GRPCURL_VERSION}_checksums.txt" \
-              | grep " ${GRPCURL_TARBALL}\$" \
-              | sed "s|${GRPCURL_TARBALL}|${GRPCURL_ARCHIVE}|" \
-              | sha256sum -c -
-            tar xz -C "${GRPCURL_DIR}" grpcurl -f "${GRPCURL_ARCHIVE}"
-            rm -f "${GRPCURL_ARCHIVE}"
-            export PATH="${GRPCURL_DIR}:${PATH}"
-            echo "${GRPCURL_DIR}" >> "$GITHUB_PATH"
           fi
 
           # Clone the OSAC monorepo for installer charts.  When components
@@ -517,8 +478,7 @@ jobs:
           echo "INSTALLER_DIR=${INSTALLER_DIR}" >> "$GITHUB_ENV"
           cd "${INSTALLER_DIR}"
 
-          make install-operators VALUES_FILE=values/caas-ci/values.yaml
-          make install-prereqs VALUES_FILE=values/caas-ci/values.yaml
+          make install-infra PLATFORM=openshift PROFILE=caas-ci NS="${INSTALLER_NAMESPACE}"
 
       - name: Install OSAC
         env:
@@ -610,7 +570,7 @@ jobs:
             helm dependency update charts/osac/
           fi
 
-          make install-osac VALUES_FILE=values/caas-ci/values.yaml EXTRA_HELM_ARGS="${SET_ARGS[*]}"
+          make install-osac AAP_LICENSE_FILE="${AAP_LICENSE_FILE}" PLATFORM=openshift PROFILE=caas-ci NS="${INSTALLER_NAMESPACE}" EXTRA_HELM_ARGS="${SET_ARGS[*]}"
 
           # helm --wait only confirms the *new* pod/ReplicaSet is Ready -- it
           # does not wait for the old pod to finish terminating or for the

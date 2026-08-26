@@ -93,6 +93,16 @@ in_progress_total = Gauge(
     "Total in-progress workflow runs across all repos",
     ["org"],
 )
+queued_by_category = Gauge(
+    "github_actions_queued_runs_by_category",
+    "Queued workflow runs by category (e2e, lint, ci, automation, release)",
+    ["org", "category"],
+)
+in_progress_by_category = Gauge(
+    "github_actions_in_progress_runs_by_category",
+    "In-progress workflow runs by category (e2e, lint, ci, automation, release)",
+    ["org", "category"],
+)
 completed_runs = Counter(
     "github_actions_completed_runs_total",
     "Completed workflow runs",
@@ -121,15 +131,23 @@ api_remaining = Gauge(
 # ---------------------------------------------------------------------------
 class WorkflowExporter:
     # Ordered category mapping — first match wins (case-insensitive substring).
-    # automation and release are both checked before the broad "ci" catch-all
-    # (test/check/build): automation so bot-maintenance workflows like
+    # automation is checked before BOTH "e2e" and the broad "ci" catch-all
+    # (test/check/build): before ci so bot-maintenance workflows like
     # "Remove ok-to-test on new push" don't get caught by ci's "test"
-    # pattern, release so "Build container image" matches "container image"
-    # instead of ci's generic "build" pattern.
+    # pattern, and before e2e so bot workflows that merely reference e2e
+    # without running it don't get caught by e2e's bare "e2e" substring --
+    # confirmed live: "E2E on CodeRabbit approval" (kicks off the real e2e
+    # workflows via the GitHub API, runs none itself), "Remove e2e-ready
+    # label on new push" (label housekeeping), and "Scan E2E logs" (log
+    # retention) were all miscategorized "e2e" and polluting e2e pass-rate/
+    # infra-failure stats with runs that never executed a single real test.
+    # release is checked before ci too, so "Build container image" matches
+    # "container image" instead of ci's generic "build" pattern.
     WORKFLOW_CATEGORIES = {
+        "automation": ["bump", "dependabot", "copilot", "slash", "ok-to-test",
+                       "coderabbit approval", "e2e-ready label", "scan e2e logs"],
         "e2e":        ["e2e"],
         "lint":       ["pre-commit", "lint", "checklist", "kustomize", "check image"],
-        "automation": ["bump", "dependabot", "copilot", "slash", "ok-to-test"],
         "release":    ["publish", "container image", "mirror"],
         "ci":         ["ci", "test", "check", "build"],
     }
@@ -157,32 +175,100 @@ class WorkflowExporter:
     # "test" (see _classify_failure_reason).
     TEST_STEPS = frozenset({
         "Install OSAC",
+        "Install infrastructure operators",
         "Deploy OSAC (make deploy-osac)",
         "Deploy OSAC from snapshot (make deploy-osac)",
         "Run E2E tests",
         "Run CaaS e2e tests",
     })
 
+    # Suffix used by pure pass-through relay jobs/workflows that exist only
+    # to give the merge-queue ruleset a stable required-check name -- e.g.
+    # "label-gate" (a whole workflow) and "e2e-caas-gate" (one job within a
+    # bigger e2e workflow, alongside the real "e2e-caas-full-install" job).
+    # Neither adds test/infra signal of its own: a job-level gate's only
+    # step is "if an upstream job failed, exit 1", which would otherwise
+    # misclassify as failure_reason "infra" (it never matches TEST_STEPS)
+    # even when the real failure was already correctly classified from the
+    # actual e2e job in the same run; a workflow-level gate like
+    # "label-gate" is almost always a trivial auto-pass on merge_group and
+    # a real-but-unrelated label check on pull_request, neither of which is
+    # "CI health" signal worth counting.
+    GATE_NAME_SUFFIX = "-gate"
+
+    # Other known plumbing jobs that precede the real e2e job within each
+    # e2e-*-full-install run (see osac/.github/workflows/e2e-*-full-install.yml)
+    # but don't follow the "-gate" suffix convention: "changes" (dorny/paths-filter
+    # precondition -- should the expensive e2e job run at all) and
+    # "e2e-readiness" (fleet/capacity precondition). A failure here means a
+    # precondition wasn't met, not that OSAC itself broke -- when
+    # "e2e-readiness" fails, the real e2e job is skipped entirely (confirmed
+    # live), so there's no product signal to attribute the failure to.
+    # A small, stable, explicit list rather than a broader substring guess,
+    # for the same reason TEST_STEPS above is a small allowlist rather than
+    # an ever-growing denylist of infra step names.
+    GATE_JOB_NAMES = frozenset({"changes", "e2e-readiness"})
+
     @staticmethod
-    def _classify_failure_reason(category, failed_steps):
+    def _is_gate_name(name):
+        """Whole-workflow gate check (e.g. "label-gate") -- suffix only."""
+        return (name or "").lower().endswith(WorkflowExporter.GATE_NAME_SUFFIX)
+
+    @staticmethod
+    def _is_gate_job(name):
+        """Job-level gate/precondition check within a bigger workflow run --
+        suffix match (e.g. "e2e-caas-gate") or one of GATE_JOB_NAMES.
+        """
+        lname = (name or "").lower()
+        return lname.endswith(WorkflowExporter.GATE_NAME_SUFFIX) or lname in WorkflowExporter.GATE_JOB_NAMES
+
+    @staticmethod
+    def _is_gate_only_failure(jobs):
+        """True if every FAILED job in this run's job list is a gate/
+        precondition job (see _is_gate_job) -- i.e. "e2e-readiness" (or
+        another precondition) failed, the real e2e job was never even
+        started (GitHub reports it "skipped"), and the only "failure"
+        conclusions in the whole run belong to gate jobs relaying that
+        upstream skip (confirmed live: osac run 32196167957 -- changes:
+        success, e2e-readiness: failure, e2e-vmaas-gate: failure,
+        e2e-vmaas-full-install: skipped). Nothing broke (not infra) and
+        nothing ran (not test) -- there's no e2e signal in this run at all.
+        """
+        failed_jobs = [j for j in (jobs or []) if j.get("conclusion") == "failure"]
+        if not failed_jobs:
+            return False
+        return all(WorkflowExporter._is_gate_job(j.get("name")) for j in failed_jobs)
+
+    @staticmethod
+    def _classify_failure_reason(category, failed_steps, jobs=None):
         """category: only "e2e" jobs get classified. Returns "n/a" for
         any other category.
 
         failed_steps: the list from _extract_failed_steps
-        ([{"display":.., "step":..}, ...]). Returns "test" if any failed
-        step is in TEST_STEPS (OSAC's own install/test execution), "infra"
-        if there's failure detail but none of it is a test step, and
-        "infra" too when there's no per-step detail at all (e.g. the job
-        itself shows conclusion "cancelled" with zero recorded steps even
-        though the run's overall conclusion is "failure" -- a real
-        observed case: a runner-level crash/timeout that GitHub cancelled
-        mid-job). A genuine product/test failure always produces step-
-        level data (a red "Run E2E tests" step); the total absence of any
-        step data is itself an infra-level symptom, not an ambiguous
-        third category.
+        ([{"display":.., "step":..}, ...]), already excluding gate/
+        precondition jobs (see _is_gate_job). jobs: the raw per-job list
+        from _fetch_run_jobs, used only to detect the gate-only-failure
+        case below -- pass None when unavailable (e.g. reclassifying from
+        already-stored text) to skip that check.
+
+        Returns "gate" if every job that actually failed was a gate/
+        precondition job (see _is_gate_only_failure) -- excluded from all
+        stats by get_jobs_json, not just this infra/test breakdown, since
+        it's neither. Otherwise "test" if any failed step is in TEST_STEPS
+        (OSAC's own install/test execution), "infra" if there's failure
+        detail but none of it is a test step, and "infra" too when there's
+        no per-step detail at all (e.g. the job itself shows conclusion
+        "cancelled" with zero recorded steps even though the run's overall
+        conclusion is "failure" -- a real observed case: a runner-level
+        crash/timeout that GitHub cancelled mid-job). A genuine product/
+        test failure always produces step-level data (a red "Run E2E
+        tests" step); the total absence of any step data is itself an
+        infra-level symptom, not an ambiguous third category.
         """
         if category != "e2e":
             return "n/a"
+        if jobs is not None and WorkflowExporter._is_gate_only_failure(jobs):
+            return "gate"
         if not failed_steps:
             return "infra"
         for f in failed_steps:
@@ -353,6 +439,25 @@ class WorkflowExporter:
         _recategorize_jobs_if_needed for WORKFLOW_CATEGORIES. Safe to
         re-run every startup: no-op once every failed row already matches
         what _classify_failure_reason would assign today.
+
+        The live-jobs list _classify_failure_reason optionally uses to
+        detect a gate-only failure (see _is_gate_only_failure) isn't
+        available here -- only the flattened text is stored, not each
+        job's raw conclusion. Approximated instead from the stored
+        "job -> step" entries themselves: if every entry's job name is a
+        gate job (rows recorded before the ingestion-time gate filter
+        existed still have these), it's a gate-only failure by the same
+        definition. Rows recorded after that filter existed have an empty
+        failed_step for a true gate-only failure (the entries were already
+        dropped before storage) -- for those, an empty failed_step is
+        genuinely ambiguous from text alone (it could equally mean "no
+        data at all", which is legitimately "infra"), so a row already
+        classified "gate" is left as-is rather than re-derived here.
+        Without that, every exporter restart would silently flip an
+        already-correct "gate" row back to "infra" the moment its
+        failed_step happens to be empty -- confirmed live, e.g. osac run
+        #32265159432, reclassified back and forth across restarts before
+        this guard existed.
         """
         with self._db() as conn:
             rows = conn.execute(
@@ -361,12 +466,16 @@ class WorkflowExporter:
             ).fetchall()
             updated = 0
             for row in rows:
-                steps = [
-                    {"step": entry.split(" → ")[-1]}
-                    for entry in (row["failed_step"] or "").split("; ")
-                    if entry
-                ]
-                reason = self._classify_failure_reason(row["category"], steps)
+                entries = [e for e in (row["failed_step"] or "").split("; ") if e]
+                if row["category"] == "e2e" and entries and all(
+                    self._is_gate_job(entry.split(" → ")[0]) for entry in entries
+                ):
+                    reason = "gate"
+                elif row["category"] == "e2e" and not entries and row["failure_reason"] == "gate":
+                    reason = "gate"
+                else:
+                    steps = [{"step": entry.split(" → ")[-1]} for entry in entries]
+                    reason = self._classify_failure_reason(row["category"], steps)
                 if reason != row["failure_reason"]:
                     conn.execute(
                         "UPDATE jobs SET failure_reason = ? WHERE id = ?", (reason, row["id"])
@@ -1118,8 +1227,17 @@ class WorkflowExporter:
         every "queued now"/"in progress now" stat panel -- silently
         capping it at one page's worth understates the real number
         exactly when an accurate one matters most.
+
+        Returns (runs, complete). complete is False if any page fetch
+        failed partway through a repo's pagination -- runs is then a
+        partial list that undercounts the real total, not "there
+        genuinely are only this many". Callers deriving counts from this
+        list (e.g. the by-category queued/in-progress gauges) should skip
+        publishing on an incomplete fetch rather than publish an
+        undercount that looks like a real drop.
         """
         runs = []
+        complete = True
         for status in ("queued", "in_progress"):
             url = (
                 f"{API_URL}/repos/{ORG}/{repo}/actions/runs"
@@ -1128,6 +1246,7 @@ class WorkflowExporter:
             while url:
                 resp = self._get(url)
                 if not resp.ok:
+                    complete = False
                     break
                 for run in resp.json().get("workflow_runs", []):
                     if run.get("event") in WorkflowExporter.IGNORED_EVENTS:
@@ -1139,7 +1258,7 @@ class WorkflowExporter:
                             record["runner_name"] = self._extract_runner_names(jobs)
                     runs.append(record)
                 url = resp.links.get("next", {}).get("url")
-        return runs
+        return runs, complete
 
     def _recent_completed(self, repo):
         """Fetch recently completed runs to detect new completions.
@@ -1196,6 +1315,8 @@ class WorkflowExporter:
         """
         failed_steps = []
         for job in jobs:
+            if self._is_gate_job(job.get("name")):
+                continue
             if job.get("conclusion") != "failure":
                 continue
             for step in job.get("steps", []):
@@ -1214,6 +1335,8 @@ class WorkflowExporter:
         """
         steps = []
         for job in jobs:
+            if self._is_gate_job(job.get("name")):
+                continue
             if job.get("conclusion") not in ("success", "failure"):
                 continue
             for step in job.get("steps", []):
@@ -1319,7 +1442,7 @@ class WorkflowExporter:
                     # unset; _classify_failure_reason treats "no per-step
                     # detail at all" as infra, which is correct here too.
                     failed = self._extract_failed_steps(jobs or [])
-                    record["failure_reason"] = self._classify_failure_reason(record.get("category", ""), failed)
+                    record["failure_reason"] = self._classify_failure_reason(record.get("category", ""), failed, jobs)
                     if failed:
                         record["failed_step"] = "; ".join(
                             f["display"] for f in failed
@@ -1393,7 +1516,7 @@ class WorkflowExporter:
                 # _classify_failure_reason treats "no per-step detail at
                 # all" as infra, which is correct here too.
                 failed = self._extract_failed_steps(jobs or [])
-                record["failure_reason"] = self._classify_failure_reason(record.get("category", ""), failed)
+                record["failure_reason"] = self._classify_failure_reason(record.get("category", ""), failed, jobs)
                 if failed:
                     record["failed_step"] = "; ".join(f["display"] for f in failed)
             if self._upsert_job(record):
@@ -1483,7 +1606,7 @@ class WorkflowExporter:
                         # treats "no per-step detail at all" as infra,
                         # which is correct here too.
                         failed = self._extract_failed_steps(jobs or [])
-                        record["failure_reason"] = self._classify_failure_reason(record.get("category", ""), failed)
+                        record["failure_reason"] = self._classify_failure_reason(record.get("category", ""), failed, jobs)
                         if failed:
                             record["failed_step"] = "; ".join(
                                 f["display"] for f in failed
@@ -1510,6 +1633,12 @@ class WorkflowExporter:
         tot_queued = 0
         tot_in_progress = 0
         current_active = []
+        # False if any repo's active-runs fetch was partial/failed this
+        # cycle -- gates the by-category gauge update below (see
+        # _fetch_active_runs' docstring): publishing counts derived from
+        # an incomplete current_active would look like a real drop in
+        # queued/in-progress e2e work rather than "we couldn't fetch it".
+        active_runs_complete = True
 
         for repo in repos:
             try:
@@ -1523,7 +1652,14 @@ class WorkflowExporter:
 
                 # Collect active (queued/in_progress) runs for the active list
                 if q > 0 or ip > 0:
-                    current_active.extend(self._fetch_active_runs(repo))
+                    try:
+                        active_runs, was_complete = self._fetch_active_runs(repo)
+                        current_active.extend(active_runs)
+                        if not was_complete:
+                            active_runs_complete = False
+                    except Exception:
+                        logger.exception("Error fetching active runs for %s", repo)
+                        active_runs_complete = False
 
                 # Track newly completed runs. Checked via a cheap existence
                 # query before spending the extra _fetch_run_jobs API call,
@@ -1558,7 +1694,7 @@ class WorkflowExporter:
                         # treats "no per-step detail at all" as infra,
                         # which is correct here too.
                         failed = self._extract_failed_steps(jobs or [])
-                        record["failure_reason"] = self._classify_failure_reason(record.get("category", ""), failed)
+                        record["failure_reason"] = self._classify_failure_reason(record.get("category", ""), failed, jobs)
                         if failed:
                             record["failed_step"] = "; ".join(
                                 f["display"] for f in failed
@@ -1592,6 +1728,47 @@ class WorkflowExporter:
 
         queued_total.labels(org=ORG).set(tot_queued)
         in_progress_total.labels(org=ORG).set(tot_in_progress)
+
+        # By-category breakdown of the same org-wide totals above -- e2e
+        # runs on self-hosted runners, a completely different resource
+        # pool/queue from the GitHub-hosted runners lint/build/automation
+        # workflows use, so the combined total can look calm while e2e's
+        # own queue is backed up (or vice versa). Reuses current_active
+        # (already fully fetched above for the active-run list) rather
+        # than making extra API calls -- each record already carries its
+        # category from _make_job_record.
+        #
+        # Skipped entirely when active_runs_complete is False: unlike
+        # tot_queued/tot_in_progress above (each repo's own reliable
+        # total_count from a single API call, unaffected by pagination
+        # failures), these gauges are derived from current_active itself,
+        # so a partial fetch would publish an undercount that looks like a
+        # real drop in queued/in-progress work rather than "we couldn't
+        # fetch it this cycle" -- leaving the previous values in place
+        # (Gauges hold their last value until explicitly set) is more
+        # honest than overwriting them with a known-wrong number.
+        if active_runs_complete:
+            category_queued = {}
+            category_in_progress = {}
+            for run in current_active:
+                cat = run.get("category", "ci")
+                if run.get("status") == "queued":
+                    category_queued[cat] = category_queued.get(cat, 0) + 1
+                elif run.get("status") == "in_progress":
+                    category_in_progress[cat] = category_in_progress.get(cat, 0) + 1
+            # Explicitly zero every known category every cycle -- a Gauge
+            # holds its last value forever otherwise, so a category that
+            # drops to zero active runs would otherwise show a stale
+            # nonzero count rather than actually reaching zero.
+            for cat in set(WorkflowExporter.WORKFLOW_CATEGORIES.keys()) | {"ci"}:
+                queued_by_category.labels(org=ORG, category=cat).set(category_queued.get(cat, 0))
+                in_progress_by_category.labels(org=ORG, category=cat).set(category_in_progress.get(cat, 0))
+        else:
+            logger.warning(
+                "Active-runs fetch incomplete this cycle -- skipping "
+                "by-category queued/in-progress gauge update, keeping "
+                "previous values"
+            )
 
         with self._lock:
             self.active_runs = current_active
@@ -1735,6 +1912,30 @@ class WorkflowExporter:
         # -- DB-backed completed-job history -----------------------------
         where = []
         args = {"limit": limit}
+        # Whole-workflow gates (e.g. "label-gate") add no CI-health signal
+        # of their own -- excluded from every stats consumer of this
+        # method unconditionally, not behind an opt-in filter, since
+        # there's no legitimate reason to count them. Job-level gates
+        # (e.g. "e2e-caas-gate", one job within a bigger e2e workflow) are
+        # handled separately in _extract_failed_steps/_extract_step_durations,
+        # since they're not their own row here.
+        where.append("LOWER(workflow) NOT LIKE '%' || :gate_suffix")
+        args["gate_suffix"] = WorkflowExporter.GATE_NAME_SUFFIX
+        # Gate-only failures (failure_reason "gate", see
+        # _is_gate_only_failure): a precondition like "e2e-readiness"
+        # failed and the real e2e job never ran, so there's no e2e signal
+        # here at all -- excluded unconditionally, same as the
+        # whole-workflow gate filter above, no opt-in override.
+        # NOT `LOWER(failure_reason) != 'gate'` -- failure_reason is NULL
+        # for every non-failure row (success/cancelled/skipped never set
+        # it, see the ingestion code), and SQL's three-valued NULL logic
+        # makes any comparison against NULL evaluate to NULL, not TRUE --
+        # a bare `!=` here silently excluded the entire table except the
+        # ~7k rows that happen to have a real failure_reason, making every
+        # dashboard look like "100% failures" (confirmed live in
+        # production immediately after this shipped). COALESCE first so
+        # NULL rows compare as '' (never equal to 'gate') and pass through.
+        where.append("COALESCE(LOWER(failure_reason), '') != 'gate'")
         if failure_reason_filter:
             # Picking a failure reason implies "only failures" -- the same
             # effect as also picking status=failure. Takes precedence over
@@ -1812,6 +2013,13 @@ class WorkflowExporter:
         # so they never displace history.
         if include_active:
             def matches_active(job):
+                # Same unconditional whole-workflow-gate exclusion as the
+                # SQL-backed branch above -- without this, a queued/
+                # in-progress run of e.g. "label-gate" would appear here
+                # (the ?active=true path) even though it's excluded from
+                # every completed-history query.
+                if WorkflowExporter._is_gate_name(job.get("workflow")):
+                    return False
                 if failure_reason_filter:
                     # Active (queued/in_progress) jobs are never
                     # conclusion == "failure" yet -- same precedence as
@@ -2141,11 +2349,18 @@ class WorkflowExporter:
         names = sorted(set(j.get("workflow", "unknown") for j in jobs))
         return [{"workflow": n, "__text": n, "__value": n} for n in names]
 
+    # Below this fraction of the total, a "Most Failing Steps" entry is
+    # folded into a single "Other" slice instead of its own -- with dozens
+    # of distinct "job -> step" combinations across e2e flavors, a
+    # piechart/legend listing every single-digit-count step is unreadable.
+    FAILED_STEPS_OTHER_THRESHOLD = 0.10
+
     def get_failed_steps_json(self, params):
         """Return failure counts by step name for jobs matching the filters.
 
         Parses the 'failed_step' field (semicolon-separated "job -> step" entries)
-        from each matching failed job.
+        from each matching failed job. Entries below FAILED_STEPS_OTHER_THRESHOLD
+        of the total are combined into a single "Other" entry.
 
         Returns: [{"step": "step_name", "count": N}, ...] sorted by count desc.
         """
@@ -2159,8 +2374,18 @@ class WorkflowExporter:
                 entry = entry.strip()
                 if entry:
                     step_counts[entry] = step_counts.get(entry, 0) + 1
-        result = [{"step": s, "count": c} for s, c in step_counts.items()]
-        return sorted(result, key=lambda x: -x["count"])
+
+        total = sum(step_counts.values())
+        main = []
+        other_count = 0
+        for step, count in step_counts.items():
+            if total and count / total >= self.FAILED_STEPS_OTHER_THRESHOLD:
+                main.append({"step": step, "count": count})
+            else:
+                other_count += count
+        if other_count:
+            main.append({"step": "Other", "count": other_count})
+        return sorted(main, key=lambda x: -x["count"])
 
     # Maps event names back to human-readable job type labels
     EVENT_TYPE_LABELS = {

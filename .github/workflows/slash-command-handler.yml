@@ -72,6 +72,8 @@ jobs:
 
           if [[ "${FIRST_LINE}" =~ ^/ok-to-test([[:space:]]|$) ]]; then
             echo "command=ok-to-test" >> "$GITHUB_OUTPUT"
+          elif [[ "${FIRST_LINE}" =~ ^/e2e-ready([[:space:]]|$) ]]; then
+            echo "command=e2e-ready" >> "$GITHUB_OUTPUT"
           elif [[ "${FIRST_LINE}" =~ ^/retest ]]; then
             echo "command=retest" >> "$GITHUB_OUTPUT"
           elif [[ "${FIRST_LINE}" =~ ^/cancel[[:space:]]+(.*) ]]; then
@@ -133,10 +135,13 @@ jobs:
             echo "| \`/retest\` | Re-run all failed checks |"
             echo "| \`/cancel [name]\` | Cancel in-progress runs |"
             echo "| \`/ok-to-test\` | Approve fork PR for E2E testing |"
+            echo "| \`/e2e-ready\` | Apply \`e2e-ready\` label to unlock expensive e2e |"
 
             if jq -e '[.[] | select(.stem | startswith("e2e-"))] | length > 0' /tmp/available.json > /dev/null 2>&1; then
               echo ""
               echo "Tip: \`/test e2e\` runs all \`e2e-*\` workflows."
+              echo ""
+              echo "OSAC-3370: expensive e2e runs after CodeRabbit APPROVED on head, \`lgtm\` label, or \`/e2e-ready\`."
             fi
           } > /tmp/help_body.md
 
@@ -203,12 +208,39 @@ jobs:
           gh api "repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
             -f content='+1' --silent 2>/dev/null || true
 
+      - name: Handle e2e-ready
+        if: steps.cmd.outputs.command == 'e2e-ready'
+        env:
+          HEAD_SHA: ${{ steps.pr.outputs.head_sha }}
+        run: |
+          echo "Applying e2e-ready label on PR #${PR_NUMBER}..."
+
+          # Verify head hasn't moved since we parsed the comment.
+          CURRENT_HEAD_SHA=$(gh pr view "${PR_NUMBER}" -R "${REPO}" \
+            --json headRefOid --jq '.headRefOid')
+          if [[ "${CURRENT_HEAD_SHA}" != "${HEAD_SHA}" ]]; then
+            echo "::error::PR head changed (${HEAD_SHA:0:7} -> ${CURRENT_HEAD_SHA:0:7}); retry /e2e-ready."
+            gh pr comment "${PR_NUMBER}" -R "${REPO}" \
+              --body "Could not apply \`e2e-ready\`: PR head moved to \`${CURRENT_HEAD_SHA:0:7}\`. Retry \`/e2e-ready\`."
+            exit 1
+          fi
+
+          gh pr edit "${PR_NUMBER}" -R "${REPO}" --add-label "e2e-ready" 2>/dev/null || \
+            gh api "repos/${REPO}/issues/${PR_NUMBER}/labels" \
+              --input - <<< '{"labels":["e2e-ready"]}' --silent
+
+          gh pr comment "${PR_NUMBER}" -R "${REPO}" \
+            --body "Labeled \`e2e-ready\` on \`${HEAD_SHA:0:7}\`. Expensive e2e is now unlocked (cleanup workflow removes on next push)."
+          gh api "repos/${REPO}/issues/comments/${COMMENT_ID}/reactions" \
+            -f content='rocket' --silent 2>/dev/null || true
+
       - name: Execute command
         if: >-
           steps.cmd.outputs.command != '?' &&
           steps.cmd.outputs.command != 'help' &&
           steps.cmd.outputs.command != 'retest' &&
           steps.cmd.outputs.command != 'ok-to-test' &&
+          steps.cmd.outputs.command != 'e2e-ready' &&
           !startsWith(steps.cmd.outputs.command, 'cancel:')
         env:
           COMMAND: ${{ steps.cmd.outputs.command }}

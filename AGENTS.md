@@ -229,7 +229,6 @@ export OSAC_JWT_PASSWORD=<password>                  # Password for test JWT use
 export OSAC_SERVICE_ACCOUNT=admin                    # ServiceAccount used for `oc create token` (default: admin)
 export OSAC_CLI_PATH=osac                            # Path to the osac CLI binary (default: osac)
 export OSAC_VM_TEMPLATE=ocp-virt-vm                  # ComputeInstance template (vmaas tests, default shown)
-export OSAC_NETWORK_CLASS=cudn-net                    # NetworkClass for test networking (vmaas tests, default shown)
 ```
 
 Token creation is automatic: fixtures run `oc create token <service-account> -n <namespace> --as system:admin` (ServiceAccount) or fetch a JWT from Keycloak (tenant tests) — there is no token env var to set manually.
@@ -301,6 +300,7 @@ Both flavors accept `test-suite`/`test-filter` inputs and output JUnit XML to `r
 - `.github/workflows/slash-command-handler.yml` — Triggers E2E workflow after slash command approval
 - `.github/workflows/ok-to-test-label-cleanup.yml` — Removes the `ok-to-test` label whenever new commits are pushed, requiring an org member to re-approve
 - Tests run in container with Vault secrets injection
+
 
 ### Monitoring Workflows
 

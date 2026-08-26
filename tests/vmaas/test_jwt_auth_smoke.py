@@ -15,7 +15,6 @@ CLIENT_LISTABLE_RESOURCES = [
     "computeinstancetemplates",
     "computeinstances",
     "hosttypes",
-    "networkclasses",
     "externalips",
     "rolebindings",
     "roles",
@@ -73,9 +72,7 @@ def test_invalid_token_rejected(fulfillment_address: str) -> None:
 
 def test_jwt_virtual_network_lifecycle(jwt_grpc_tenant1: GRPCClient) -> None:
     vn_name: str = f"jwt-smoke-{uuid4().hex[:8]}"
-    vn_id: str = jwt_grpc_tenant1.create_virtual_network(
-        name=vn_name, network_class="cudn-net", ipv4_cidr="10.200.0.0/16"
-    )
+    vn_id: str = jwt_grpc_tenant1.create_virtual_network(name=vn_name, ipv4_cidr="10.200.0.0/16")
     assert vn_id in jwt_grpc_tenant1.list_virtual_network_ids()
 
     vn: dict = jwt_grpc_tenant1.get_virtual_network(vn_id=vn_id)
@@ -86,9 +83,7 @@ def test_jwt_virtual_network_lifecycle(jwt_grpc_tenant1: GRPCClient) -> None:
 
 def test_jwt_security_group_lifecycle(jwt_grpc_tenant1: GRPCClient) -> None:
     vn_name: str = f"jwt-sg-vnet-{uuid4().hex[:8]}"
-    vn_id: str = jwt_grpc_tenant1.create_virtual_network(
-        name=vn_name, network_class="cudn-net", ipv4_cidr="10.202.0.0/16"
-    )
+    vn_id: str = jwt_grpc_tenant1.create_virtual_network(name=vn_name, ipv4_cidr="10.202.0.0/16")
 
     for _ in range(90):
         vn = jwt_grpc_tenant1.get_virtual_network(vn_id=vn_id)
@@ -98,11 +93,24 @@ def test_jwt_security_group_lifecycle(jwt_grpc_tenant1: GRPCClient) -> None:
     else:
         pytest.fail(f"VirtualNetwork {vn_id} did not reach READY state within 180s")
 
+    subnet_name: str = f"jwt-sg-subnet-{uuid4().hex[:8]}"
+    subnet_id: str = jwt_grpc_tenant1.create_subnet(
+        name=subnet_name, virtual_network=vn_id, ipv4_cidr="10.202.1.0/24",
+    )
+    for _ in range(90):
+        sn = jwt_grpc_tenant1.get_subnet(subnet_id=subnet_id)
+        if sn["object"].get("status", {}).get("state") == "SUBNET_STATE_READY":
+            break
+        time.sleep(2)
+    else:
+        pytest.fail(f"Subnet {subnet_id} did not reach READY state within 180s")
+
     sg_name: str = f"jwt-sg-{uuid4().hex[:8]}"
     sg_id: str = jwt_grpc_tenant1.create_security_group(name=sg_name, virtual_network=vn_id)
     assert sg_id in jwt_grpc_tenant1.list_security_group_ids()
 
     jwt_grpc_tenant1.delete_security_group(sg_id=sg_id)
+    jwt_grpc_tenant1.delete_subnet(subnet_id=subnet_id)
     jwt_grpc_tenant1.delete_virtual_network(vn_id=vn_id)
 
 
@@ -111,9 +119,7 @@ def test_jwt_security_group_lifecycle(jwt_grpc_tenant1: GRPCClient) -> None:
 
 def test_jwt_tenant_isolation(jwt_grpc_tenant1: GRPCClient, jwt_grpc_tenant2: GRPCClient) -> None:
     vn_name: str = f"tenant-iso-{uuid4().hex[:8]}"
-    vn_id: str = jwt_grpc_tenant1.create_virtual_network(
-        name=vn_name, network_class="cudn-net", ipv4_cidr="10.201.0.0/16"
-    )
+    vn_id: str = jwt_grpc_tenant1.create_virtual_network(name=vn_name, ipv4_cidr="10.201.0.0/16")
 
     assert vn_id in jwt_grpc_tenant1.list_virtual_network_ids()
     assert vn_id not in jwt_grpc_tenant2.list_virtual_network_ids()

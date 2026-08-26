@@ -21,9 +21,11 @@ test-storage:
 	mkdir -p $(REPORTS_DIR)
 	pytest tests/storage/ -v $${TEST_FILTER:+-k "$$TEST_FILTER"} --junitxml=$(REPORTS_DIR)/junit.xml
 
+# Optional: MARKER=sanity or MARKER=regression (pytest -m)
+# -n 0 for local full-suite runs so BMH-consuming tests do not race.
 test-bmaas:
 	mkdir -p $(REPORTS_DIR)
-	pytest tests/bmaas/ -v $${TEST_FILTER:+-k "$$TEST_FILTER"} --junitxml=$(REPORTS_DIR)/junit.xml
+	pytest tests/bmaas/ -n 0 -v $(if $(MARKER),-m "$(MARKER)") $${TEST_FILTER:+-k "$$TEST_FILTER"} $(if $(TEST),-k "$(TEST)") --junitxml=$(REPORTS_DIR)/junit.xml
 
 test-disruptive-vmaas:
 	mkdir -p $(REPORTS_DIR)

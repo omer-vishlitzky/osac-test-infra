@@ -9,6 +9,11 @@ on:
         required: false
         type: string
         default: ""
+      test-marker:
+        description: "pytest -m marker expression (e.g. sanity, regression). Empty runs all."
+        required: false
+        type: string
+        default: ""
       namespace:
         description: "OSAC namespace on the cluster"
         required: false
@@ -324,7 +329,9 @@ jobs:
               git -C "${src}" fetch --depth 1 "https://github.com/${repo}.git" "${sha}"
               git -C "${src}" checkout FETCH_HEAD
             else
-              git clone --depth 1 --branch "${ref}" "https://github.com/${repo}.git" "${src}"
+              git init "${src}"
+              git -C "${src}" fetch --depth 1 "https://github.com/${repo}.git" "${ref}"
+              git -C "${src}" checkout FETCH_HEAD
               sha=$(git -C "${src}" rev-parse HEAD)
               REPO_PINNED_SHA[$repo]="${sha}"
               echo "Pinned ${repo} to SHA ${sha} (resolved from ref '${ref}')."
@@ -407,6 +414,9 @@ jobs:
           podman build --no-cache ${BUILD_ARGS} -t "${E2E_IMAGE}" -f Containerfile .
           rm -f ./osac-cli-bin
 
+      - name: Install grpcurl
+        uses: ./.github/actions/install-grpcurl
+
       - name: Install infrastructure operators
         env:
           KUBECONFIG: ${{ runner.temp }}/kubeconfig
@@ -461,12 +471,10 @@ jobs:
           cd "${INSTALLER_DIR}"
 
           # OCP 4.22 catalogs don't carry older operator channels
-          yq -i '.aapOperator.channel = "stable-2.6-cluster-scoped"' values/bmaas-ci/values.yaml
-          yq -i '.lvms.channel = "stable-4.22"' values/bmaas-ci/values.yaml
+          yq -i '.aapOperator.channel = "stable-2.6-cluster-scoped"' values/bmaas-ci/infra.yaml
+          yq -i '.lvms.channel = "stable-4.22"' values/bmaas-ci/infra.yaml
 
-          make install-operators VALUES_FILE=values/bmaas-ci/values.yaml
-
-          make install-prereqs VALUES_FILE=values/bmaas-ci/values.yaml
+          make install-infra PLATFORM=openshift PROFILE=bmaas-ci NS="${INSTALLER_NAMESPACE}"
 
       - name: Create BMF secrets
         env:
@@ -597,7 +605,7 @@ jobs:
             helm dependency update charts/osac/
           fi
 
-          make install-osac VALUES_FILE=values/bmaas-ci/values.yaml EXTRA_HELM_ARGS="${SET_ARGS[*]}"
+          make install-osac AAP_LICENSE_FILE="${AAP_LICENSE_FILE}" PLATFORM=openshift PROFILE=bmaas-ci NS="${INSTALLER_NAMESPACE}" EXTRA_HELM_ARGS="${SET_ARGS[*]}"
 
           for tenant in "${INSTALLER_NAMESPACE}" shared; do
             echo "Creating Tenant: ${tenant}"
@@ -624,10 +632,37 @@ jobs:
             fi
           done
 
+          # OSAC-3553: gate on a gRPC health check before pytest -- `helm --wait`
+          # only confirms the pod is Ready, not that the route endpoints have
+          # converged, so the suite's first call can fail with Code: Unavailable.
+          # Matches e2e-vmaas/e2e-caas-full-install (OSAC-2528, OSAC-3505).
+          DOMAIN=$(oc get ingresses.config/cluster -o jsonpath='{.spec.domain}')
+          # Health-check the PUBLIC endpoint -- a past regression had the private
+          # address reachable while the public route was still not serving.
+          GRPC_ADDR="fulfillment-api-${INSTALLER_NAMESPACE}.${DOMAIN}:443"
+          GRPC_TOKEN=$(oc create token admin -n "${INSTALLER_NAMESPACE}" --duration 10m --as system:admin)
+          echo "Waiting for gRPC endpoint ${GRPC_ADDR} to be reachable..."
+          for i in $(seq 1 30); do
+            # -format json + jq: grpcurl exits 0 even when the server reports
+            # NOT_SERVING, so parse the response and assert status == SERVING.
+            if grpcurl -insecure -H "Authorization: Bearer ${GRPC_TOKEN}" -format json \
+              "${GRPC_ADDR}" grpc.health.v1.Health/Check 2>/dev/null | jq -e '.status == "SERVING"' >/dev/null 2>&1; then
+              echo "gRPC endpoint reachable (attempt ${i})"
+              break
+            fi
+            if [ "${i}" -eq 30 ]; then
+              echo "gRPC endpoint not reachable after 30 attempts"
+              exit 1
+            fi
+            echo "Attempt ${i}/30 failed, retrying in 2s..."
+            sleep 2
+          done
+
       - name: Run E2E tests
         id: test
         env:
           TEST_FILTER: ${{ inputs.test-filter }}
+          TEST_MARKER: ${{ inputs.test-marker }}
           OSAC_NAMESPACE: ${{ inputs.namespace }}
           OSAC_BMI_TEMPLATE: ${{ inputs.bmi-template }}
           OSAC_BMH_NAMESPACE: ${{ inputs.bmh-namespace }}
@@ -648,6 +683,7 @@ jobs:
             -e OSAC_BMH_NAMESPACE="${OSAC_BMH_NAMESPACE}" \
             -e OSAC_PULL_SECRET_PATH=/root/pull-secret \
             -e "TEST_FILTER=${TEST_FILTER}" \
+            -e "MARKER=${TEST_MARKER}" \
             "${E2E_IMAGE}" \
             make test-bmaas REPORTS_DIR=/tmp/test-output
 

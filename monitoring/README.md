@@ -12,9 +12,9 @@ document only covers the monitoring layer on top of that base.
 
 One **central** machine runs the full stack (Prometheus, Grafana,
 Alertmanager, plus two GitHub-API exporters). Every other CI machine
-(**agent**) runs only `node_exporter` plus a small textfile collector, and is
-reached over an SSH tunnel initiated *from* the central machine — agents
-never need to expose a port publicly.
+(**agent**) runs only `node_exporter`, `haproxy-exporter`, and a small
+textfile collector, and is reached over an SSH tunnel initiated *from* the
+central machine — agents never need to expose a port publicly.
 
 ```
                               central machine (osac-ci-1)
@@ -35,22 +35,26 @@ never need to expose a port publicly.
     :9100 (local)        :9102 (GitHub API)     :9103 (GitHub API)    via SSH tunnel below)
                                                                               |
                     monitoring-tunnel@<host>--<port>.service:                |
-                    ssh -L 127.0.0.1:<port>:127.0.0.1:9100 github-runner@<host>
+                    ssh -L 127.0.0.1:<port>:127.0.0.1:9100 \
+                        -L 127.0.0.1:<port+1>:127.0.0.1:9104 github-runner@<host>
                                                                               |
                   +---------------------------------+---------------------------------+
                   |                                                                   |
           agent machine (osac-3)                                          agent machine (osac-N)
           ========================                                        ========================
           node_exporter :9100                                              node_exporter :9100
+          haproxy_exporter :9104                                           haproxy_exporter :9104
           service-health-textfile.timer (30s)                              service-health-textfile.timer (30s)
 ```
 
-Every machine, central and agent alike, also runs
-`service-health-textfile.timer`, which writes `osac_service_active{unit=...}`
-gauges for services `node_exporter`'s built-in collectors can't see in this
-rootless setup: `haproxy.service`, `podman.socket`, `libvirtd`/`virtqemud`
-(checked via socket units, since both are socket-activated), and any
-`actions.runner.*` GitHub runner agent units on that host.
+Every machine, central and agent alike, also runs `haproxy-exporter`
+(request rate / backend health / error rate, via HAProxy's Unix stats
+socket -- see OSAC-2206) and `service-health-textfile.timer`, which writes
+`osac_service_active{unit=...}` gauges for services `node_exporter`'s
+built-in collectors can't see in this rootless setup: `haproxy.service`,
+`podman.socket`, `libvirtd`/`virtqemud` (checked via socket units, since
+both are socket-activated), and any `actions.runner.*` GitHub runner agent
+units on that host.
 
 ## Components
 
@@ -58,17 +62,27 @@ rootless setup: `haproxy.service`, `podman.socket`, `libvirtd`/`virtqemud`
 |---|---|---|---|
 | `prometheus` | central only | 127.0.0.1:9091 | Scrapes all exporters, evaluates `config/alert-rules.yml`, 30d retention |
 | `grafana` | central only | 0.0.0.0:3000 (HTTPS) | Dashboards, GitHub OAuth login (org: `osac-project`) |
+| `caddy` | central only | 0.0.0.0:3443 (HTTPS) | Reverse proxy to Grafana with an on-demand, self-signed cert matching whatever hostname/IP the client used — avoids the certificate-name-mismatch warning `grafana`'s own fixed-hostname cert (needed for OAuth callback matching) gives on any other address. See caveat below. |
 | `alertmanager` | central only | 127.0.0.1:9093 | Routes alerts to Slack `#osac-ci` |
 | `node-exporter` | every machine | 127.0.0.1:9100 | Host-level metrics (CPU, memory, disk, filesystem) |
+| `haproxy-exporter` | every machine | 127.0.0.1:9104 | HAProxy request rate / backend health / error rate, via a Unix stats socket (no TCP stats port -- zero new network exposure) |
 | `org-runner-exporter` | central only | 127.0.0.1:9102 | GitHub Actions runner online/offline status (org-wide, via GitHub API) |
 | `workflow-exporter` | central only | 127.0.0.1:9103 | Workflow queue depth, run history/duration, failed-step counts (via GitHub API); SQLite-backed, 60-day retention |
 | `service-health-textfile.timer` | every machine | n/a | Writes `osac_service_active` textfile-collector metrics every 30s |
-| `monitoring-tunnel@<host>--<port>.service` | central only, one per agent | n/a | Persistent SSH tunnel forwarding an agent's `node_exporter:9100` to a local port on the central machine |
+| `monitoring-tunnel@<host>--<port>.service` | central only, one per agent | n/a | Persistent SSH tunnel forwarding an agent's `node_exporter:9100` and `haproxy_exporter:9104` to local ports `<port>`/`<port>+1` on the central machine |
 
 `runner-exporter.container` exists in `quadlet/` but is **not currently
 deployed** — no published container image is available yet for it, so
 `monitoring-setup.sh` never installs it and its `prometheus.yml` scrape jobs
 are commented out. Re-enable it once an image exists.
+
+`caddy` was found already live on `osac-ci-1` (OSAC-2209 audit) — hand-created
+directly on the host, never committed or wired into `monitoring-setup.sh`
+until now. Its purpose above is inferred from its config (`tls internal {
+on_demand }` only makes sense as a name-mismatch workaround, and this repo
+uses that exact same pattern for Vault's relay-facing listener — see
+`vpn-relay-access.md`), not confirmed by whoever originally added it. If you
+know the real reason, update this note.
 
 Config lives under `config/` (Prometheus, Alertmanager, alert rules, Grafana
 provisioning + dashboards), container definitions under `quadlet/` (Podman
@@ -136,7 +150,10 @@ bash monitoring/scripts/monitoring-setup.sh --add-tunnel <agent-hostname> <local
 ```
 
 `<local-port>` is an unused port on the central machine (1024-65535) that
-will forward to the agent's `node_exporter:9100`. This starts the
+will forward to the agent's `node_exporter:9100`; `<local-port>+1` is used
+for the agent's `haproxy_exporter:9104` (OSAC-2206) over the same tunnel —
+**choose ports at least 2 apart** from every other registered agent so the
+two never collide. This starts the
 `monitoring-tunnel@<host>--<port>.service`, registers the agent in
 `~/.monitoring-server/config/remote-runners.txt`, regenerates the
 `# BEGIN/END REMOTE TARGETS` block in the deployed `prometheus.yml`, and

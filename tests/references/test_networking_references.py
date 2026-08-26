@@ -12,8 +12,6 @@ from tests.core.helpers import (
     wait_for_security_group_deletion,
     wait_for_subnet_cr,
     wait_for_subnet_deletion,
-    wait_for_virtual_network_cr,
-    wait_for_virtual_network_deletion,
 )
 from tests.core.k8s_client import K8sClient
 
@@ -22,34 +20,6 @@ logger = logging.getLogger(__name__)
 
 class TestNetworkingReferences:
     """OSAC-3095: Networking resource reference tests."""
-
-    def test_create_virtual_network_with_network_class_by_name(
-        self, grpc: GRPCClient, k8s_hub_client: K8sClient, ref_network_class: str, ref_test_run_id: str
-    ):
-        vn_name = f"ref-vn-nc-{ref_test_run_id}"
-        response = grpc.call(
-            service=f"{PUBLIC_API}.VirtualNetworks/Create",
-            data={
-                "object": {
-                    "metadata": {"name": vn_name},
-                    "spec": {"network_class": {"name": ref_network_class}, "ipv4_cidr": "10.211.0.0/16"},
-                }
-            },
-        )
-        vn_id = response["object"]["id"]
-        try:
-            vn = grpc.get_virtual_network(vn_id=vn_id)
-            nc_ref = vn["object"]["spec"].get("network_class", vn["object"]["spec"].get("networkClass", {}))
-            assert nc_ref.get("name") == ref_network_class or nc_ref.get("id"), (
-                "network_class reference should contain name or resolved id"
-            )
-        finally:
-            grpc.delete_virtual_network(vn_id=vn_id)
-            try:
-                vn_cr_name = wait_for_virtual_network_cr(k8s=k8s_hub_client, uuid=vn_id)
-                wait_for_virtual_network_deletion(k8s=k8s_hub_client, name=vn_cr_name)
-            except (subprocess.CalledProcessError, AssertionError, TimeoutError):
-                logger.warning("Cleanup wait failed for virtual network %s", vn_id)
 
     def test_create_subnet_with_virtual_network_by_name(
         self, grpc: GRPCClient, k8s_hub_client: K8sClient, ref_virtual_network: dict[str, str], ref_test_run_id: str
@@ -127,31 +97,3 @@ class TestNetworkingReferences:
         assert ref_subnet["id"] in found_ids, (
             f"Expected subnet {ref_subnet['id']} in filter results for VN name '{vn_name}', got {found_ids}"
         )
-
-    def test_cross_tenant_network_class_reference(
-        self, jwt_grpc_tenant1: GRPCClient, k8s_hub_client: K8sClient, ref_network_class: str, ref_test_run_id: str
-    ):
-        vn_name = f"ref-vn-xt-{ref_test_run_id}"
-        response = jwt_grpc_tenant1.call(
-            service=f"{PUBLIC_API}.VirtualNetworks/Create",
-            data={
-                "object": {
-                    "metadata": {"name": vn_name},
-                    "spec": {"network_class": {"name": ref_network_class}, "ipv4_cidr": "10.213.0.0/16"},
-                }
-            },
-        )
-        vn_id = response["object"]["id"]
-        try:
-            vn = jwt_grpc_tenant1.get_virtual_network(vn_id=vn_id)
-            nc_ref = vn["object"]["spec"].get("network_class", vn["object"]["spec"].get("networkClass", {}))
-            assert nc_ref.get("name") == ref_network_class or nc_ref.get("id"), (
-                "network_class reference should contain name or resolved id for cross-tenant reference"
-            )
-        finally:
-            jwt_grpc_tenant1.delete_virtual_network(vn_id=vn_id)
-            try:
-                vn_cr_name = wait_for_virtual_network_cr(k8s=k8s_hub_client, uuid=vn_id)
-                wait_for_virtual_network_deletion(k8s=k8s_hub_client, name=vn_cr_name)
-            except (subprocess.CalledProcessError, AssertionError, TimeoutError):
-                logger.warning("Cleanup wait failed for virtual network %s", vn_id)

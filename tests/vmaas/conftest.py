@@ -25,6 +25,10 @@ from tests.core.runner import env
 DEFAULT_IT_CORES: int = 2
 DEFAULT_IT_MEMORY_GIB: int = 4
 
+# Shared DiskImage source for CLI-based ComputeInstance scaffolding. Pinned (not
+# :latest) to match the source_ref the gRPC AC tests provision and for CI stability.
+DEFAULT_DISK_IMAGE_SOURCE_REF: str = "quay.io/containerdisks/fedora:41"
+
 
 @pytest.fixture(scope="session")
 def k8s_virt_client(namespace: str) -> K8sClient:
@@ -38,23 +42,13 @@ def vm_template() -> str:
 
 
 @pytest.fixture(scope="session")
-def network_class() -> str:
-    return env("OSAC_NETWORK_CLASS", "cudn-net")
-
-
-@pytest.fixture(scope="session")
 def test_run_id() -> str:
     """Unique ID for this test run to avoid resource name conflicts."""
     return str(uuid.uuid4())[:8]
 
 
 @pytest.fixture(scope="session")
-def default_networking(
-    grpc: GRPCClient,
-    k8s_hub_client: K8sClient,
-    network_class: str,
-    test_run_id: str,
-) -> dict[str, str]:
+def default_networking(grpc: GRPCClient, k8s_hub_client: K8sClient, test_run_id: str) -> dict[str, str]:
     """
     Create default networking resources (VirtualNetwork + Subnet) for VM tests.
 
@@ -74,11 +68,7 @@ def default_networking(
         # Create virtual network with unique name
         vn_name = f"test-vn-{test_run_id}"
         print(f"\nCreating VirtualNetwork: {vn_name}")
-        vn_id = grpc.create_virtual_network(
-            name=vn_name,
-            network_class=network_class,
-            ipv4_cidr="10.200.0.0/16",
-        )
+        vn_id = grpc.create_virtual_network(name=vn_name, ipv4_cidr="10.200.0.0/16")
         vn_cr_name = wait_for_virtual_network_cr(k8s=k8s_hub_client, uuid=vn_id)
         print(f"Waiting for VirtualNetwork {vn_cr_name} to become Ready...")
         wait_for_virtual_network_ready(k8s=k8s_hub_client, name=vn_cr_name)
@@ -87,11 +77,7 @@ def default_networking(
         # Create subnet with unique name
         subnet_name = f"test-subnet-{test_run_id}"
         print(f"Creating Subnet: {subnet_name}")
-        subnet_id = grpc.create_subnet(
-            name=subnet_name,
-            virtual_network=vn_id,
-            ipv4_cidr="10.200.100.0/24",
-        )
+        subnet_id = grpc.create_subnet(name=subnet_name, virtual_network=vn_id, ipv4_cidr="10.200.100.0/24")
         subnet_cr_name = wait_for_subnet_cr(k8s=k8s_hub_client, uuid=subnet_id)
         print(f"Waiting for Subnet {subnet_cr_name} to become Ready...")
         wait_for_subnet_ready(k8s=k8s_hub_client, name=subnet_cr_name)
@@ -159,10 +145,7 @@ def default_instance_type(private_grpc: GRPCClient, test_run_id: str) -> Iterato
     """Create a default ACTIVE instance type for VM tests; clean up after."""
     it_name = f"e2e-default-it-{test_run_id}"
     private_grpc.create_instance_type(
-        name=it_name,
-        cores=DEFAULT_IT_CORES,
-        memory_gib=DEFAULT_IT_MEMORY_GIB,
-        description="Default E2E instance type",
+        name=it_name, cores=DEFAULT_IT_CORES, memory_gib=DEFAULT_IT_MEMORY_GIB, description="Default E2E instance type"
     )
     yield it_name
     try:
@@ -173,11 +156,35 @@ def default_instance_type(private_grpc: GRPCClient, test_run_id: str) -> Iterato
             raise
 
 
+@pytest.fixture(scope="session")
+def default_disk_image(grpc: GRPCClient, test_run_id: str) -> Iterator[str]:
+    """Create a default AVAILABLE Linux DiskImage for CLI-based VM tests; clean up after.
+
+    Mirrors ``default_instance_type`` but diverges in two API-driven ways:
+    DiskImages/Create is a PUBLIC API (uses ``grpc``, not ``private_grpc``), and a
+    DiskImage carries its own UUID distinct from its name — so we capture the id
+    returned at create and delete by id, while yielding the name the CLI's
+    ``--disk-image`` flag needs.
+    """
+    di_name = f"e2e-default-di-{test_run_id}"
+    di_id = grpc.create_disk_image(
+        name=di_name,
+        source_ref=DEFAULT_DISK_IMAGE_SOURCE_REF,
+        guest_os_family="GUEST_OS_FAMILY_LINUX",
+        architecture=["ARCHITECTURE_AMD64"],
+    )
+    yield di_name
+    try:
+        grpc.delete_disk_image(disk_image_id=di_id)
+    except subprocess.CalledProcessError as e:
+        output = ((e.stdout or "") + (e.stderr or "")).lower()
+        # Tolerate only an already-deleted DiskImage; surface in-use/failedprecondition (leaked CI).
+        if "not found" not in output:
+            raise
+
+
 @pytest.fixture(scope="session", autouse=True)
-def _wait_for_tenant_storage_ready(
-    k8s_hub_client: K8sClient,
-    namespace: str,
-) -> None:
+def _wait_for_tenant_storage_ready(k8s_hub_client: K8sClient, namespace: str) -> None:
     """Wait for ClusterStorageReady=True before any VMaaS tests if storage is configured.
 
     When storageFulfillment is enabled, the storage controller triggers AAP jobs to
@@ -216,3 +223,9 @@ def _wait_for_tenant_storage_ready(
 def _set_cli_default_instance_type(cli: OsacCLI, default_instance_type: str) -> None:
     """Wire the session-scoped default instance type into the shared CLI fixture."""
     cli.default_instance_type = default_instance_type
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _set_cli_default_disk_image(cli: OsacCLI, default_disk_image: str) -> None:
+    """Wire the session-scoped default disk image into the shared CLI fixture."""
+    cli.default_disk_image = default_disk_image

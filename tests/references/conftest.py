@@ -32,23 +32,15 @@ def ref_test_run_id() -> str:
 
 
 @pytest.fixture(scope="session")
-def ref_network_class(grpc: GRPCClient) -> str:
-    response: dict[str, Any] = grpc.call(service=f"{PUBLIC_API}.NetworkClasses/List")
-    items = response.get("items", [])
-    assert items, "No network classes found; set OSAC_NETWORK_CLASS or deploy a NetworkClass"
-    return items[0]["metadata"]["name"]
-
-
-@pytest.fixture(scope="session")
 def ref_virtual_network(
-    grpc: GRPCClient, k8s_hub_client: K8sClient, ref_network_class: str, ref_test_run_id: str
+    grpc: GRPCClient, k8s_hub_client: K8sClient, ref_test_run_id: str
 ) -> Generator[dict[str, str], None, None]:
     vn_name = f"ref-vn-{ref_test_run_id}"
     vn_id: str | None = None
     vn_cr_name: str | None = None
 
     try:
-        vn_id = grpc.create_virtual_network(name=vn_name, network_class=ref_network_class, ipv4_cidr="10.210.0.0/16")
+        vn_id = grpc.create_virtual_network(name=vn_name, ipv4_cidr="10.210.0.0/16")
         vn_cr_name = wait_for_virtual_network_cr(k8s=k8s_hub_client, uuid=vn_id)
         wait_for_virtual_network_ready(k8s=k8s_hub_client, name=vn_cr_name)
         yield {"id": vn_id, "name": vn_name, "cr_name": vn_cr_name}
