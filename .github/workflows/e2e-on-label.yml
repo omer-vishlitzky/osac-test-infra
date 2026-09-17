@@ -29,6 +29,11 @@ on:
         required: false
         default: e2e-ready
         type: string
+      test-infra-ref:
+        description: Ref of trusted test-infra action code
+        required: false
+        default: main
+        type: string
   workflow_call:
     inputs:
       pr_number:
@@ -87,7 +92,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           repository: osac-project/osac-test-infra
-          ref: main
+          ref: ${{ inputs.test-infra-ref || 'main' }}
           persist-credentials: false
           sparse-checkout: |
             .github/actions/e2e-start

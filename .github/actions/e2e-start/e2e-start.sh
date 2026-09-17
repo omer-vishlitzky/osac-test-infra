@@ -42,6 +42,7 @@ if ! jq -e '
 fi
 
 merge_ref="refs/pull/${PR_NUMBER}/merge"
+workflow_ref="${merge_ref}"
 if [[ "${REPO}" == "osac-project/osac" ]]; then
   source_repository="${REPO}"
   source_ref="${merge_ref}"
@@ -70,10 +71,10 @@ for workflow in "${workflow_list[@]}"; do
   workflow="${workflow%"${workflow##*[![:space:]]}"}"
   [[ -n "${workflow}" ]] || continue
 
-  echo "Dispatching ${workflow} from main with PR merge ref ${merge_ref}."
+  echo "Dispatching ${workflow} from ${workflow_ref}."
   gh workflow run "${workflow}" \
     --repo "${REPO}" \
-    --ref main \
+    --ref "${workflow_ref}" \
     -f "pr-number=${PR_NUMBER}" \
     -f "installer-repo=${installer_repository}" \
     -f "installer-ref=${installer_ref}" \
