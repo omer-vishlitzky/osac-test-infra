@@ -42,6 +42,10 @@ on:
         description: "PR number that requested a fresh E2E run"
         required: false
         default: ""
+      head-sha:
+        description: "Exact PR head SHA authorized for E2E"
+        required: false
+        default: ""
       source-repository:
         description: "Repository containing the PR source"
         required: false
@@ -70,7 +74,9 @@ concurrency:
 jobs:
   e2e-readiness:
     name: e2e-readiness (caas)
-    if: github.event_name == 'pull_request_target'
+    if: >-
+      github.event_name == 'pull_request_target' ||
+      (github.event_name == 'workflow_dispatch' && inputs.pr-number != '')
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -89,17 +95,16 @@ jobs:
         id: check
         uses: ./.github/actions/check-e2e-readiness
         with:
-          pr-number: ${{ github.event.pull_request.number }}
-          head-sha: ${{ github.event.pull_request.head.sha }}
+          pr-number: ${{ inputs.pr-number || github.event.pull_request.number }}
+          head-sha: ${{ inputs.head-sha || github.event.pull_request.head.sha }}
           require-e2e-ready: true
 
   e2e-caas-full-install:
     needs: [e2e-readiness]
     if: >-
       always()
-      && (github.event_name != 'pull_request_target'
-          || needs.e2e-readiness.result == 'skipped'
-          || needs.e2e-readiness.outputs.ready == 'true')
+      && (needs.e2e-readiness.outputs.ready == 'true'
+          || (github.event_name != 'pull_request_target' && inputs.pr-number == ''))
     permissions:
       contents: read
       # See e2e-vmaas-full-install-caller.yml's identical grant for why
@@ -118,12 +123,12 @@ jobs:
       test-repository: ${{ inputs.test-repository || 'osac-project/osac' }}
       test-ref: ${{ inputs.test-ref || 'main' }}
       notify-on-failure: ${{ github.event_name == 'schedule' }}
-      enable-ai-diagnostic: ${{ github.event_name != 'pull_request_target' && github.ref == 'refs/heads/main' }}
+      enable-ai-diagnostic: ${{ (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.pr-number == '')) && github.ref == 'refs/heads/main' }}
 
   e2e-caas-gate:
     if: >-
       always()
-      && (github.event_name != 'pull_request_target'
+      && ((github.event_name != 'pull_request_target' && inputs.pr-number == '')
           || needs.e2e-readiness.result != 'success'
           || needs.e2e-readiness.outputs.ready == 'true')
     needs: [e2e-readiness, e2e-caas-full-install]
@@ -140,7 +145,8 @@ jobs:
   e2e-caas-complete-stale-gates:
     if: >-
       always()
-      && github.event_name == 'pull_request_target'
+      && (github.event_name == 'pull_request_target'
+          || (github.event_name == 'workflow_dispatch' && inputs.pr-number != ''))
       && needs.e2e-readiness.result == 'success'
       && needs.e2e-readiness.outputs.ready == 'true'
     needs: [e2e-readiness, e2e-caas-full-install, e2e-caas-gate]
@@ -168,7 +174,8 @@ jobs:
   e2e-caas-pending:
     if: >-
       always()
-      && github.event_name == 'pull_request_target'
+      && (github.event_name == 'pull_request_target'
+          || (github.event_name == 'workflow_dispatch' && inputs.pr-number != ''))
       && needs.e2e-readiness.result == 'success'
       && needs.e2e-readiness.outputs.ready != 'true'
     needs: [e2e-readiness, e2e-caas-full-install, e2e-caas-gate]

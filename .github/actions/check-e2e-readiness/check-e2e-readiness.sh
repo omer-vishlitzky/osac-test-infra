@@ -1,20 +1,16 @@
 #!/usr/bin/env bash
 # OSAC-3370: decide whether a PR is ready for expensive e2e.
 #
-# Allow when:
-#   1. "lgtm" label present, or it was applied earlier (Prow / auto-queue
-#      strip the label on push; a prior /lgtm still unlocks later SHAs unless
-#      a human has outstanding CHANGES_REQUESTED), or
-#   2. "e2e-ready" label present (cleanup workflow removes on push), or
-#   3. coderabbitai[bot] APPROVED on head AND no outstanding human CHANGES_REQUESTED
-# Otherwise wait: ready=false, exit 0 (do not fail). Fetch/API errors still fail.
+# Standard full-install callers require a bot-applied e2e-ready label and a
+# bot comment that records the exact approved head SHA. Other callers retain
+# the older review signals. Otherwise wait: ready=false, exit 0. Fetch/API
+# errors still fail.
 #
 # Human APPROVED reviews do NOT unlock e2e (untrusted for this cost gate).
 #
 # Outstanding human CHANGES_REQUESTED = a human reviewer's latest decision
 # review (APPROVED / CHANGES_REQUESTED / DISMISSED) is CHANGES_REQUESTED.
-# COMMENTED reviews do not clear that decision. Match is not tied to head SHA
-# (request-changes often sticks across pushes until re-reviewed).
+# COMMENTED reviews do not clear that decision.
 #
 # Usage (CI):
 #   GH_TOKEN=... REPO=owner/name PR_NUMBER=123 HEAD_SHA=abc \
@@ -130,11 +126,25 @@ e2e_ready_applied_by_trusted_actor() {
   ' <<<"${events_json}" >/dev/null 2>&1
 }
 
+e2e_ready_approval_matches_head() {
+  local comments_json="$1"
+  local head_sha="$2"
+  jq -e --arg who "${E2E_READY_TRUSTED_ACTOR}" --arg sha "${head_sha}" '
+    [.[]
+      | select(.user.login == $who)
+      | select((.body // "") | contains(("<!-- e2e-ready-head:" + $sha + " -->")))
+    ] | length > 0
+  ' <<<"${comments_json}" >/dev/null 2>&1
+}
+
 e2e_ready_unlock_present() {
   local labels_json="$1"
   local events_json="$2"
+  local comments_json="$3"
+  local head_sha="$4"
   labels_have_e2e_ready "${labels_json}" \
-    && e2e_ready_applied_by_trusted_actor "${events_json}"
+    && e2e_ready_applied_by_trusted_actor "${events_json}" \
+    && e2e_ready_approval_matches_head "${comments_json}" "${head_sha}"
 }
 
 # Returns 0 if labels JSON includes lgtm.
@@ -336,13 +346,23 @@ if ! github_api_get_all \
 fi
 echo "::endgroup::"
 
+echo "::group::Fetch issue comments"
+if ! github_api_get_all \
+  "issues/comments" \
+  "${API}/repos/${REPO}/issues/${PR_NUMBER}/comments?per_page=100" \
+  "${tmp}/comments.json"; then
+  exit 1
+fi
+echo "::endgroup::"
+
 labels_json="$(cat "${tmp}/labels.json")"
 reviews_json="$(cat "${tmp}/reviews.json")"
 events_json="$(cat "${tmp}/events.json")"
+comments_json="$(cat "${tmp}/comments.json")"
 
 if [[ "${REQUIRE_E2E_READY}" == "true" ]]; then
-  if e2e_ready_unlock_present "${labels_json}" "${events_json}"; then
-    reason="allowed: e2e-ready label present (applied by trusted actor)"
+  if e2e_ready_unlock_present "${labels_json}" "${events_json}" "${comments_json}" "${HEAD_SHA}"; then
+    reason="allowed: e2e-ready approval matches current head (applied by trusted actor)"
   fi
 elif reason=$(decide_e2e_readiness "${labels_json}" "${reviews_json}" "${HEAD_SHA}" "${events_json}"); then
   :

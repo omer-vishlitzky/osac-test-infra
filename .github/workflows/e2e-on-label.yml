@@ -9,8 +9,8 @@
 # pull_request_target: fork PRs can manage runs/comments with base-repo token.
 # workflow_dispatch: GITHUB_TOKEN label events do not start other workflows, so
 # slash-command-handler dispatches the per-repo e2e-on-label.yml after applying
-# e2e-ready. The starter dispatches each caller from a temporary base-repo
-# branch containing the current synthetic merge commit. Native full-install
+# e2e-ready. The starter dispatches trusted base-branch workflows and passes
+# the current synthetic PR merge ref as source/test inputs. Native full-install
 # jobs report the required gate checks.
 name: E2E on unlock label
 
@@ -28,11 +28,6 @@ on:
         description: Unlock label that was applied
         required: false
         default: e2e-ready
-        type: string
-      test-infra-ref:
-        description: Ref of trusted test-infra action code
-        required: false
-        default: main
         type: string
   workflow_call:
     inputs:
@@ -75,7 +70,7 @@ jobs:
     permissions:
       actions: write
       checks: write
-      contents: write
+      contents: read
       issues: read
       pull-requests: write
     # Native labeled: only e2e-ready. workflow_call / dispatch callers
@@ -92,7 +87,7 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
         with:
           repository: osac-project/osac-test-infra
-          ref: ${{ inputs.test-infra-ref || 'main' }}
+          ref: main
           persist-credentials: false
           sparse-checkout: |
             .github/actions/e2e-start

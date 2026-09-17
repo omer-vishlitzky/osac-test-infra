@@ -5,7 +5,7 @@ on:
   workflow_call: {}
 
 permissions:
-  contents: write
+  contents: read
   pull-requests: write
   actions: write
   checks: write
@@ -34,6 +34,7 @@ jobs:
       - name: Check permissions
         env:
           COMMENTER: ${{ github.event.comment.user.login }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
         run: |
           PERM=$(gh api "repos/${REPO}/collaborators/${COMMENTER}/permission" \
             --jq '.permission' 2>/dev/null) || true
@@ -41,7 +42,7 @@ jobs:
             -H "Authorization: Bearer ${ORG_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/orgs/osac-project/members/${COMMENTER}")
-          if [[ "${ORG_MEMBER_STATUS}" == "204" ]]; then
+          if [[ "${ORG_MEMBER_STATUS}" == "204" && "${COMMENT_BODY}" =~ ^/e2e-ready([[:space:]]|$) ]]; then
             echo "User ${COMMENTER} is an osac-project organization member."
             exit 0
           fi
@@ -328,6 +329,8 @@ jobs:
           fi
 
           gh pr edit "${PR_NUMBER}" -R "${REPO}" --add-label "e2e-ready"
+          gh pr comment "${PR_NUMBER}" -R "${REPO}" \
+            --body "<!-- e2e-ready-head:${HEAD_SHA} -->"
           gh workflow run e2e-on-label.yml \
             -R "${REPO}" \
             -f "pr_number=${PR_NUMBER}" \

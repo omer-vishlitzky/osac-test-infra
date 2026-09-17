@@ -19,11 +19,6 @@ if [[ "$(jq -r '.state' <<<"${pr_json}")" != "open" ]]; then
 fi
 
 head_sha=$(jq -r '.head.sha' <<<"${pr_json}")
-merge_sha=$(jq -r '.merge_commit_sha // empty' <<<"${pr_json}")
-if [[ -z "${merge_sha}" ]]; then
-  echo "PR #${PR_NUMBER} has no synthetic merge commit; refusing to start E2E." >&2
-  exit 1
-fi
 if [[ -n "${EVENT_HEAD_SHA}" && "${head_sha}" != "${EVENT_HEAD_SHA}" ]]; then
   echo "PR head moved (${EVENT_HEAD_SHA:0:7} -> ${head_sha:0:7}); refusing to start stale E2E."
   exit 0
@@ -47,22 +42,7 @@ if ! jq -e '
 fi
 
 merge_ref="refs/pull/${PR_NUMBER}/merge"
-workflow_ref="ci/e2e-pr-${PR_NUMBER}-${merge_sha:0:12}"
-
-old_refs=$(gh api "repos/${REPO}/git/matching-refs/heads/ci/e2e-pr-${PR_NUMBER}-")
-while IFS= read -r old_ref; do
-  [[ -n "${old_ref}" ]] || continue
-  gh api --method DELETE "repos/${REPO}/git/refs/${old_ref#refs/}"
-done < <(jq -r '.[].ref' <<<"${old_refs}")
-
-gh api "repos/${REPO}/git/refs" \
-  -f "ref=refs/heads/${workflow_ref}" \
-  -f "sha=${merge_sha}"
-
-cleanup_workflow_ref() {
-  gh api --method DELETE "repos/${REPO}/git/refs/heads/${workflow_ref}"
-}
-trap cleanup_workflow_ref EXIT
+workflow_ref="main"
 if [[ "${REPO}" == "osac-project/osac" ]]; then
   source_repository="${REPO}"
   source_ref="${merge_ref}"
@@ -91,11 +71,12 @@ for workflow in "${workflow_list[@]}"; do
   workflow="${workflow%"${workflow##*[![:space:]]}"}"
   [[ -n "${workflow}" ]] || continue
 
-  echo "Dispatching ${workflow} from ${workflow_ref}."
+  echo "Dispatching ${workflow} from ${workflow_ref} with source ref ${merge_ref}."
   gh workflow run "${workflow}" \
     --repo "${REPO}" \
     --ref "${workflow_ref}" \
     -f "pr-number=${PR_NUMBER}" \
+    -f "head-sha=${head_sha}" \
     -f "installer-repo=${installer_repository}" \
     -f "installer-ref=${installer_ref}" \
     -f "source-repository=${source_repository}" \

@@ -85,6 +85,9 @@ EVENTS_E2E_READY_HUMAN_THEN_BOT='[
   {"event":"labeled","label":{"name":"e2e-ready"},"actor":{"login":"github-actions[bot]","type":"Bot"}}
 ]'
 EVENTS_NONE='[]'
+
+COMMENTS_E2E_READY_HEAD='[{"user":{"login":"github-actions[bot]"},"body":"<!-- e2e-ready-head:head-commit -->"}]'
+COMMENTS_E2E_READY_OLD_HEAD='[{"user":{"login":"github-actions[bot]"},"body":"<!-- e2e-ready-head:old-commit -->"}]'
 EVENTS_LGTM_LABELED='[
   {"event":"labeled","label":{"name":"lgtm"},"actor":{"login":"alice","type":"User"}}
 ]'
@@ -149,8 +152,10 @@ assert_rc "e2e-ready by bot trusted" 0 e2e_ready_applied_by_trusted_actor "${EVE
 assert_rc "e2e-ready by human untrusted" 1 e2e_ready_applied_by_trusted_actor "${EVENTS_E2E_READY_BY_HUMAN}"
 assert_rc "e2e-ready human then bot trusts last" 0 e2e_ready_applied_by_trusted_actor "${EVENTS_E2E_READY_HUMAN_THEN_BOT}"
 assert_rc "e2e-ready no events untrusted" 1 e2e_ready_applied_by_trusted_actor "${EVENTS_NONE}"
-assert_rc "e2e-ready unlock trusted" 0 e2e_ready_unlock_present "${LABELS_E2E_READY}" "${EVENTS_E2E_READY_BY_BOT}"
-assert_rc "e2e-ready unlock untrusted" 1 e2e_ready_unlock_present "${LABELS_E2E_READY}" "${EVENTS_E2E_READY_BY_HUMAN}"
+assert_rc "e2e-ready approval matches head" 0 e2e_ready_approval_matches_head "${COMMENTS_E2E_READY_HEAD}" "${HEAD_SHA}"
+assert_rc "e2e-ready approval stale head" 1 e2e_ready_approval_matches_head "${COMMENTS_E2E_READY_OLD_HEAD}" "${HEAD_SHA}"
+assert_rc "e2e-ready unlock current head" 0 e2e_ready_unlock_present "${LABELS_E2E_READY}" "${EVENTS_E2E_READY_BY_BOT}" "${COMMENTS_E2E_READY_HEAD}" "${HEAD_SHA}"
+assert_rc "e2e-ready unlock stale head" 1 e2e_ready_unlock_present "${LABELS_E2E_READY}" "${EVENTS_E2E_READY_BY_BOT}" "${COMMENTS_E2E_READY_OLD_HEAD}" "${HEAD_SHA}"
 
 # --- decide_e2e_readiness ---
 assert_rc "decide lgtm present" 0 decide_e2e_readiness "${LABELS_LGTM}" "${REVIEWS_NONE}" "${HEAD_SHA}" "${EVENTS_NONE}"
