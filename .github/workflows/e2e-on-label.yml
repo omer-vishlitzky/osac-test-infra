@@ -75,7 +75,7 @@ jobs:
     permissions:
       actions: write
       checks: write
-      contents: read
+      contents: write
       issues: read
       pull-requests: write
     # Native labeled: only e2e-ready. workflow_call / dispatch callers
