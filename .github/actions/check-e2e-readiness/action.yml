@@ -1,0 +1,46 @@
+---
+name: Check e2e readiness
+description: >-
+  Set ready=true when the PR may run expensive e2e. Callers can require the
+  trusted e2e-ready label. Otherwise ready=false (wait, do not fail). API
+  errors still fail. OSAC-3370.
+
+inputs:
+  pr-number:
+    description: Pull request number
+    required: true
+  head-sha:
+    description: PR head commit SHA that must be covered by CodeRabbit approval (if no unlock label)
+    required: true
+  github-token:
+    description: >-
+      Token with pull-requests:read and issues:read (defaults to github.token).
+    required: false
+    default: ${{ github.token }}
+  require-e2e-ready:
+    description: Require the trusted e2e-ready label instead of other unlock signals.
+    required: false
+    default: "false"
+
+outputs:
+  ready:
+    description: "'true' if expensive e2e may run; 'false' if waiting for unlock"
+    value: ${{ steps.check.outputs.ready }}
+  reason:
+    description: One-line wait or unlock reason for the check summary / overlay
+    value: ${{ steps.check.outputs.reason }}
+
+runs:
+  using: composite
+  steps:
+    - name: Check e2e readiness
+      id: check
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        REPO: ${{ github.repository }}
+        PR_NUMBER: ${{ inputs.pr-number }}
+        HEAD_SHA: ${{ inputs.head-sha }}
+        REQUIRE_E2E_READY: ${{ inputs.require-e2e-ready }}
+        GITHUB_API_URL: ${{ github.api_url }}
+      run: bash "${GITHUB_ACTION_PATH}/check-e2e-readiness.sh"

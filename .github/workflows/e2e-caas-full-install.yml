@@ -87,21 +87,6 @@ on:
         required: false
         type: string
         default: ""
-      fork-pr-author-association:
-        description: "PR author_association from the caller"
-        required: false
-        type: string
-        default: ""
-      fork-pr-author:
-        description: "GitHub login of the PR author (for fork PR org membership check)"
-        required: false
-        type: string
-        default: ""
-      pr-number:
-        description: "PR number (for label-based authorization check)"
-        required: false
-        type: string
-        default: ""
       notify-on-failure:
         description: "Send Slack notification on failure (typically set for scheduled runs)"
         required: false
@@ -228,15 +213,6 @@ jobs:
             echo "EOF_RESOLVED_COMPONENTS"
           } >> "$GITHUB_OUTPUT"
           echo "::endgroup::"
-
-      - name: Authorize fork PR
-        if: inputs.fork-pr-author-association != ''
-        uses: ./.github/actions/authorize-fork-pr
-        with:
-          role-id: ${{ steps.setup.outputs.role-id }}
-          secret-id: ${{ steps.setup.outputs.secret-id }}
-          fork-pr-author: ${{ inputs.fork-pr-author }}
-          pr-number: ${{ inputs.pr-number }}
 
       - name: Fetch and write secrets
         id: secrets

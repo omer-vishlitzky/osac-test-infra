@@ -2,7 +2,11 @@
 
 ## E2E execution
 
-- Full-install callers run E2E for non-draft PRs on `opened`, `ready_for_review`, `synchronize`, and `reopened`.
-- Pull-request runs use GitHub's synthetic PR merge ref and do not modify the contributor's branch.
+- Full-install callers run a cheap readiness job on non-draft PRs; expensive E2E
+  starts only after an organization member invokes `/e2e-ready`.
+- The unlock handler dispatches a fresh workflow with the current GitHub
+  synthetic PR merge ref; it never reruns an older PR workflow run.
+- Pull-request target workflows use trusted base-branch YAML before starting
+  self-hosted jobs.
 - The same workflows run again on `merge_group`, using GitHub's fresh temporary merge-queue ref against current `main`.
-- Draft PRs skip E2E. `/ok-to-test` remains the fork secret authorization command.
+- Draft PRs skip E2E. `e2e-ready` is removed on new commits.
