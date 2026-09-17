@@ -32,6 +32,9 @@ cp "${REMOTE_STAGING_DIR}/license.zip" "${NETRIS_DIR}/license.zip"
 cp "${REMOTE_STAGING_DIR}/pull-secret" /root/pull-secret
 cp "${REMOTE_STAGING_DIR}/config" "${NETRIS_DIR}/config"
 chmod 600 "${NETRIS_DIR}/license.key" "${NETRIS_DIR}/license.zip" "${NETRIS_DIR}/config" /root/pull-secret
+mkdir -p /root/.config/containers
+cp /root/pull-secret /root/.config/containers/auth.json
+chmod 600 /root/.config/containers/auth.json
 
 # Remove the staging copies once they're in their final place -- a second
 # copy lying around outside infra/netris/'s own access patterns is

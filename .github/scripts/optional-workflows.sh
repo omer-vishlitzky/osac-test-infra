@@ -54,7 +54,6 @@ RESERVED_COMMANDS=(
   "?"
   "all"
   "cancel"
-  "e2e-ready"
   "help"
   "ok-to-test"
   "retest"

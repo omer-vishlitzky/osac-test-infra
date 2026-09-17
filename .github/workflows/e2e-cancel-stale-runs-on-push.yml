@@ -1,11 +1,7 @@
 ---
 # Cancel stale full-install runs on every synchronize. pull_request_target uses
 # default-branch workflow YAML and base-repo GITHUB_TOKEN (required to cancel
-# runs). Runs outside full-install concurrency so cleanup still runs when new
-# caller runs queue behind gh run rerun.
-# Do not POST or dismiss e2e-*-gate checks here: GitHub groups unbound Checks
-# API posts onto this suite (same as auto-queue / ok-to-test). Gate dismiss
-# lives in e2e-ready-label-cleanup.yml.
+# runs).
 name: Cancel stale e2e runs on push
 on:
   pull_request_target:

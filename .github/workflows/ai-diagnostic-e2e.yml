@@ -183,16 +183,9 @@ jobs:
           head-branch: ${{ github.event.workflow_run.head_branch }}
           github-token: ${{ github.token }}
 
-      # OSAC-3370's cheap e2e-readiness gate (lgtm / `/e2e-ready` /
-      # CodeRabbit approval) can fail the whole caller workflow before the
-      # actual e2e-{suite}-full-install job -- the one that boots a cluster
-      # and produces the osac-logs-* artifact this diagnosis is built from
-      # -- ever runs. Diagnosing that case burns a Vertex AI call against a
-      # run with zero test evidence and produces a "no artifacts found, go
-      # check the logs yourself" non-answer instead of a real diagnosis; the
-      # actual root cause (missing e2e-ready label/approval) is a fixed,
-      # well-known one-liner already visible in the failing e2e-readiness
-      # check itself, not something worth asking an LLM about.
+      # A docs-only or draft PR can skip the full-install job before it boots a
+      # cluster and produces the osac-logs-* artifact this diagnosis uses.
+      # Avoid spending a Vertex AI call when there is no test evidence.
       #
       # Also gates the SUCCESS path (comment-success below): the paths-filter
       # `changes` job can decide `should-run: false` for a doc-only PR,
@@ -218,7 +211,7 @@ jobs:
           full_install_conclusion=$(gh api --paginate "repos/${REPO}/actions/runs/${RUN_ID}/jobs?per_page=100" \
             --jq '.jobs[] | select(.name | test("^e2e-[a-z]+-full-install(\\s*/.*)?$")) | .conclusion' | head -1)
           if [[ -z "${full_install_conclusion}" || "${full_install_conclusion}" == "skipped" ]]; then
-            echo "e2e-*-full-install job conclusion: '${full_install_conclusion:-missing}' -- the actual E2E test never ran (likely blocked by the e2e-readiness gate). Skipping AI diagnosis, no test evidence to analyze."
+            echo "e2e-*-full-install job conclusion: '${full_install_conclusion:-missing}' -- the actual E2E test never ran. Skipping AI diagnosis, no test evidence to analyze."
             echo "has-test-evidence=false" >> "${GITHUB_OUTPUT}"
           else
             echo "has-test-evidence=true" >> "${GITHUB_OUTPUT}"

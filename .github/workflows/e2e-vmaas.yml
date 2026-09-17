@@ -127,13 +127,17 @@ jobs:
           secrets: |
             secret/data/osac/e2e/pull-secret dockerconfigjson | PULL_SECRET ;
             secret/data/osac/e2e/aap-license license | AAP_LICENSE ;
-            secret/data/osac/e2e/snapshot-registry dockerconfigjson | SNAPSHOT_REGISTRY_AUTH
+            secret/data/osac/e2e/snapshot-registry dockerconfigjson | SNAPSHOT_REGISTRY_AUTH ;
+            secret/data/osac/e2e/quay-io-osac-ci-bot-account user | QUAY_USER ;
+            secret/data/osac/e2e/quay-io-osac-ci-bot-account password | QUAY_PASSWORD
 
       - name: Write secrets
         env:
           PULL_SECRET: ${{ steps.vault.outputs.PULL_SECRET }}
           AAP_LICENSE: ${{ steps.vault.outputs.AAP_LICENSE }}
           SNAPSHOT_REGISTRY_AUTH: ${{ steps.vault.outputs.SNAPSHOT_REGISTRY_AUTH }}
+          QUAY_USER: ${{ steps.vault.outputs.QUAY_USER }}
+          QUAY_PASSWORD: ${{ steps.vault.outputs.QUAY_PASSWORD }}
         run: |
           mkdir -p "${HOME}/.config/containers"
 
@@ -141,7 +145,10 @@ jobs:
           # auth file.  The snapshot secret uses a path-scoped key
           # (quay.io/rh-ee-ovishlit) so it won't conflict with the OCP
           # quay.io entry.
-          jq -s '.[0].auths * .[1].auths | {auths: .}' \
+          jq -s \
+            --arg quay_user "${QUAY_USER}" \
+            --arg quay_password "${QUAY_PASSWORD}" \
+            '.[0].auths * .[1].auths * {"quay.io/osac-project": {"auth": (($quay_user + ":" + $quay_password) | @base64)}} | {auths: .}' \
             <(printf '%s' "${PULL_SECRET}") \
             <(printf '%s' "${SNAPSHOT_REGISTRY_AUTH}") \
             > "${HOME}/.config/containers/auth.json"
