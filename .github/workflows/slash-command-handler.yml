@@ -122,7 +122,7 @@ jobs:
             "https://api.github.com/orgs/osac-project/members/${COMMENTER}")
           if [[ "${status}" != "204" ]]; then
             gh pr comment "${PR_NUMBER}" -R "${REPO}" \
-              --body "@${COMMENTER} must be an osac-project organization member to run \\`/e2e-ready\\`."
+              --body "@${COMMENTER} must be an osac-project organization member to run \`/e2e-ready\`."
             exit 1
           fi
 
@@ -240,15 +240,15 @@ jobs:
             echo "| \`/test e2e-full-regression\` | Dispatch VMaaS + CaaS + BMaaS full e2e (not a PR rerun) |"
             echo "| \`/test ?\` or \`/test help\` | Show this help |"
             echo "| \`/retest\` | Re-run all failed checks |"
-             echo "| \`/cancel [name]\` | Cancel in-progress runs |"
-             echo "| \`/e2e-ready\` | Organization-member unlock for full-install e2e |"
-             echo "| \`/ok-to-test\` | Fork secrets for workflows that still require them |"
+            echo "| \`/cancel [name]\` | Cancel in-progress runs |"
+            echo "| \`/e2e-ready\` | Organization-member unlock for full-install e2e |"
+            echo "| \`/ok-to-test\` | Fork secrets for workflows that still require them |"
 
             if jq -e '[.[] | select(.stem | startswith("e2e-"))] | length > 0' /tmp/available.json > /dev/null 2>&1; then
               echo ""
               echo "Tip: \`/test e2e\` runs all \`e2e-*\` workflows."
               echo ""
-               echo "Full-install e2e starts after an organization member applies \`/e2e-ready\` and runs again in the merge queue."
+              echo "Full-install e2e starts after an organization member applies \`/e2e-ready\` and runs again in the merge queue."
             fi
           } > /tmp/help_body.md
 
@@ -323,7 +323,7 @@ jobs:
           CURRENT_HEAD_SHA=$(gh pr view "${PR_NUMBER}" -R "${REPO}" --json headRefOid --jq '.headRefOid')
           if [[ "${CURRENT_HEAD_SHA}" != "${HEAD_SHA}" ]]; then
             gh pr comment "${PR_NUMBER}" -R "${REPO}" \
-              --body "PR head moved while processing \\`/e2e-ready\\`; run the command again."
+              --body "PR head moved while processing \`/e2e-ready\`; run the command again."
             exit 1
           fi
 
@@ -333,7 +333,7 @@ jobs:
             -f "pr_number=${PR_NUMBER}" \
             -f "trigger_label=e2e-ready"
           gh pr comment "${PR_NUMBER}" -R "${REPO}" \
-            --body "Applied \\`e2e-ready\\` and started a fresh E2E run for \\`${HEAD_SHA:0:7}\\`."
+            --body "Applied \`e2e-ready\` and started a fresh E2E run for \`${HEAD_SHA:0:7}\`."
 
       - name: Handle e2e-full-regression
         if: steps.cmd.outputs.command == 'e2e-full-regression'
