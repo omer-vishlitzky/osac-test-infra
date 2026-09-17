@@ -30,14 +30,6 @@ on:
         description: "Expected immutable PR head SHA"
         required: false
         default: ""
-      fork-pr-author-association:
-        description: "PR author association used by fork authorization"
-        required: false
-        default: ""
-      fork-pr-author:
-        description: "PR author login used by fork authorization"
-        required: false
-        default: ""
       instance-type:
         description: "EC2 instance type -- curated allow-list, not free text, so a dispatch can't accidentally launch an unexpectedly expensive type."
         required: false
@@ -85,10 +77,37 @@ concurrency:
   cancel-in-progress: ${{ inputs.pr-number != '' || github.event_name == 'pull_request_target' }}
 
 jobs:
+  e2e-readiness:
+    if: >-
+      github.event_name == 'pull_request_target' ||
+      (github.event_name == 'workflow_dispatch' && inputs.pr-number != '')
+    runs-on: ubuntu-latest
+    outputs:
+      ready: ${{ steps.readiness.outputs.ready }}
+    permissions:
+      contents: read
+      issues: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: osac-project/osac-test-infra
+          ref: main
+          persist-credentials: false
+      - id: readiness
+        uses: ./.github/actions/check-e2e-readiness
+        with:
+          pr-number: ${{ inputs.pr-number || github.event.pull_request.number }}
+          head-sha: ${{ inputs.pr-sha || github.event.pull_request.head.sha }}
+          require-e2e-ready: true
+
   e2e-bmaas-netris:
     if: >-
-      github.event_name != 'pull_request_target'
-      || github.event.label.name == 'e2e-bmaas-netris'
+      always() &&
+      (needs.e2e-readiness.result == 'success'
+       && needs.e2e-readiness.outputs.ready == 'true'
+       || (github.event_name != 'pull_request_target' && inputs.pr-number == ''))
+    needs: [e2e-readiness]
     uses: ./.github/workflows/e2e-bmaas-netris-full-install.yml
     with:
       instance-type: ${{ inputs.instance-type || 'c5n.metal' }}
@@ -106,6 +125,4 @@ jobs:
       pr-repository: ${{ inputs.pr-repository || github.event.pull_request.head.repo.full_name || '' }}
       pr-ref: ${{ inputs.pr-ref || github.event.pull_request.head.ref || '' }}
       pr-sha: ${{ inputs.pr-sha || github.event.pull_request.head.sha || '' }}
-      fork-pr-author-association: ${{ inputs.fork-pr-author-association || (github.event.pull_request.head.repo.full_name != github.repository && github.event.pull_request.author_association) || '' }}
-      fork-pr-author: ${{ inputs.fork-pr-author || (github.event.pull_request.head.repo.full_name != github.repository && github.event.pull_request.user.login) || '' }}
       pr-number: ${{ inputs.pr-number || github.event.pull_request.number || '' }}
