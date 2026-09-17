@@ -9,9 +9,9 @@
 # pull_request_target: fork PRs can manage runs/comments with base-repo token.
 # workflow_dispatch: GITHUB_TOKEN label events do not start other workflows, so
 # slash-command-handler dispatches the per-repo e2e-on-label.yml after applying
-# e2e-ready. The starter dispatches each caller from main and passes the
-# current refs/pull/<number>/merge source ref. Native full-install jobs report
-# the required gate checks.
+# e2e-ready. The starter dispatches each caller from a temporary base-repo
+# branch containing the current synthetic merge commit. Native full-install
+# jobs report the required gate checks.
 name: E2E on unlock label
 
 on:
