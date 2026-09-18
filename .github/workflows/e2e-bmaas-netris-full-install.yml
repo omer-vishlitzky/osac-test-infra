@@ -232,15 +232,24 @@ jobs:
           exportEnv: false
           secrets: |
             secret/data/osac/e2e/pull-secret dockerconfigjson | PULL_SECRET ;
-            secret/data/osac/e2e/aap-license license | AAP_LICENSE
+            secret/data/osac/e2e/aap-license license | AAP_LICENSE ;
+            secret/data/osac/e2e/quay-io-osac-ci-bot-account user | QUAY_USER ;
+            secret/data/osac/e2e/quay-io-osac-ci-bot-account password | QUAY_PASSWORD
 
       - name: Write pull secret and AAP license to temp files
         shell: bash
         env:
           PULL_SECRET: ${{ steps.vault-secrets.outputs.PULL_SECRET }}
           AAP_LICENSE: ${{ steps.vault-secrets.outputs.AAP_LICENSE }}
+          QUAY_USER: ${{ steps.vault-secrets.outputs.QUAY_USER }}
+          QUAY_PASSWORD: ${{ steps.vault-secrets.outputs.QUAY_PASSWORD }}
         run: |
-          printf '%s' "${PULL_SECRET}" > "$RUNNER_TEMP/pull-secret.json"
+          jq -s \
+            --arg quay_user "${QUAY_USER}" \
+            --arg quay_password "${QUAY_PASSWORD}" \
+            '.[0].auths * {"quay.io/osac-project": {"auth": (($quay_user + ":" + $quay_password) | @base64)}} | {auths: .}' \
+            <(printf '%s' "${PULL_SECRET}") \
+            > "$RUNNER_TEMP/pull-secret.json"
           chmod 600 "$RUNNER_TEMP/pull-secret.json"
           printf '%s' "${AAP_LICENSE}" | base64 -d > "$RUNNER_TEMP/aap-license.zip"
           chmod 600 "$RUNNER_TEMP/aap-license.zip"
