@@ -146,9 +146,7 @@ jobs:
           # (quay.io/rh-ee-ovishlit) so it won't conflict with the OCP
           # quay.io entry.
           jq -s \
-            --arg quay_user "${QUAY_USER}" \
-            --arg quay_password "${QUAY_PASSWORD}" \
-            '.[0].auths * .[1].auths * {"quay.io/osac-project": {"auth": (($quay_user + ":" + $quay_password) | @base64)}} | {auths: .}' \
+            '.[0].auths * .[1].auths * {"quay.io/osac-project": {"auth": ((env.QUAY_USER + ":" + env.QUAY_PASSWORD) | @base64)}} | {auths: .}' \
             <(printf '%s' "${PULL_SECRET}") \
             <(printf '%s' "${SNAPSHOT_REGISTRY_AUTH}") \
             > "${HOME}/.config/containers/auth.json"

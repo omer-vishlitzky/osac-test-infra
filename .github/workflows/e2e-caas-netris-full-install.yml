@@ -227,9 +227,7 @@ jobs:
           QUAY_PASSWORD: ${{ steps.vault-secrets.outputs.QUAY_PASSWORD }}
         run: |
           jq -s \
-            --arg quay_user "${QUAY_USER}" \
-            --arg quay_password "${QUAY_PASSWORD}" \
-            '.[0].auths * {"quay.io/osac-project": {"auth": (($quay_user + ":" + $quay_password) | @base64)}} | {auths: .}' \
+            '.[0].auths * {"quay.io/osac-project": {"auth": ((env.QUAY_USER + ":" + env.QUAY_PASSWORD) | @base64)}} | {auths: .}' \
             <(printf '%s' "${PULL_SECRET}") \
             > "$RUNNER_TEMP/pull-secret.json"
           chmod 600 "$RUNNER_TEMP/pull-secret.json"
