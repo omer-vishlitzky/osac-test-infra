@@ -510,6 +510,8 @@ def resolve_tested_revision(
         )
         if status_binding.verdict is Verdict.VERIFIED:
             return status_binding
+        if status_binding.reason == "trusted_status_ambiguous_sha":
+            return status_binding
         if tests_run_head:
             return _head_policy_binding(run)
         if override is not None:

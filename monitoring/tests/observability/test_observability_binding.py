@@ -811,6 +811,22 @@ def test_trusted_statuses_on_two_commits_stay_ambiguous() -> None:
     assert binding.reason == "trusted_status_ambiguous_sha"
 
 
+def test_conflicting_status_evidence_cannot_fall_back_to_checkout_policy() -> None:
+    binding = resolve_tested_revision(
+        pr_suite_run(),
+        [e2e_pr_job()],
+        [status(sha=TESTED_SHA), status(sha=NEW_HEAD_SHA)],
+        expected_context=VMaaS_CONTEXT,
+        trusted_creator_ids=TRUSTED_CREATORS,
+        expected_job_id=E2E_PR_JOB_ID,
+        tests_run_head=True,
+    )
+
+    assert binding.verdict is Verdict.UNKNOWN
+    assert binding.tested_sha is None
+    assert binding.reason == "trusted_status_ambiguous_sha"
+
+
 def test_event_without_a_rule_stays_unknown() -> None:
     run = GitHubRun.from_api(run_raw(event="workflow_run"))
 
