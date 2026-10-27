@@ -1,16 +1,12 @@
 ---
 name: Monitoring unit tests
 
-# Unit tests for the Python scripts in monitoring/scripts
-# (workflow-exporter.py, post-ci-digest.py). A workflow of its own, so the
-# paths filter keeps it to pull requests that change those scripts, their
-# tests, or this file -- path filters apply per workflow, not per job. The
-# run fails when coverage of monitoring/scripts drops below 80%
-# (monitoring/tests/pytest.ini).
+# Contract changes need the same validation as their producers and consumers.
 on:
   pull_request:
     paths:
       - "monitoring/scripts/**"
+      - "monitoring/ci_observability/**"
       - "monitoring/tests/**"
       - ".github/workflows/monitoring-unit-tests.yml"
 
