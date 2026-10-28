@@ -5,6 +5,10 @@ plus a read-only HTTP API over it. This is the storage layer of the CI
 observability work: it keeps exact history for run investigation, comparison,
 and reporting, and it never interprets what it stores.
 
+[Bundle ingestion](INGESTION.md) adds private source receipts, quarantine and
+verified publication. Producer claims remain separate from GitHub-owned identity
+and conclusions.
+
 The user-facing overview of the monitoring stack stays in
 [`../README.md`](../README.md). The CI source inventory is in
 [`CI-INVENTORY.md`](CI-INVENTORY.md).
@@ -17,6 +21,10 @@ The user-facing overview of the monitoring stack stays in
 | `ledger_journal` | Per-journal contiguity checkpoint: `(execution_id, journal_id)` and `prefix_sequence`, the length of the stored contiguous prefix. |
 | `ledger_event` | One row per journal record: `execution_id`, `journal_id`, `sequence`, `schema_version`, the indexed `recorded_at`/`source_at` timestamptz plus the original `recorded_at_text`/`source_at_text`, `mono_ns`, `invocation_id`, `clock_id`, `clock_uncertainty_ns`, `event`, `data` (canonical JSON text in a json column, at most 1 MiB), `data_sha256`, `ingested_at`. |
 | `schema_migrations` | Applied migration versions. |
+
+Migration 0002 adds private source receipts, execution ownership, GitHub
+observations and redaction proofs. The reader role cannot select these raw
+source tables. See [ingestion storage](INGESTION.md) for their lifecycle.
 
 `repository_id` is a required positive integer: the v1 manifest always
 carries it, so there is no unknown-repository path. `github_job_id` stays
@@ -129,6 +137,24 @@ The migration creates no roles and issues no grants: role bootstrap and
 `GRANT SELECT` for the reader are owned by the monitoring deployment, so a
 deviation from the deployment defaults is impossible to hide in a
 migration.
+
+Migration 0002 revokes reader access to the private source tables, including
+PUBLIC, column-level and inherited grants. Ledger tables keep their grants.
+The container bootstrap also denies reader defaults on bootstrap-user-created
+tables, so backup restoration preserves private-table access rules.
+
+Bootstrap runs only when the data volume is empty. Before restoring into a
+local pilot initialized with the old defaults, rerun the current bootstrap
+inside its container. Updating the checkout alone does not change existing
+database privileges. From the repository root:
+
+```bash
+podman exec -i ci-observability-postgres bash \
+    < monitoring/config/observability/postgres-init-roles.sh
+```
+
+Use the pilot's container name if it differs. This step reads its existing
+protected environment; do not pass passwords on the command line.
 
 Every query is parameterized. Table and schema names are composed with
 `psycopg.sql.Identifier` from code-controlled, validated values, never from
@@ -262,9 +288,9 @@ There is no write endpoint and the server makes no outbound requests.
 
 ## Dependencies
 
-`runtime-requirements.txt` pins the only runtime dependency
-(`psycopg[binary]==3.3.6`). It is not part of
-`monitoring/tests/requirements.txt`.
+`runtime-requirements.txt` pins `psycopg[binary]==3.3.6` and
+`jsonschema==4.23.0`. Ingestion uses the frozen contract validators locally;
+it does not fetch schemas or executable code from the network.
 
 ## Tests
 
@@ -297,23 +323,20 @@ and the CLI environment-DSN contract including the `/proc` cmdline check.
 
 ## Scope and gaps
 
-W01a stores validated records; it does not decide what is valid. Not
-implemented here:
+The ledger stores validated records. Ingestion validates frozen bundle bytes
+and publishes only verified, attested deliveries. Still missing:
 
-- Bundle ingestion and native report parsers. The v1 contract and validators
-  are implemented; W01b and W03 use them. Raw reconciliation
-  metadata — for example which earlier attempt a not-executed record
-  carries over from — is W01b.
+- Native report parsing and workflow handoff. The v1 contract, validators and
+  ingestion are implemented; native adapters remain separate W03 work.
 - The trusted ingest boundary: batch manifests, redaction checks, spooling,
   and acknowledgements over the transport (W06). The storage-side hooks it
   needs (register, append, bind, resolve, conclusions) are in place.
-- GitHub reconciliation: run and job fetching, attempt and inherited-result
-  assignment, stale in-progress handling, and backfill (W01b). The storage
-  columns and the write-once paths it needs are in place.
-- Deployment: Quadlets, role bootstrap, reader grants, backups, retention
-  (W05); the CLI serves on loopback only and nothing was deployed.
-- CI wiring for psycopg and a PostgreSQL service in the monitoring test
-  workflow (the parent owns the environment contract).
+- GitHub polling, artifact delivery, stale-job handling and historical backfill.
+  Reconciliation of explicitly supplied trusted metadata is implemented;
+  ingestion itself performs no network fetch.
+- Live rollout and approved storage and retention limits. Opt-in backend
+  packaging, backup tools and required PostgreSQL CI tests exist; none of this
+  enables collection or deploys to the fleet.
 - Consumer wiring (Grafana dashboards, the W06/W10 read paths) chooses
   between cursor pages and the offset window per query; nothing here
   decides for them.

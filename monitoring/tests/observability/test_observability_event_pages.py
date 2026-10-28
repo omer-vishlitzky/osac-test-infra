@@ -82,7 +82,7 @@ def dsn() -> str:
 def test_schema(dsn: str) -> Iterator[str]:
     name = f"ci_obs_w01d_pages_{os.getpid()}"
     try:
-        assert ledger.apply_migrations(dsn=dsn, schema=name) == [1]
+        assert ledger.apply_migrations(dsn=dsn, schema=name) == [1, 2]
         yield name
     finally:
         # Armed from the first owned mutation: a failed migration also drops.
@@ -1003,7 +1003,7 @@ def test_database_failure_midstream_ends_the_stream(dsn: str) -> None:
     try:
         # Owned from the first mutation: a failed setup also drops the
         # schema instead of leaking it into the shared server.
-        assert ledger.apply_migrations(dsn=dsn, schema=schema) == [1]
+        assert ledger.apply_migrations(dsn=dsn, schema=schema) == [1, 2]
         execution_id = "gh-1-r906-a1-j1"
         _register_execution(dsn=dsn, schema=schema, execution_id=execution_id, run_id=906)
         pad = "z" * 1_039_000
@@ -1290,7 +1290,7 @@ def test_keepalive_resets_response_state_between_requests(dsn: str) -> None:
     server = None
     connection = None
     try:
-        assert ledger.apply_migrations(dsn=dsn, schema=schema) == [1]
+        assert ledger.apply_migrations(dsn=dsn, schema=schema) == [1, 2]
         _register_execution(dsn=dsn, schema=schema, execution_id=execution_id, run_id=908)
         _append_batches(
             dsn=dsn,

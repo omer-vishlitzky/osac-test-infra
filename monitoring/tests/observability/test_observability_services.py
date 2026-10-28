@@ -1397,6 +1397,45 @@ def test_ci_prometheus_scrapes_the_read_api_health_metric(
 
 
 @real_stack
+def test_postgres_source_privacy_survives_backup_restore(*, pg_container: ContainerFixture, tmp_path: Path) -> None:
+    """Exercise the deployed roles and restore scripts, not synthetic grants."""
+    container = pg_container.name
+    mapping = podman(["port", container, "5432/tcp"])
+    assert mapping.returncode == 0, mapping.stderr
+    port = int(mapping.stdout.strip().rsplit(":", 1)[1])
+    ledger.apply_migrations(dsn=f"postgresql://ci_observability:{PG_INGEST_PW}@127.0.0.1:{port}/ci_observability")
+
+    permissions_query = (
+        "SELECT has_table_privilege(current_user, table_name, 'SELECT'),"
+        " has_any_column_privilege(current_user, table_name, 'SELECT')"
+        " FROM (VALUES ('ci_observability.source_receipt'),"
+        " ('ci_observability.source_execution'),"
+        " ('ci_observability.source_github_observation'),"
+        " ('ci_observability.source_redaction_proof')) AS sources(table_name)"
+    )
+    before = psql(container, permissions_query, user="ci_observability_reader", password=PG_READER_PW)
+    assert before.splitlines() == ["f|f"] * 4
+    assert (
+        psql(container, "SELECT count(*) FROM ledger_execution", user="ci_observability_reader", password=PG_READER_PW)
+        == "0"
+    )
+
+    env = {"CI_OBSERVABILITY_HOME": str(tmp_path), "CI_OBSERVABILITY_POSTGRES_CONTAINER": container}
+    backup = run(["bash", str(BACKUP_SCRIPT)], env=env, timeout=180)
+    assert backup.returncode == 0, backup.stderr
+    dump = next((tmp_path / "backups").glob("ci_observability_*.dump"))
+    restored = run(["bash", str(RESTORE_SCRIPT), str(dump), "--force"], env=env, timeout=180)
+    assert restored.returncode == 0, restored.stderr
+
+    after = psql(container, permissions_query, user="ci_observability_reader", password=PG_READER_PW)
+    assert after.splitlines() == ["f|f"] * 4
+    assert (
+        psql(container, "SELECT count(*) FROM ledger_execution", user="ci_observability_reader", password=PG_READER_PW)
+        == "0"
+    )
+
+
+@real_stack
 def test_stack_script_full_check(tmp_path: Path) -> None:
     """The shipped configs validated by the real upstream binaries
     (loki -verify-config, promtool check config, alloy validate) through

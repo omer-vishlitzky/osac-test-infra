@@ -151,7 +151,7 @@ def dsn() -> str:
 @pytest.fixture(scope="session")
 def test_schema(dsn: str) -> Iterator[str]:
     name = f"ci_obs_w01a_readapi_{os.getpid()}"
-    assert ledger.apply_migrations(dsn=dsn, schema=name) == [1]
+    assert ledger.apply_migrations(dsn=dsn, schema=name) == [1, 2]
     yield name
     with psycopg.connect(dsn, autocommit=True) as conn:
         conn.execute(sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(name)))

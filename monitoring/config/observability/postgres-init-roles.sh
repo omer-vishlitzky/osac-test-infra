@@ -35,13 +35,13 @@ ALTER ROLE ci_observability_reader CONNECTION LIMIT 20;
 CREATE SCHEMA IF NOT EXISTS ci_observability AUTHORIZATION ci_observability;
 GRANT USAGE ON SCHEMA ci_observability TO ci_observability_reader;
 
--- Future tables are readable by the reader role without further grants,
--- whichever role creates them (the ingest role, or the bootstrap
--- superuser running W01's migrations).
+-- Migrations run as the ingest role and revoke access to private tables.
+-- Restores run as the bootstrap user; its defaults must not undo the
+-- archive's private-table ACLs while recreating those tables.
 ALTER DEFAULT PRIVILEGES FOR ROLE ci_observability IN SCHEMA ci_observability
     GRANT SELECT ON TABLES TO ci_observability_reader;
 ALTER DEFAULT PRIVILEGES FOR ROLE :"bootstrap_user" IN SCHEMA ci_observability
-    GRANT SELECT ON TABLES TO ci_observability_reader;
+    REVOKE SELECT ON TABLES FROM ci_observability_reader;
 
 -- Dedicated database: nothing is inherited from PUBLIC. Only the two
 -- stack roles may connect, only the ingest role may create temporary
