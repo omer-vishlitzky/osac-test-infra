@@ -316,6 +316,11 @@
 
 # Keep bmf.metal3.enabled false here: it enables the BMF subchart's own Secret
 # templates. The OSAC chart's testBackend templates provide those configs instead.
+# The inventory namespace must be bmaas_bmh_namespace: setup-bmaas creates the
+# virtual BareMetalHosts there, and the BMF operator lists hosts only in the
+# namespace this override renders into the inventory secret. Pointing it at
+# osac_namespace leaves the operator searching an empty namespace, so every
+# BareMetalInstance fails with NoMatchingHosts.
 - name: Configure the Metal3 test backend for bare-metal services
   when:
     - bare_metal_services | bool
@@ -329,7 +334,7 @@
                'inventoryConfig': 'osac-inventory-config-metal3-test',
                'managementConfig': 'osac-management-config-metal3-test'
              },
-             'testBackend': {'metal3': {'enabled': true, 'namespace': osac_namespace}}
+             'testBackend': {'metal3': {'enabled': true, 'namespace': bmaas_bmh_namespace}}
            }
          }, recursive=true) }}
 
