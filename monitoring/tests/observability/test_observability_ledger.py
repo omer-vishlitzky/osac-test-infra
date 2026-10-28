@@ -21,6 +21,7 @@ import json
 import os
 import threading
 import time
+import uuid
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 
@@ -35,6 +36,7 @@ except ModuleNotFoundError:
     pytest.skip("psycopg is not installed and CI_OBSERVABILITY_TEST_DSN is not set", allow_module_level=True)
 
 from psycopg import sql
+from psycopg.conninfo import make_conninfo
 
 from monitoring.ci_observability import ledger
 from monitoring.ci_observability.contracts.validation import CONTRACTS_V1_DIR, validate_bundle
@@ -182,6 +184,29 @@ def test_migrate_is_idempotent(dsn: str) -> None:
 def test_migrate_rejects_unsafe_schema_name(dsn: str) -> None:
     with pytest.raises(ValueError, match="schema name"):
         ledger.apply_migrations(dsn=dsn, schema='evil"; DROP SCHEMA x')
+
+
+def test_schema_owner_can_migrate_without_database_create_privilege(dsn: str) -> None:
+    suffix = uuid.uuid4().hex[:10]
+    schema = f"ci_obs_restricted_migration_{suffix}"
+    role = f"ci_obs_migration_owner_{suffix}"
+    try:
+        with psycopg.connect(dsn, autocommit=True) as administrator:
+            administrator.execute(sql.SQL("CREATE ROLE {} LOGIN").format(sql.Identifier(role)))
+            administrator.execute(
+                sql.SQL("CREATE SCHEMA {} AUTHORIZATION {}").format(sql.Identifier(schema), sql.Identifier(role))
+            )
+            allowed = administrator.execute(
+                "SELECT has_database_privilege(%s, current_database(), 'CREATE')", (role,)
+            ).fetchone()[0]
+            assert allowed is False
+        restricted_dsn = make_conninfo(dsn, user=role)
+        assert ledger.apply_migrations(dsn=restricted_dsn, schema=schema) == [1]
+        assert ledger.apply_migrations(dsn=restricted_dsn, schema=schema) == []
+    finally:
+        with psycopg.connect(dsn, autocommit=True) as administrator:
+            administrator.execute(sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(schema)))
+            administrator.execute(sql.SQL("DROP ROLE IF EXISTS {}").format(sql.Identifier(role)))
 
 
 def test_migrate_serializes_first_schema_creation(dsn: str) -> None:

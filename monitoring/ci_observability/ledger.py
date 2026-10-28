@@ -354,7 +354,10 @@ def apply_migrations(*, dsn: str, schema: str = DEFAULT_SCHEMA) -> list[int]:
         conn.cursor() as cur,
     ):
         cur.execute("SELECT pg_advisory_xact_lock(hashtext(%s))", (schema,))
-        cur.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(schema)))
+        # PostgreSQL checks database CREATE even with IF NOT EXISTS.
+        cur.execute("SELECT to_regnamespace(%s)", (schema,))
+        if cur.fetchone()[0] is None:
+            cur.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
         cur.execute("SELECT to_regclass(%s)", (f"{schema}.schema_migrations",))
         recorded: set[int] = set()
         if cur.fetchone()[0] is not None:
