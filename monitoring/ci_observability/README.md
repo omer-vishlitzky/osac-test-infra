@@ -170,15 +170,80 @@ non-loopback address.
 | `GET /api/v1/runs` | Registered runs. `execution_count` counts records known to have executed; `registration_count` counts every stored record. Filters: `repository_id`. |
 | `GET /api/v1/executions` | Bounded execution list. Filters: `repository_id`, `run_id`, `run_attempt`, `logical_job_key`, `github_job_id`, `executed`, `registered_after`, `registered_before`. |
 | `GET /api/v1/executions/{execution_id}` | One execution with event and journal counts. |
-| `GET /api/v1/executions/{execution_id}/events` | Events in timeline order. Filters: `journal_id`, `recorded_after`, `recorded_before`. |
+| `GET /api/v1/executions/{execution_id}/events` | Events in timeline order: byte-capped cursor pages by default, the legacy offset window when `offset` is given. Filters: `journal_id`, `recorded_after`, `recorded_before`. |
 
-All list endpoints take `limit` (1 to 500, default 100) and `offset`
-(0 to 10 000), reject unknown or repeated query parameters, and validate
-values before any query runs. Every query is bounded by `limit`, request
-paths are capped at 2048 bytes, query strings at 16 fields, and every
-response body carries the stored facts: the original timestamp text, the
-exact payload types, authoritative conclusions and producer claims as
-separate fields, and no derived outcome or cause.
+### Bounded event pages
+
+The events route never materializes a history. Without `offset` it serves
+one keyset page with the same response fields as the legacy window
+(`offset` is always 0 there) plus `next_cursor` and `byte_cap`: the server
+reads the candidate timeline keys with their stored payload sizes first,
+fetches exactly those planned `(journal_id, sequence)` pairs — rows
+appended between the two queries cannot join the payload fetch, so the
+page's cost is bounded by its plan even under concurrent inserts — and
+cuts the page on the real serialized bytes, data, metadata, and JSON
+escaping all counted, against a server-chosen cap (`byte_cap`, 8 MiB: at
+least seven maximal 1 MiB events plus envelopes). A page always contains
+at least one event, `count` is the exact number of returned rows, and
+`next_cursor` continues the walk; a cursor page is never silently
+truncated, it just ends at the cap and the rest returns on the next page.
+The suffix after the events array is reserved at its derived legal worst
+case (a maximal cursor token over a 128-character journal id, a
+30-character timestamp, a 19-digit sequence, and the context digest), so
+the advertised cap holds for adversarial legal field maxima too. The
+keyset predicate `(recorded_at, journal_id, sequence) > (cursor)` is
+served by the `idx_event_execution_recorded` index, so each page costs a
+bounded index range, never a scan of the history, and a walk traverses any
+number of rows — the 10 000-row `offset` cap does not apply to it. The
+cursor carries each event's original timestamp text, up to nine fractional
+digits; the SQL ordering index stores `timestamptz` microseconds, so two
+events whose texts differ only below microseconds tie on the index and are
+ordered by `(journal_id, sequence)`, which is unique per execution.
+
+The cursor token is base64 JSON binding the position to the exact
+execution and filters: reusing it against a different query is a fixed
+`400 cursor does not match this query`, and malformed, oversized, or
+mixed tokens get `400 cursor is malformed`, never an echo of the token.
+`limit` (1 to 500) caps rows per page and may change mid-walk; `cursor`
+and `offset` cannot be combined.
+
+Pages are live views, not snapshots: each page reflects the rows visible
+when its two queries ran, rows appended after the cursor position appear
+on later pages, and rows that sort before the cursor are never returned.
+There is no frozen cross-request snapshot, no server-side cursor state,
+no temporary tables, and no read transaction held across requests or
+while a response streams.
+
+The legacy `offset` window (same rows and response fields as before,
+including an additive `next_cursor`) is streamed in fetch rounds planned
+against a 4 MiB byte budget — the budget sizes how many rows each
+database fetch materializes, not a wire chunk size — so even a
+`limit=500` window of 1 MiB events, roughly 500 MiB of response, is
+delivered with server memory bounded by that planning budget. The cursor
+page response itself stays within the 8 MiB `byte_cap`. An
+`offset` beyond the matching rows is an empty window (`count` 0,
+`next_cursor` null), never a wrap-around to the start. A database failure
+after the stream started ends the response — the client sees an
+incomplete chunked body — rather than corrupting it with a second status
+line or an error body.
+
+One response per request, always. The handler marks a response as started
+at its first wire write; after that, any failure — a slow client whose
+write times out mid-body, a dropped database mid-stream — only closes the
+connection and logs the exception type. The client sees a short response,
+never a second status line or an error body appended to the one in
+flight. Pre-response validation and database failures still get their own
+honest 400 or 500, including on a keepalive connection whose earlier
+request completed successfully.
+
+All list endpoints take `limit` (1 to 500, default 100); the
+non-events lists also take `offset` (0 to 10 000). Every endpoint rejects
+unknown or repeated query parameters and validates values before any
+query runs. Request paths are capped at 2048 bytes, query strings at 16
+fields, and every response body carries the stored facts: the original
+timestamp text (nine fractional digits preserved, including inside
+cursors), the exact payload types, authoritative conclusions and producer
+claims as separate fields, and no derived outcome or cause.
 
 Concurrency is bounded at two levels. Accepted connections are capped
 (default 16) before a handler thread is spawned, so idle, slow, or hostile
@@ -249,6 +314,8 @@ implemented here:
   (W05); the CLI serves on loopback only and nothing was deployed.
 - CI wiring for psycopg and a PostgreSQL service in the monitoring test
   workflow (the parent owns the environment contract).
-- Keyset pagination (offset is capped at 10 000 for now).
+- Consumer wiring (Grafana dashboards, the W06/W10 read paths) chooses
+  between cursor pages and the offset window per query; nothing here
+  decides for them.
 - Envelope fields added by a future contract version need a migration
   before that version is accepted.

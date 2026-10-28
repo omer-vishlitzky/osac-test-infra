@@ -21,6 +21,8 @@ Migrations use the ingest role; the API uses the SELECT-only reader role.
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import ipaddress
 import json
 import os
@@ -35,8 +37,10 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from . import ledger
 from .ledger import (
+    DEFAULT_EVENT_PAGE_BYTES,
     MAX_LIST_ROWS,
     MAX_OFFSET,
+    EventCursor,
     ExecutionRow,
     JSONValue,
     Ledger,
@@ -50,6 +54,52 @@ DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 9185
 MAX_REQUEST_PATH_BYTES = 2048
 MAX_QUERY_FIELDS = 16
+# The server-chosen byte cap of one cursor page: the page is cut on the
+# real serialized bytes, data and metadata both, and always contains at
+# least one event so a walk advances.
+MAX_EVENT_PAGE_BYTES = DEFAULT_EVENT_PAGE_BYTES
+# Fetch planning size for the offset (legacy) streaming path: memory is
+# bounded by this chunk, not by the requested window.
+LEGACY_STREAM_CHUNK_BYTES = 4 * 1_048_576
+_CURSOR_VERSION = 1
+_MAX_CURSOR_CHARS = 512
+
+
+def _worst_case_page_suffix_bytes() -> int:
+    """The largest suffix an events page response can carry, derived from
+    the legal maxima of every field in it: a cursor token over a
+    128-character journal id, a 30-character timestamp, a 19-digit
+    sequence (the bigint maximum), and the 64-character context digest,
+    plus three-digit count and limit. The actual suffix never exceeds
+    this, so reserving it keeps the advertised byte cap honest."""
+
+    worst_payload = json.dumps(
+        {
+            "v": _CURSOR_VERSION,
+            "r": "2026-10-28T12:00:00.123456789Z",
+            "j": "j" * 128,
+            "s": 9_223_372_036_854_775_807,
+            "x": "x" * 64,
+        },
+        separators=(",", ":"),
+    ).encode("utf-8")
+    worst_token = len(json.dumps(base64.urlsafe_b64encode(worst_payload).decode("ascii")).encode("utf-8"))
+    return (
+        len('],"count":')
+        + 3
+        + len(',"next_cursor":')
+        + worst_token
+        + len(',"limit":')
+        + 3
+        + len(',"offset":0,"byte_cap":')
+        + len(str(MAX_EVENT_PAGE_BYTES))
+        + 1
+    )
+
+
+# Reserved bytes for the JSON fields that follow the events array when a
+# cursor page is cut on its real serialized size.
+_CURSOR_SUFFIX_SLACK_BYTES = _worst_case_page_suffix_bytes()
 
 
 class _BadRequest(Exception):
@@ -136,6 +186,20 @@ class _ReadAPIHandler(BaseHTTPRequestHandler):
         # One finite timeout for header reads, body reads, and writes; an
         # idle keepalive connection expires and releases its slot.
         self.connection.settimeout(self.server.socket_timeout_seconds)
+        self._response_started = False
+
+    def handle_one_request(self) -> None:
+        # Keepalive reuses this handler: every request starts a fresh
+        # response, so a pre-response failure on a later request still gets
+        # its own honest status line.
+        self._response_started = False
+        super().handle_one_request()
+
+    def send_response(self, code: int, message: str | None = None) -> None:
+        # The single chokepoint for the first wire write of any response:
+        # once a status line is out, no failure may start another one.
+        self._response_started = True
+        super().send_response(code, message)
 
     def do_GET(self) -> None:
         if len(self.path.encode("utf-8")) > MAX_REQUEST_PATH_BYTES:
@@ -149,13 +213,23 @@ class _ReadAPIHandler(BaseHTTPRequestHandler):
                 if self.path == "/metrics":
                     self._metrics()
                     return
-                status, body = self._route()
+                result = self._route()
+                if result is None:
+                    # The route streamed its own response (event pages).
+                    return
+                status, body = result
             except _BadRequest as exc:
                 status, body = 400, {"error": str(exc)}
             except Exception as exc:
                 # Exception types only: message text can carry SQL and
                 # connection strings, and the client gets an opaque body.
                 print(f"ci-observability-api: request failed with {type(exc).__name__}", file=sys.stderr)
+                if self._response_started:
+                    # A status line is already on the wire: a second one
+                    # would corrupt that response. Close so the client sees
+                    # a short response instead.
+                    self.close_connection = True
+                    return
                 status, body = 500, {"error": "internal error"}
         finally:
             self.server.request_slots.release()
@@ -236,7 +310,7 @@ class _ReadAPIHandler(BaseHTTPRequestHandler):
             lock_timeout_ms=2000,
         )
 
-    def _route(self) -> tuple[int, dict[str, JSONValue]]:
+    def _route(self) -> tuple[int, dict[str, JSONValue]] | None:
         parsed = urlparse(self.path)
         params = self._parse_query(raw=parsed.query)
         if len(params) > MAX_QUERY_FIELDS:
@@ -251,7 +325,7 @@ class _ReadAPIHandler(BaseHTTPRequestHandler):
             remainder = parsed.path[len("/api/v1/executions/") :]
             if remainder.endswith("/events"):
                 execution_id = unquote(remainder[: -len("/events")])
-                return self._events(execution_id=execution_id, params=params)
+                return self._serve_events(execution_id=execution_id, params=params)
             if remainder and "/" not in remainder:
                 return self._execution(execution_id=unquote(remainder), params=params)
         return 404, {"error": "not found"}
@@ -345,35 +419,220 @@ class _ReadAPIHandler(BaseHTTPRequestHandler):
         body["journal_count"] = journal_count
         return 200, body
 
-    def _events(self, *, execution_id: str, params: dict[str, str]) -> tuple[int, dict[str, JSONValue]]:
+    def _serve_events(self, *, execution_id: str, params: dict[str, str]) -> tuple[int, dict[str, JSONValue]] | None:
+        """Serve the events route: cursor pages or the offset window, both streamed.
+
+        Returns None when the response was written directly (the events
+        route streams); a tuple goes through the standard JSON sender."""
+
         journal_id = _query_pattern(params=params, name="journal_id", pattern=ledger.JOURNAL_ID_PATTERN)
         recorded_after = _query_timestamp(params=params, name="recorded_after")
         recorded_before = _query_timestamp(params=params, name="recorded_before")
         limit = _query_limit(params=params)
-        offset = _query_offset(params=params)
+        cursor_token = params.pop("cursor", None)
+        has_offset = "offset" in params
+        if cursor_token is not None and has_offset:
+            raise _BadRequest("cursor and offset cannot be combined")
+        offset = _query_offset(params=params) if has_offset else 0
         _reject_leftovers(params=params)
         _validate_execution_id(execution_id=execution_id)
         client = self._ledger()
         try:
             if client.get_execution(execution_id=execution_id) is None:
                 return 404, {"error": "execution not found"}
-            events = client.list_events(
+            if has_offset:
+                # The legacy window: same rows as always, streamed in
+                # bounded chunks, with a cursor to continue past the cap.
+                self._serve_events_offset(
+                    client=client,
+                    execution_id=execution_id,
+                    journal_id=journal_id,
+                    recorded_after=recorded_after,
+                    recorded_before=recorded_before,
+                    limit=limit,
+                    offset=offset,
+                )
+                return None
+            after = None
+            if cursor_token is not None:
+                after = _decode_event_cursor(
+                    token=cursor_token,
+                    context=_cursor_context(
+                        execution_id=execution_id,
+                        journal_id=journal_id,
+                        recorded_after=recorded_after,
+                        recorded_before=recorded_before,
+                    ),
+                )
+            self._serve_events_cursor(
+                client=client,
                 execution_id=execution_id,
+                after=after,
                 journal_id=journal_id,
                 recorded_after=recorded_after,
                 recorded_before=recorded_before,
                 limit=limit,
-                offset=offset,
             )
+            return None
         finally:
             client.close()
-        return 200, {
-            "execution_id": execution_id,
-            "events": [_event_json(event=event) for event in events],
-            "count": len(events),
-            "limit": limit,
-            "offset": offset,
-        }
+
+    def _serve_events_cursor(
+        self,
+        *,
+        client: Ledger,
+        execution_id: str,
+        after: EventCursor | None,
+        journal_id: str | None,
+        recorded_after: datetime | None,
+        recorded_before: datetime | None,
+        limit: int,
+    ) -> None:
+        """One byte-capped keyset page, cut on the real serialized bytes.
+
+        The ledger plans the fetch from stored payload sizes; this layer
+        counts the actual wire bytes and moves the cursor back to the last
+        event that fits, so the cap is honest and no event is silently
+        dropped: everything after the cut returns on the next page."""
+
+        page = client.list_event_page(
+            execution_id=execution_id,
+            after=after,
+            journal_id=journal_id,
+            recorded_after=recorded_after,
+            recorded_before=recorded_before,
+            limit=limit,
+            byte_budget=MAX_EVENT_PAGE_BYTES,
+        )
+        prefix = ('{"execution_id":' + json.dumps(execution_id) + ',"events":[').encode("utf-8")
+        fragments = [_event_fragment(event=event) for event in page.events]
+        used = len(prefix) + _CURSOR_SUFFIX_SLACK_BYTES
+        kept = 0
+        for fragment in fragments:
+            if kept and used + 1 + len(fragment) > MAX_EVENT_PAGE_BYTES:
+                break
+            used += (1 if kept else 0) + len(fragment)
+            kept += 1
+        more = kept < len(fragments) or page.next_cursor is not None
+        next_cursor: EventCursor | None = None
+        if more and kept:
+            last = page.events[kept - 1]
+            next_cursor = EventCursor(journal_id=last.journal_id, sequence=last.sequence, recorded_at=last.recorded_at)
+        token = (
+            "null"
+            if next_cursor is None
+            else json.dumps(
+                _encode_event_cursor(
+                    cursor=next_cursor,
+                    context=_cursor_context(
+                        execution_id=execution_id,
+                        journal_id=journal_id,
+                        recorded_after=recorded_after,
+                        recorded_before=recorded_before,
+                    ),
+                )
+            )
+        )
+        suffix = (
+            f'],"count":{kept},"next_cursor":{token},"limit":{limit},"offset":0,"byte_cap":{MAX_EVENT_PAGE_BYTES}}}'
+        ).encode()
+        payload = prefix + b",".join(fragments[:kept]) + suffix
+        self._send_content(status=200, content_type="application/json", payload=payload)
+
+    def _serve_events_offset(
+        self,
+        *,
+        client: Ledger,
+        execution_id: str,
+        journal_id: str | None,
+        recorded_after: datetime | None,
+        recorded_before: datetime | None,
+        limit: int,
+        offset: int,
+    ) -> None:
+        """The legacy offset window, streamed in fetch-planning chunks.
+
+        Same rows and response fields as before; LEGACY_STREAM_CHUNK_BYTES
+        plans how many rows each fetch round reads, so server memory is
+        bounded by that budget even when the window is hundreds of MiB.
+        A failure after the stream started closes the response; the
+        response-started boundary guarantees no second status line."""
+
+        start = client.event_cursor_after_offset(
+            execution_id=execution_id,
+            journal_id=journal_id,
+            recorded_after=recorded_after,
+            recorded_before=recorded_before,
+            offset=offset,
+        )
+        self._start_chunked(content_type="application/json")
+        try:
+            context = _cursor_context(
+                execution_id=execution_id,
+                journal_id=journal_id,
+                recorded_after=recorded_after,
+                recorded_before=recorded_before,
+            )
+            prefix = ('{"execution_id":' + json.dumps(execution_id) + ',"events":[').encode()
+            self._write_chunk(data=prefix)
+            sent = 0
+            last_event: StoredEvent | None = None
+            window_has_more = False
+            cursor = start.cursor
+            # An exhausted start (fewer than offset rows match) skips the
+            # loop entirely: the window is empty, not wrapped to the start.
+            while not start.exhausted and sent < limit:
+                page = client.list_event_page(
+                    execution_id=execution_id,
+                    after=cursor,
+                    journal_id=journal_id,
+                    recorded_after=recorded_after,
+                    recorded_before=recorded_before,
+                    limit=limit - sent,
+                    byte_budget=LEGACY_STREAM_CHUNK_BYTES,
+                )
+                if not page.events:
+                    break
+                fragments = [_event_fragment(event=event) for event in page.events]
+                chunk = b",".join(fragments)
+                if sent:
+                    chunk = b"," + chunk
+                self._write_chunk(data=chunk)
+                sent += len(page.events)
+                last_event = page.events[-1]
+                window_has_more = page.next_cursor is not None
+                if page.next_cursor is None:
+                    break
+                cursor = page.next_cursor
+            next_token = "null"
+            if sent and window_has_more and last_event is not None:
+                next_cursor = EventCursor(
+                    journal_id=last_event.journal_id, sequence=last_event.sequence, recorded_at=last_event.recorded_at
+                )
+                next_token = json.dumps(_encode_event_cursor(cursor=next_cursor, context=context))
+            suffix = f'],"count":{sent},"limit":{limit},"offset":{offset},"next_cursor":{next_token}}}'.encode()
+            self._write_chunk(data=suffix)
+            self._end_chunked()
+        except Exception as exc:
+            # The headers are already on the wire: no second response can
+            # be written, so the stream ends and the client sees a short
+            # body instead of a corrupted one.
+            print(f"ci-observability-api: event stream failed with {type(exc).__name__}", file=sys.stderr)
+            self.close_connection = True
+
+    def _start_chunked(self, *, content_type: str) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Transfer-Encoding", "chunked")
+        if self.close_connection:
+            self.send_header("Connection", "close")
+        self.end_headers()
+
+    def _write_chunk(self, *, data: bytes) -> None:
+        self.wfile.write(f"{len(data):x}\r\n".encode("ascii") + data + b"\r\n")
+
+    def _end_chunked(self) -> None:
+        self.wfile.write(b"0\r\n\r\n")
 
 
 def _validate_execution_id(*, execution_id: str) -> None:
@@ -479,6 +738,56 @@ def _execution_json(*, row: ExecutionRow) -> dict[str, JSONValue]:
         "github_job_conclusion": row.github_job_conclusion,
         "registered_at": ledger.format_utc(value=row.registered_at),
     }
+
+
+def _event_fragment(*, event: StoredEvent) -> bytes:
+    """One event's exact response bytes, the honest unit of the page cap."""
+
+    return json.dumps(_event_json(event=event), separators=(",", ":")).encode("utf-8")
+
+
+def _cursor_context(
+    *, execution_id: str, journal_id: str | None, recorded_after: datetime | None, recorded_before: datetime | None
+) -> str:
+    """The query shape a cursor belongs to: execution and filters, not limit."""
+
+    parts = [
+        execution_id,
+        journal_id or "",
+        ledger.format_utc(value=recorded_after) if recorded_after is not None else "",
+        ledger.format_utc(value=recorded_before) if recorded_before is not None else "",
+    ]
+    return hashlib.sha256("\x00".join(parts).encode("utf-8")).hexdigest()
+
+
+def _encode_event_cursor(*, cursor: EventCursor, context: str) -> str:
+    payload = json.dumps(
+        {"v": _CURSOR_VERSION, "r": cursor.recorded_at, "j": cursor.journal_id, "s": cursor.sequence, "x": context},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii")
+
+
+def _decode_event_cursor(*, token: str, context: str) -> EventCursor:
+    """Decode and validate one page cursor; refusals are fixed text without the token."""
+
+    if not isinstance(token, str) or not 1 <= len(token) <= _MAX_CURSOR_CHARS:
+        raise _BadRequest("cursor is malformed")
+    try:
+        document = json.loads(base64.b64decode(token, altchars=b"-_", validate=True))
+    except (ValueError, UnicodeError):
+        raise _BadRequest("cursor is malformed") from None
+    if not isinstance(document, dict) or set(document) != {"v", "r", "j", "s", "x"}:
+        raise _BadRequest("cursor is malformed") from None
+    if document["v"] != _CURSOR_VERSION:
+        raise _BadRequest("cursor is malformed") from None
+    try:
+        cursor = EventCursor(journal_id=document["j"], sequence=document["s"], recorded_at=document["r"])
+    except ValidationError:
+        raise _BadRequest("cursor is malformed") from None
+    if document["x"] != context:
+        raise _BadRequest("cursor does not match this query") from None
+    return cursor
 
 
 def _event_json(*, event: StoredEvent) -> dict[str, JSONValue]:

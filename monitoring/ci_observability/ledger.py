@@ -32,6 +32,13 @@ JSONValue: TypeAlias = bool | int | float | str | list["JSONValue"] | dict[str, 
 _ExecutionRowValues: TypeAlias = (
     "tuple[str, int, int, int, int, str, int | None, bool | None, str | None, str | None, datetime]"
 )
+# Column order of every full ledger_event SELECT: execution_id, journal_id,
+# sequence, schema_version, recorded_at_text, source_at_text, mono_ns,
+# invocation_id, clock_id, clock_uncertainty_ns, event, data, ingested_at.
+_EventRowValues: TypeAlias = (
+    "tuple[str, str, int, int, str, str | None, int | None, str | None, str | None, int | None, str,"
+    " dict[str, JSONValue], datetime]"
+)
 
 DEFAULT_SCHEMA = "ci_observability"
 DEFAULT_LIST_ROWS = 100
@@ -41,6 +48,12 @@ MAX_BATCH_EVENTS = 10_000
 MAX_EVENT_DATA_BYTES = 1_048_576
 MAX_BATCH_BYTES = 16 * 1_048_576
 MAX_JSON_DEPTH = 64
+# The default byte budget of one event page: enough for seven maximal
+# events plus their envelopes, so a page always advances.
+DEFAULT_EVENT_PAGE_BYTES = 8 * 1_048_576
+# Fixed JSON envelope allowance per event when a page is planned from
+# stored payload sizes; the serving layer counts the real wire bytes.
+_EVENT_ENVELOPE_ALLOWANCE_BYTES = 512
 
 EXECUTION_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$")
 JOURNAL_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -53,6 +66,7 @@ TIMESTAMP_TEXT_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{
 MIGRATIONS_DIR = Path(__file__).resolve().parent / "migrations"
 
 __all__ = [
+    "DEFAULT_EVENT_PAGE_BYTES",
     "DEFAULT_LIST_ROWS",
     "DEFAULT_SCHEMA",
     "MAX_BATCH_BYTES",
@@ -62,6 +76,8 @@ __all__ = [
     "MAX_OFFSET",
     "AppendResult",
     "ConflictError",
+    "EventCursor",
+    "EventPage",
     "ExecutionRecord",
     "ExecutionRow",
     "JSONValue",
@@ -69,6 +85,7 @@ __all__ = [
     "Ledger",
     "LedgerError",
     "NotFoundError",
+    "OffsetStart",
     "RunSummary",
     "SequenceError",
     "StoredEvent",
@@ -246,6 +263,52 @@ class AppendResult:
 
     appended: int
     duplicates: int
+
+
+@dataclass(frozen=True, kw_only=True)
+class EventCursor:
+    """A keyset position in one execution's timeline: the key of the last
+    returned event. The next page continues strictly after it, so pages
+    never repeat or skip a row, and the original timestamp text keeps the
+    position exact to the delivered nine fractional digits."""
+
+    journal_id: str
+    sequence: int
+    recorded_at: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.journal_id, str) or not JOURNAL_ID_PATTERN.fullmatch(self.journal_id):
+            raise ValidationError("journal_id must be a bounded identifier")
+        if not _is_int(value=self.sequence) or self.sequence < 1:
+            raise ValidationError("sequence must be an integer >= 1")
+        parse_utc_text(value=self.recorded_at)
+
+
+@dataclass(frozen=True, kw_only=True)
+class EventPage:
+    """One bounded page of an execution's event timeline.
+
+    Pages are live, not frozen snapshots: each page reflects the rows
+    visible when its queries ran, rows appended after the cursor position
+    appear on later pages, and rows before it are never returned.
+    next_cursor is set when more matching rows are known or planned;
+    a page always contains at least one event unless the timeline is
+    exhausted."""
+
+    events: tuple[StoredEvent, ...]
+    next_cursor: EventCursor | None
+
+
+@dataclass(frozen=True, kw_only=True)
+class OffsetStart:
+    """Where an offset window begins.
+
+    cursor is None with exhausted False for offset 0 (begin at the first
+    row). exhausted True means fewer than offset rows match, so the window
+    is empty rather than wrapping around to the start."""
+
+    cursor: EventCursor | None
+    exhausted: bool
 
 
 def parse_utc_text(*, value: str) -> datetime:
@@ -888,6 +951,130 @@ class Ledger:
     ) -> list[StoredEvent]:
         """List the events of one execution in timeline order, serving the original timestamp text."""
 
+        clauses, params = self._event_filter_clauses(
+            execution_id=execution_id,
+            journal_id=journal_id,
+            recorded_after=recorded_after,
+            recorded_before=recorded_before,
+        )
+        _validate_page(limit=limit, offset=offset)
+        where = sql.SQL(" AND ").join(clauses)
+        query = sql.SQL(
+            "SELECT execution_id, journal_id, sequence, schema_version, recorded_at_text, source_at_text,"
+            " mono_ns, invocation_id, clock_id, clock_uncertainty_ns, event, data, ingested_at"
+            " FROM {table} WHERE {where}"
+            " ORDER BY recorded_at, journal_id, sequence"
+            " LIMIT %s OFFSET %s"
+        ).format(table=self._table(name="ledger_event"), where=where)
+        with self._connection().cursor() as cur:
+            cur.execute(query, (*params, limit, offset))
+            return [_stored_event(row=row) for row in cur.fetchall()]
+
+    def list_event_page(
+        self,
+        *,
+        execution_id: str,
+        after: EventCursor | None = None,
+        journal_id: str | None = None,
+        recorded_after: datetime | None = None,
+        recorded_before: datetime | None = None,
+        limit: int = DEFAULT_LIST_ROWS,
+        byte_budget: int = DEFAULT_EVENT_PAGE_BYTES,
+    ) -> EventPage:
+        """Return one bounded page of an execution's event timeline.
+
+        The page continues strictly after the cursor, applies the same
+        filters as list_events, and is planned from stored payload sizes
+        so no more rows are fetched than the byte budget and row cap can
+        hold: the candidate keys are read first as (journal_id, sequence,
+        timestamp text, payload bytes) without payloads, then only the
+        chosen key range is fetched. A page always contains at least one
+        event when any matching row exists, so a walk always advances.
+        next_cursor is set when more matching rows are known or planned;
+        pages are live views, not frozen snapshots."""
+
+        if after is not None and not isinstance(after, EventCursor):
+            raise ValidationError("after must be an EventCursor or None")
+        clauses, params = self._event_filter_clauses(
+            execution_id=execution_id,
+            journal_id=journal_id,
+            recorded_after=recorded_after,
+            recorded_before=recorded_before,
+        )
+        _validate_page(limit=limit, offset=0)
+        if not _is_int(value=byte_budget) or byte_budget < 1:
+            raise ValidationError("byte_budget must be a positive integer")
+        metadata = self._event_key_metadata(clauses=clauses, params=params, after=after, limit=limit)
+        if not metadata:
+            return EventPage(events=(), next_cursor=None)
+
+        chosen = 0
+        planned_bytes = 0
+        for _, _, _, payload_bytes in metadata:
+            if chosen > 0 and planned_bytes + payload_bytes + _EVENT_ENVELOPE_ALLOWANCE_BYTES > byte_budget:
+                break
+            planned_bytes += payload_bytes + _EVENT_ENVELOPE_ALLOWANCE_BYTES
+            chosen += 1
+        more_rows = chosen < len(metadata) or len(metadata) == limit
+        # Fetch exactly the planned keys: rows appended inside the planned
+        # span between the metadata query and this fetch cannot join the
+        # payload fetch, so the materialized bytes stay bounded by the plan
+        # and the page never needs trimming or a premature terminal cursor.
+        events = self._fetch_selected_events(clauses=clauses, params=params, keys=metadata[:chosen])
+        if not events:
+            return EventPage(events=(), next_cursor=None)
+        last = events[-1]
+        next_cursor = (
+            EventCursor(journal_id=last.journal_id, sequence=last.sequence, recorded_at=last.recorded_at)
+            if more_rows
+            else None
+        )
+        return EventPage(events=tuple(events), next_cursor=next_cursor)
+
+    def event_cursor_after_offset(
+        self,
+        *,
+        execution_id: str,
+        journal_id: str | None = None,
+        recorded_after: datetime | None = None,
+        recorded_before: datetime | None = None,
+        offset: int = 0,
+    ) -> OffsetStart:
+        """Where an offset window begins: the position after the skipped rows.
+
+        cursor is None with exhausted False for offset 0. exhausted True
+        means fewer than offset rows match, so the window is empty rather
+        than wrapping around to the start of the timeline."""
+
+        clauses, params = self._event_filter_clauses(
+            execution_id=execution_id,
+            journal_id=journal_id,
+            recorded_after=recorded_after,
+            recorded_before=recorded_before,
+        )
+        if not _is_int(value=offset) or offset < 0:
+            raise ValidationError("offset must be an integer >= 0")
+        if offset == 0:
+            return OffsetStart(cursor=None, exhausted=False)
+        rows = self._event_key_metadata(clauses=clauses, params=params, after=None, limit=1, offset=offset - 1)
+        if not rows:
+            return OffsetStart(cursor=None, exhausted=True)
+        journal_id_value, sequence, recorded_at_text, _ = rows[0]
+        return OffsetStart(
+            cursor=EventCursor(journal_id=journal_id_value, sequence=sequence, recorded_at=recorded_at_text),
+            exhausted=False,
+        )
+
+    def _event_filter_clauses(
+        self,
+        *,
+        execution_id: str,
+        journal_id: str | None,
+        recorded_after: datetime | None,
+        recorded_before: datetime | None,
+    ) -> tuple[list[sql.Composed], list[object]]:
+        """Validated WHERE clauses and parameters shared by every event read."""
+
         if not isinstance(execution_id, str) or not EXECUTION_ID_PATTERN.fullmatch(execution_id):
             raise ValidationError("execution_id must be a bounded filename-safe identifier")
         clauses = [sql.SQL("execution_id = %s")]
@@ -907,35 +1094,68 @@ class Ledger:
                 raise ValidationError("recorded_before must be a timezone-aware datetime")
             clauses.append(sql.SQL("recorded_at <= %s"))
             params.append(recorded_before)
-        _validate_page(limit=limit, offset=offset)
-        where = sql.SQL(" AND ").join(clauses)
+        return clauses, params
+
+    def _event_key_metadata(
+        self,
+        *,
+        clauses: list[sql.Composed],
+        params: list[object],
+        after: EventCursor | None,
+        limit: int,
+        offset: int = 0,
+    ) -> list[tuple[str, int, str, int]]:
+        """Candidate timeline keys with payload sizes, without the payloads.
+
+        The index-backed keyset predicate keeps this query and the range
+        fetch that follows it bounded to the page, never the history."""
+
+        predicates = list(clauses)
+        query_params = list(params)
+        if after is not None:
+            predicates.append(sql.SQL("(recorded_at, journal_id, sequence) > (%s, %s, %s)"))
+            query_params.extend([parse_utc_text(value=after.recorded_at), after.journal_id, after.sequence])
+        where = sql.SQL(" AND ").join(predicates)
         query = sql.SQL(
-            "SELECT execution_id, journal_id, sequence, schema_version, recorded_at_text, source_at_text,"
-            " mono_ns, invocation_id, clock_id, clock_uncertainty_ns, event, data, ingested_at"
+            "SELECT journal_id, sequence, recorded_at_text, octet_length(data::text)"
             " FROM {table} WHERE {where}"
             " ORDER BY recorded_at, journal_id, sequence"
             " LIMIT %s OFFSET %s"
         ).format(table=self._table(name="ledger_event"), where=where)
         with self._connection().cursor() as cur:
-            cur.execute(query, (*params, limit, offset))
-            return [
-                StoredEvent(
-                    schema_version=row[3],
-                    execution_id=row[0],
-                    journal_id=row[1],
-                    sequence=row[2],
-                    recorded_at=row[4],
-                    event=row[10],
-                    data=row[11],
-                    ingested_at=row[12],
-                    source_at=row[5],
-                    invocation_id=row[7],
-                    clock_id=row[8],
-                    clock_uncertainty_ns=row[9],
-                    mono_ns=row[6],
-                )
-                for row in cur.fetchall()
-            ]
+            cur.execute(query, (*query_params, limit, offset))
+            return [(row[0], row[1], row[2], row[3]) for row in cur.fetchall()]
+
+    def _fetch_selected_events(
+        self, *, clauses: list[sql.Composed], params: list[object], keys: list[tuple[str, int, str, int]]
+    ) -> list[StoredEvent]:
+        """Fetch the full rows for exactly the planned keys, in page order.
+
+        (journal_id, sequence) is unique within an execution, so an IN over
+        the planned key pairs returns the planned rows and nothing else:
+        rows appended between the metadata query and this fetch cannot join
+        the payload fetch, keeping the materialized bytes bounded by the
+        plan. The key list is bounded by the page row cap."""
+
+        if not keys:
+            return []
+        predicates = list(clauses)
+        predicates.append(
+            sql.SQL("(journal_id, sequence) IN ({})").format(sql.SQL(", ").join(sql.SQL("(%s, %s)") for _ in keys))
+        )
+        where = sql.SQL(" AND ").join(predicates)
+        query = sql.SQL(
+            "SELECT execution_id, journal_id, sequence, schema_version, recorded_at_text, source_at_text,"
+            " mono_ns, invocation_id, clock_id, clock_uncertainty_ns, event, data, ingested_at"
+            " FROM {table} WHERE {where}"
+            " ORDER BY recorded_at, journal_id, sequence"
+        ).format(table=self._table(name="ledger_event"), where=where)
+        query_params: list[object] = list(params)
+        for key in keys:
+            query_params.extend([key[0], key[1]])
+        with self._connection().cursor() as cur:
+            cur.execute(query, query_params)
+            return [_stored_event(row=row) for row in cur.fetchall()]
 
     def health_check(self) -> None:
         """Raise when the ledger is not queryable, so missing grants surface here, not on the first query."""
@@ -949,6 +1169,25 @@ class Ledger:
                     raise LedgerError("ledger schema has no applied migration")
         except psycopg.errors.UndefinedTable:
             raise LedgerError("ledger schema is not migrated") from None
+
+
+def _stored_event(*, row: Sequence[object]) -> StoredEvent:
+    values = cast(_EventRowValues, tuple(row))
+    return StoredEvent(
+        schema_version=values[3],
+        execution_id=values[0],
+        journal_id=values[1],
+        sequence=values[2],
+        recorded_at=values[4],
+        event=values[10],
+        data=values[11],
+        ingested_at=values[12],
+        source_at=values[5],
+        invocation_id=values[7],
+        clock_id=values[8],
+        clock_uncertainty_ns=values[9],
+        mono_ns=values[6],
+    )
 
 
 def _execution_row(*, row: Sequence[object]) -> ExecutionRow:
