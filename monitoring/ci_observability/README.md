@@ -20,11 +20,25 @@ The user-facing overview of the monitoring stack stays in
 | `ledger_execution` | One row per job execution: `execution_id`, `schema_version`, `repository_id` (required, positive), `run_id`, `run_attempt`, `logical_job_key`, `github_job_id` (nullable while the binding is unknown), `executed` (nullable while the execution state is unknown), authoritative `github_run_conclusion` and `github_job_conclusion`, `registered_at`. |
 | `ledger_journal` | Per-journal contiguity checkpoint: `(execution_id, journal_id)` and `prefix_sequence`, the length of the stored contiguous prefix. |
 | `ledger_event` | One row per journal record: `execution_id`, `journal_id`, `sequence`, `schema_version`, the indexed `recorded_at`/`source_at` timestamptz plus the original `recorded_at_text`/`source_at_text`, `mono_ns`, `invocation_id`, `clock_id`, `clock_uncertainty_ns`, `event`, `data` (canonical JSON text in a json column, at most 1 MiB), `data_sha256`, `ingested_at`. |
+| `ledger_environment` | Public view of sanitized metadata from committed receipts, with separate revision verdicts. |
 | `schema_migrations` | Applied migration versions. |
 
 Migration 0002 adds private source receipts, execution ownership, GitHub
 observations and redaction proofs. The reader role cannot select these raw
 source tables. See [ingestion storage](INGESTION.md) for their lifecycle.
+
+Migration 0003 adds `ledger_environment`, a `security_barrier` view owned by
+the ingest role. It exposes one row per committed receipt with a full proof
+and a verified GitHub observation matching the execution's established job.
+A rejected replay for another job cannot replace its revision evidence.
+Reader access to the view uses the deployment's existing default grants;
+the private source tables keep their access restrictions.
+
+Columns prefixed `claimed_` contain sanitized producer claims. Source roles
+stay separate, unresolved revisions stay null, and `tested_sha` has its own
+`revision_verdict`, `revision_reason` and `revision_provenance`. The source's
+`created_at` text and the central `first_seen_at` timestamp remain distinct.
+The view publishes neither raw manifests nor private host labels or errors.
 
 `repository_id` is a required positive integer: the v1 manifest always
 carries it, so there is no unknown-repository path. `github_job_id` stays
@@ -196,7 +210,13 @@ non-loopback address.
 | `GET /api/v1/runs` | Registered runs. `execution_count` counts records known to have executed; `registration_count` counts every stored record. Filters: `repository_id`. |
 | `GET /api/v1/executions` | Bounded execution list. Filters: `repository_id`, `run_id`, `run_attempt`, `logical_job_key`, `github_job_id`, `executed`, `registered_after`, `registered_before`. |
 | `GET /api/v1/executions/{execution_id}` | One execution with event and journal counts. |
+| `GET /api/v1/executions/{execution_id}/environment` | Published claims and revision verdicts. |
 | `GET /api/v1/executions/{execution_id}/events` | Events in timeline order: byte-capped cursor pages by default, the legacy offset window when `offset` is given. Filters: `journal_id`, `recorded_after`, `recorded_before`. |
+
+The environment route returns `environments`, `count`, `limit` and `offset`,
+ordered by receipt ID under the existing page bounds. An empty list means no
+published environment evidence, not an empty environment. Duplicate delivery
+keeps one receipt. Different receipts keep their own completeness claims.
 
 ### Bounded event pages
 

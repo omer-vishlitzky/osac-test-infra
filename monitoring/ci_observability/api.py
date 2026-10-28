@@ -326,6 +326,9 @@ class _ReadAPIHandler(BaseHTTPRequestHandler):
             if remainder.endswith("/events"):
                 execution_id = unquote(remainder[: -len("/events")])
                 return self._serve_events(execution_id=execution_id, params=params)
+            if remainder.endswith("/environment"):
+                execution_id = unquote(remainder[: -len("/environment")])
+                return self._environments(execution_id=execution_id, params=params)
             if remainder and "/" not in remainder:
                 return self._execution(execution_id=unquote(remainder), params=params)
         return 404, {"error": "not found"}
@@ -418,6 +421,26 @@ class _ReadAPIHandler(BaseHTTPRequestHandler):
         body["event_count"] = event_count
         body["journal_count"] = journal_count
         return 200, body
+
+    def _environments(self, *, execution_id: str, params: dict[str, str]) -> tuple[int, dict[str, JSONValue]]:
+        limit = _query_limit(params=params)
+        offset = _query_offset(params=params)
+        _reject_leftovers(params=params)
+        _validate_execution_id(execution_id=execution_id)
+        client = self._ledger()
+        try:
+            if client.get_execution(execution_id=execution_id) is None:
+                return 404, {"error": "execution not found"}
+            rows = client.list_environments(execution_id=execution_id, limit=limit, offset=offset)
+        finally:
+            client.close()
+        return 200, {
+            "execution_id": execution_id,
+            "environments": rows,
+            "count": len(rows),
+            "limit": limit,
+            "offset": offset,
+        }
 
     def _serve_events(self, *, execution_id: str, params: dict[str, str]) -> tuple[int, dict[str, JSONValue]] | None:
         """Serve the events route: cursor pages or the offset window, both streamed.

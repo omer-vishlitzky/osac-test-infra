@@ -101,7 +101,7 @@ def dsn() -> str:
 @pytest.fixture(scope="session")
 def test_schema(dsn: str) -> Iterator[str]:
     name = f"ci_obs_w01b_sources_{os.getpid()}"
-    assert ledger.apply_migrations(dsn=dsn, schema=name) == [1, 2]
+    assert ledger.apply_migrations(dsn=dsn, schema=name) == [1, 2, 3]
     yield name
     with psycopg.connect(dsn, autocommit=True) as conn:
         conn.execute(sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(name)))
@@ -412,13 +412,13 @@ def example_path(name: str) -> Path:
 # Migrations
 
 
-def test_migrations_apply_both_versions_idempotently(dsn: str) -> None:
+def test_migrations_apply_all_versions_idempotently(dsn: str) -> None:
     name = f"ci_obs_w01b_idem_{os.getpid()}"
     try:
-        assert ledger.apply_migrations(dsn=dsn, schema=name) == [1, 2]
+        assert ledger.apply_migrations(dsn=dsn, schema=name) == [1, 2, 3]
         assert ledger.apply_migrations(dsn=dsn, schema=name) == []
         versions = direct_fetch(dsn, name, "SELECT array_agg(version ORDER BY version) FROM {schema}.schema_migrations")
-        assert versions == ([1, 2],)
+        assert versions == ([1, 2, 3],)
     finally:
         with psycopg.connect(dsn, autocommit=True) as conn:
             conn.execute(sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(name)))
@@ -2028,7 +2028,7 @@ def test_reader_role_cannot_read_source_tables(dsn: str) -> None:
                 ).format(schema=sql.Identifier(schema), role=sql.Identifier(role))
             )
             conn.execute(sql.SQL("GRANT USAGE ON SCHEMA {} TO {}").format(sql.Identifier(schema), sql.Identifier(role)))
-        assert ledger.apply_migrations(dsn=dsn, schema=schema) == [1, 2]
+        assert ledger.apply_migrations(dsn=dsn, schema=schema) == [1, 2, 3]
         with psycopg.connect(reader_dsn, autocommit=True) as reader:
             reader.execute(
                 sql.SQL("SELECT count(*) FROM {}.ledger_execution").format(sql.Identifier(schema))
@@ -2084,7 +2084,7 @@ def test_reader_isolation_covers_public_column_and_inherited_grants(dsn: str) ->
         # The migration completes with the hostile grants attached to its
         # own tables, and its revoke clears the PUBLIC keyword case and
         # the inherited direct grant.
-        assert ledger.apply_migrations(dsn=dsn, schema=schema) == [1, 2]
+        assert ledger.apply_migrations(dsn=dsn, schema=schema) == [1, 2, 3]
         with psycopg.connect(member_dsn, autocommit=True) as reader:
             for table in ("source_receipt", "source_github_observation"):
                 with pytest.raises(psycopg.errors.InsufficientPrivilege):

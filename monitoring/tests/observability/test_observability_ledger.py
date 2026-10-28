@@ -119,7 +119,7 @@ def dsn() -> str:
 @pytest.fixture(scope="session")
 def test_schema(dsn: str) -> Iterator[str]:
     name = f"ci_obs_w01a_ledger_{os.getpid()}"
-    assert ledger.apply_migrations(dsn=dsn, schema=name) == [1, 2]
+    assert ledger.apply_migrations(dsn=dsn, schema=name) == [1, 2, 3]
     yield name
     with psycopg.connect(dsn, autocommit=True) as conn:
         conn.execute(sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(name)))
@@ -171,7 +171,7 @@ def direct_conclusions(*, dsn: str, schema: str, execution_id: str) -> tuple[str
 def test_migrate_is_idempotent(dsn: str) -> None:
     name = f"ci_obs_w01a_idem_{os.getpid()}"
     try:
-        assert ledger.apply_migrations(dsn=dsn, schema=name) == [1, 2]
+        assert ledger.apply_migrations(dsn=dsn, schema=name) == [1, 2, 3]
         assert ledger.apply_migrations(dsn=dsn, schema=name) == []
         with psycopg.connect(dsn, autocommit=True) as conn:
             cursor = conn.execute(sql.SQL("SELECT version FROM {}.schema_migrations").format(sql.Identifier(name)))
@@ -201,7 +201,7 @@ def test_schema_owner_can_migrate_without_database_create_privilege(dsn: str) ->
             ).fetchone()[0]
             assert allowed is False
         restricted_dsn = make_conninfo(dsn, user=role)
-        assert ledger.apply_migrations(dsn=restricted_dsn, schema=schema) == [1, 2]
+        assert ledger.apply_migrations(dsn=restricted_dsn, schema=schema) == [1, 2, 3]
         assert ledger.apply_migrations(dsn=restricted_dsn, schema=schema) == []
     finally:
         with psycopg.connect(dsn, autocommit=True) as administrator:
@@ -214,7 +214,7 @@ def test_migrate_serializes_first_schema_creation(dsn: str) -> None:
     try:
         results = _run_concurrently(worker_count=2, body=lambda _: ledger.apply_migrations(dsn=dsn, schema=name))
         assert all(succeeded for succeeded, _ in results), results
-        assert sorted(result for _, result in results) == [[], [1, 2]]
+        assert sorted(result for _, result in results) == [[], [1, 2, 3]]
     finally:
         with psycopg.connect(dsn, autocommit=True) as conn:
             conn.execute(sql.SQL("DROP SCHEMA IF EXISTS {} CASCADE").format(sql.Identifier(name)))

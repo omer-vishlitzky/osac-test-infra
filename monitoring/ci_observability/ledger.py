@@ -27,6 +27,7 @@ from typing import TypeAlias, cast
 
 import psycopg
 from psycopg import sql
+from psycopg.rows import dict_row
 
 JSONValue: TypeAlias = bool | int | float | str | list["JSONValue"] | dict[str, "JSONValue"] | None
 _ExecutionRowValues: TypeAlias = (
@@ -938,6 +939,31 @@ class Ledger:
                 )
                 for row in cur.fetchall()
             ]
+
+    def list_environments(
+        self, *, execution_id: str, limit: int = DEFAULT_LIST_ROWS, offset: int = 0
+    ) -> list[dict[str, JSONValue]]:
+        """Read published environment claims and their separate revision verdicts."""
+
+        if not isinstance(execution_id, str) or not EXECUTION_ID_PATTERN.fullmatch(execution_id):
+            raise ValidationError("execution_id must be a bounded filename-safe identifier")
+        _validate_page(limit=limit, offset=offset)
+        with self._connection().cursor(row_factory=dict_row) as cur:
+            cur.execute(
+                sql.SQL(
+                    "SELECT receipt_id, execution_id, manifest_sha256, repository_id, run_id, run_attempt,"
+                    " github_job_id, source_created_at, first_seen_at, claimed_workflow_path,"
+                    " claimed_workflow_revision, claimed_event, claimed_cohort, claimed_suite, claimed_sources,"
+                    " claimed_image_digests, claimed_cluster_snapshot, claimed_config_hash, claimed_complete,"
+                    " claimed_end_reason, claimed_dropped_records, tested_sha, revision_verdict, revision_reason,"
+                    " revision_provenance FROM {table} WHERE execution_id = %s ORDER BY receipt_id LIMIT %s OFFSET %s"
+                ).format(table=self._table(name="ledger_environment")),
+                (execution_id, limit, offset),
+            )
+            rows = cur.fetchall()
+        for row in rows:
+            row["first_seen_at"] = format_utc(value=row["first_seen_at"])
+        return cast(list[dict[str, JSONValue]], rows)
 
     def list_events(
         self,
