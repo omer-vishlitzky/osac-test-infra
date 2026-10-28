@@ -1,8 +1,9 @@
 # CI run investigation pilot
 
 Inspect one GitHub Actions run attempt in a local, read-only Grafana dashboard.
-The view shows job and step timing, outcomes and clickable GitHub evidence links.
-It uses a manual metadata snapshot. It does not change CI or run tests again.
+The view shows job and step timing in minutes, outcomes and clickable GitHub
+evidence links. It uses a manual metadata snapshot. It does not change CI or
+run tests again.
 
 ## Start
 
@@ -36,18 +37,25 @@ Use the printed `podman stop <container>` command to stop only this pilot.
 The launcher does not prune containers or delete shared data. If your browser
 runs on another machine, forward the printed port over your usual SSH connection.
 
-## What the view shows
+## How to read the view
 
-- Run identity, selected attempt, event, outcome, GitHub head SHA and snapshot time.
-- Source coverage and explicit unmeasured fields.
-- The first listed failing step. API listing order does not establish the earliest cause.
-- Jobs with actual start, end and duration. An unfinished job has no finished duration.
-- All available steps with outcomes, timing and the step name first.
-- Artifact metadata with size, expired state and clickable evidence links.
+Scan top to bottom:
 
-Run links open the selected attempt. Job and artifact URLs use validated numeric
-IDs and the repository name, never URLs supplied inside the input snapshot.
-Text is escaped before display. Missing or incomplete pages remain visible gaps.
+1. The result and the job span in fixed minutes.
+2. The failure location and its GitHub link.
+3. The slowest measured steps, up to eight, labeled with the total measured count.
+4. Job, step and artifact tables with durations in minutes and evidence links.
+5. Identity, UTC times, provenance and coverage details at the bottom.
+
+Durations are fixed minutes with two decimals, for example 118.40 min. Missing
+durations read Unknown or Not finished, never zero. The notice at the top
+states that the data is a manual GitHub snapshot and gives its fetch time.
+
+Run links open the selected attempt. Job and artifact URLs use validated
+numeric IDs and the repository name, never URLs supplied inside the input
+snapshot. Text is escaped before display. Missing or incomplete pages remain
+visible gaps. The full reading order, honesty rules and acceptance live in
+[UI-REQUIREMENTS.md](UI-REQUIREMENTS.md).
 
 ## Refresh the snapshot
 
@@ -80,6 +88,22 @@ On an enforcing SELinux host, this preserves the bind mount's container label.
 A file created elsewhere keeps its old label after a rename and Grafana may
 refuse to read it. No SELinux disabling or broad relabeling is needed.
 
+## Ask an AI assistant about a run
+
+Most investigations are AI-assisted. The report CLI gives an assistant the
+dashboard's timing and result data as JSON on stdout. Select the snapshot used to
+build the view; after a refresh, use `$refresh/snapshot.json`:
+
+```bash
+python3 -m monitoring.ci_observability.pilot_report \
+    --snapshot "$runtime/snapshot.json" --section summary
+```
+
+Sections are summary, jobs, steps, failures, artifacts, slowest_steps and all.
+The default is summary. The CLI reads the snapshot only: no network access, no
+refetch of GitHub, no writes. Agent guidance for citations and data handling
+is in [AI-QUERIES.md](AI-QUERIES.md).
+
 ## Limits
 
 The pilot collects metadata only. It downloads no artifacts or raw logs and
@@ -101,6 +125,7 @@ Run the focused tests from the repository root:
 ```bash
 python3 -m pytest -q --no-cov \
     monitoring/tests/observability/test_pilot_snapshot.py \
+    monitoring/tests/observability/test_pilot_report.py \
     monitoring/tests/observability/test_pilot_dashboard.py
 ```
 

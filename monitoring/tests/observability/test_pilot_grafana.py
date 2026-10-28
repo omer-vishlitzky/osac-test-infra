@@ -1,17 +1,8 @@
 """Check the read-only pilot through an actual Grafana instance.
 
-The pilot under test is a real running Grafana (loopback only, anonymous
-Viewer) provisioned from a local dashboard file; the test compares what
-Grafana serves against the CURRENT local dashboard candidate, so a stale
-served snapshot fails. Grafana's file provider re-reads the dashboard
-directory roughly every updateIntervalSeconds (5 s), so content checks
-wait a bounded time for the provider to pick up a refreshed file instead
-of trusting a cached title.
-
 These tests never fetch GitHub, never write the shared dashboard, and
 never need a browser: they use Grafana's read APIs and the anonymous
-Viewer role only. They are readiness and negative-permission checks for
-the parent's integration run, not the full launcher test.
+Viewer role only.
 """
 
 from __future__ import annotations
@@ -27,6 +18,8 @@ from pathlib import Path
 
 import pytest
 
+from monitoring.ci_observability.pilot_report import build_report
+
 PROVIDER_RELOAD_TIMEOUT_SECONDS = 40
 PROVIDER_POLL_SECONDS = 2
 
@@ -36,6 +29,11 @@ class Pilot:
     url: str
     dashboard: dict[str, object]
     snapshot: dict[str, object]
+
+
+@pytest.fixture(scope="module")
+def report(*, pilot: Pilot) -> dict[str, object]:
+    return build_report(snapshot=pilot.snapshot)
 
 
 @pytest.fixture(scope="module")
@@ -73,14 +71,9 @@ def request_json(*, url: str, data: dict[str, object] | None = None) -> dict[str
 
 
 def inline_data_signature(*, dashboard: dict[str, object]) -> list[tuple[str, str, str]]:
-    """Include text so a later snapshot of an unchanged run is still detected."""
-
     signature: list[tuple[str, str, str]] = []
     for panel in dashboard["panels"]:
-        for target in panel.get("targets", []):
-            signature.append((panel["title"], target["refId"], target["data"]))
-        if panel["type"] == "text":
-            signature.append((panel["title"], "text", panel["options"]["content"]))
+        signature.append((panel["title"], panel["type"], json.dumps(panel, sort_keys=True)))
     return signature
 
 
@@ -92,71 +85,79 @@ def fetch_served_dashboard(*, pilot: Pilot) -> dict[str, object]:
 
 
 def test_pilot_dashboard_is_served_and_current(*, pilot: Pilot) -> None:
-    """The served dashboard matches the CURRENT local candidate.
-
-    Waits a bounded time for Grafana's file provider to reload a
-    refreshed dashboard file; a stale served snapshot (the provider has
-    not picked up the new file, or the local candidate was re-rendered
-    from a newer snapshot than what Grafana serves) fails here instead
-    of passing on a cached title.
-    """
-
     deadline = time.monotonic() + PROVIDER_RELOAD_TIMEOUT_SECONDS
-    last_signature: list[tuple[str, str, str]] | None = None
-    served: dict[str, object] | None = None
     while True:
         try:
             served = fetch_served_dashboard(pilot=pilot)
+            if inline_data_signature(dashboard=served) == inline_data_signature(dashboard=pilot.dashboard):
+                break
         except urllib.error.HTTPError as error:
             if error.code != 404:
                 raise
-        if served is not None:
-            last_signature = inline_data_signature(dashboard=served)
-            if last_signature == inline_data_signature(dashboard=pilot.dashboard):
-                break
         if time.monotonic() >= deadline:
-            assert served is not None, "Grafana did not provision the pilot dashboard"
-            assert served["uid"] == "ci-run-pilot"
-            assert served["editable"] is False
-            pytest.fail(
-                "served pilot dashboard is stale: its inline data does not match the current local dashboard candidate"
-            )
+            pytest.fail("served pilot dashboard is stale or missing")
         time.sleep(PROVIDER_POLL_SECONDS)
-    assert served is not None
     assert served["uid"] == "ci-run-pilot"
-    assert served["title"] == pilot.dashboard["title"]
     assert served["editable"] is False
-    assert last_signature is not None and len(last_signature) > 0
 
 
-def test_signature_detects_a_new_as_of_time_without_table_changes() -> None:
+def test_signature_detects_as_of_text_and_display_config_changes() -> None:
     earlier = {
         "panels": [
-            {"title": "Run identity", "type": "text", "options": {"content": "Snapshot taken at 08:00Z"}},
-            {"title": "Jobs", "type": "table", "targets": [{"refId": "A", "data": '[{"id": 1}]'}]},
+            {"title": "", "type": "text", "options": {"content": "Snapshot taken at 08:00Z"}},
+            {
+                "title": "Job span",
+                "type": "stat",
+                "targets": [{"refId": "A", "data": '[{"value":"118.40 min"}]'}],
+                "options": {"reduceOptions": {"fields": "Span"}},
+            },
         ]
     }
     later = json.loads(json.dumps(earlier))
     assert inline_data_signature(dashboard=earlier) == inline_data_signature(dashboard=later)
     later["panels"][0]["options"]["content"] = "Snapshot taken at 09:00Z"
     assert inline_data_signature(dashboard=earlier) != inline_data_signature(dashboard=later)
+    later = json.loads(json.dumps(earlier))
+    later["panels"][1]["options"]["reduceOptions"]["fields"] = "Wrong field"
+    assert inline_data_signature(dashboard=earlier) != inline_data_signature(dashboard=later)
 
 
-def test_pilot_queries_match_their_snapshot_rows(*, pilot: Pilot) -> None:
+def test_pilot_queries_match_report_rows(*, pilot: Pilot, report: dict[str, object]) -> None:
     expected_counts = {
-        "Jobs": len(pilot.snapshot["jobs"]),
-        "Steps (all jobs)": sum(len(job["steps"]) for job in pilot.snapshot["jobs"]),
-        "Artifacts and evidence": len(pilot.snapshot["artifacts"]),
+        "Jobs": len(report["jobs"]),
+        "All steps (slowest first)": len(report["steps"]),
+        "Artifacts and evidence": len(report["artifacts"]),
+        "Failure observations": len(report["failures"]["steps"]) + len(report["failures"]["jobs"]),
     }
-    query_count = 0
-    for panel in pilot.dashboard["panels"]:
-        for target in panel.get("targets", []):
+    panels = pilot.dashboard["panels"]
+    titles = {panel["title"] for panel in panels}
+    assert {"Jobs", "All steps (slowest first)"}.issubset(titles)
+    stat_panels = [panel for panel in panels if panel["type"] == "stat"]
+    assert len(stat_panels) == 4, "dashboard must have four stat cards"
+    assert sum(panel["type"] == "barchart" for panel in panels) == 1
+
+    stat_query_count = 0
+    non_stat_query_count = 0
+    for panel in panels:
+        if panel["type"] == "text":
+            continue
+        targets = panel["targets"]
+        assert len(targets) == 1, f"panel {panel['title']} needs one query"
+        if panel["type"] == "stat":
+            expected_count = 1
+            assert panel["datasource"]["uid"] == "ci-pilot-inline"
+        elif panel["type"] == "barchart":
+            expected_count = len(report["slowest_steps"])
+        else:
+            assert panel["type"] == "table"
+            expected_count = expected_counts[panel["title"]]
+        for target in targets:
             assert target["source"] == "inline", "pilot must not request arbitrary URLs"
-            assert target.get("url", "") == ""
+            assert target["url"] == ""
             assert target["parser"] == "backend"
             rows = json.loads(target["data"])
             assert isinstance(rows, list)
-            assert len(rows) == expected_counts[panel["title"]]
+            assert len(rows) == expected_count, panel["title"]
             query = dict(target)
             query["datasource"] = {"type": "yesoreyeram-infinity-datasource", "uid": "ci-pilot-inline"}
             result = request_json(url=f"{pilot.url}/api/ds/query", data={"from": "0", "to": "1", "queries": [query]})[
@@ -168,22 +169,24 @@ def test_pilot_queries_match_their_snapshot_rows(*, pilot: Pilot) -> None:
             actual_rows = 0
             for frame in frames:
                 columns = frame["data"]["values"]
+                assert columns, "a returned frame must contain its configured columns"
                 lengths = {len(column) for column in columns}
-                assert len(lengths) <= 1
-                actual_rows += next(iter(lengths), 0)
+                assert len(lengths) == 1
+                actual_rows += len(columns[0])
             assert actual_rows == len(rows), panel["title"]
-            query_count += 1
-    # A valid run with no artifacts renders two table queries (jobs and
-    # steps); the artifacts panel adds a third only when artifacts exist.
-    # The per-target row-count assertions above are the real data proof.
-    assert query_count >= 2, "pilot needs the jobs and steps data panels"
-
-
-def test_pilot_exposes_only_a_viewer(*, pilot: Pilot) -> None:
-    payload = {"dashboard": {"uid": "ci-pilot-write-probe", "title": "Write must be denied", "panels": []}}
-    with pytest.raises(urllib.error.HTTPError) as error:
-        request_json(url=f"{pilot.url}/api/dashboards/db", data=payload)
-    assert error.value.code in (401, 403), "anonymous pilot access must be read-only"
+            if panel["type"] == "stat":
+                stat_query_count += 1
+                fields = panel["options"]["reduceOptions"]["fields"]
+                frame_fields = []
+                for frame in frames:
+                    frame_fields.extend(field["name"] for field in frame["schema"]["fields"])
+                assert fields in frame_fields, (
+                    f"stat panel {panel['title']}: reduceOptions field {fields!r} not in frame schema {frame_fields}"
+                )
+            else:
+                non_stat_query_count += 1
+    assert stat_query_count == 4, "all four stat cards must have actual queried targets"
+    assert non_stat_query_count >= 2, "pilot needs the jobs and steps data panels"
 
 
 def test_pilot_data_source_refuses_url_queries(*, pilot: Pilot) -> None:
@@ -206,3 +209,10 @@ def test_pilot_data_source_refuses_url_queries(*, pilot: Pilot) -> None:
     denied = result["results"]["URL"]
     assert denied["status"] == 500
     assert "requested URL not allowed" in denied["error"]
+
+
+def test_pilot_exposes_only_a_viewer(*, pilot: Pilot) -> None:
+    payload = {"dashboard": {"uid": "ci-pilot-write-probe", "title": "Write must be denied", "panels": []}}
+    with pytest.raises(urllib.error.HTTPError) as error:
+        request_json(url=f"{pilot.url}/api/dashboards/db", data=payload)
+    assert error.value.code in (401, 403), "anonymous pilot access must be read-only"
