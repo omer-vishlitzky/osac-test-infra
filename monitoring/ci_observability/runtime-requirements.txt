@@ -1,0 +1,4 @@
+# Runtime dependencies of the CI observability ledger and read API.
+# The monitoring deployment installs these into the service image; the
+# tests run with the shared monitoring test tools instead.
+psycopg[binary]==3.3.6
