@@ -146,6 +146,9 @@ class _ReadAPIHandler(BaseHTTPRequestHandler):
             return
         try:
             try:
+                if self.path == "/metrics":
+                    self._metrics()
+                    return
                 status, body = self._route()
             except _BadRequest as exc:
                 status, body = 400, {"error": str(exc)}
@@ -192,8 +195,11 @@ class _ReadAPIHandler(BaseHTTPRequestHandler):
 
     def _send_json(self, *, status: int, body: dict[str, JSONValue]) -> None:
         payload = json.dumps(body, separators=(",", ":")).encode("utf-8")
+        self._send_content(status=status, content_type="application/json", payload=payload)
+
+    def _send_content(self, *, status: int, content_type: str, payload: bytes) -> None:
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(payload)))
         if status == 405:
             self.send_header("Allow", "GET")
@@ -202,6 +208,23 @@ class _ReadAPIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         if self.command != "HEAD":
             self.wfile.write(payload)
+
+    def _metrics(self) -> None:
+        client = self._ledger()
+        success = 1
+        try:
+            client.health_check()
+        except Exception as error:
+            print(f"ci-observability-api: metrics check failed with {type(error).__name__}", file=sys.stderr)
+            success = 0
+        finally:
+            client.close()
+        payload = (
+            "# HELP ci_observability_ledger_healthcheck_success Whether the ledger health check succeeded.\n"
+            "# TYPE ci_observability_ledger_healthcheck_success gauge\n"
+            f"ci_observability_ledger_healthcheck_success {success}\n"
+        ).encode("ascii")
+        self._send_content(status=200, content_type="text/plain; version=0.0.4; charset=utf-8", payload=payload)
 
     def _ledger(self) -> Ledger:
         return Ledger(

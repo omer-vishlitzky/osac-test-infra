@@ -40,6 +40,7 @@ except ModuleNotFoundError:
 
 from collections.abc import Iterator, Sequence
 
+from prometheus_client.parser import text_string_to_metric_families
 from psycopg import sql
 from psycopg.conninfo import conninfo_to_dict
 
@@ -257,6 +258,35 @@ def test_healthz_reports_ok(base_url: str) -> None:
     status, body = http_get(url=f"{base_url}/healthz")
     assert status == 200
     assert body == {"status": "ok"}
+
+
+def test_metrics_are_valid_prometheus_text(base_url: str) -> None:
+    with urllib.request.urlopen(f"{base_url}/metrics", timeout=10) as response:
+        assert response.status == 200
+        assert response.headers["Content-Type"].startswith("text/plain; version=0.0.4")
+        metrics = list(text_string_to_metric_families(response.read().decode()))
+    assert len(metrics) == 1
+    assert metrics[0].type == "gauge"
+    assert metrics[0].name == "ci_observability_ledger_healthcheck_success"
+    assert metrics[0].samples[0].value == 1
+    assert metrics[0].samples[0].labels == {}
+
+
+def test_metrics_distinguish_a_running_api_from_a_failed_database_check(seeded: str) -> None:
+    server = api.ReadAPIServer(dsn=UNREACHABLE_DSN, schema=seeded, port=0)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{server.port}/metrics", timeout=10) as response:
+            assert response.status == 200
+            payload = response.read().decode()
+        metrics = list(text_string_to_metric_families(payload))
+        assert metrics[0].samples[0].value == 0
+        assert "postgresql" not in payload
+        assert "Traceback" not in payload
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def test_healthz_reports_unavailable_when_database_is_down(dsn: str, seeded: str) -> None:

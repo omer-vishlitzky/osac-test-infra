@@ -166,6 +166,7 @@ non-loopback address.
 | Endpoint | Purpose |
 | --- | --- |
 | `GET /healthz` | Connectivity and migrated-schema check. `200 {"status":"ok"}` or `503`. |
+| `GET /metrics` | Prometheus gauge for the ledger health check. A failed check emits zero; diagnostics expose no credentials or queries. |
 | `GET /api/v1/runs` | Registered runs. `execution_count` counts records known to have executed; `registration_count` counts every stored record. Filters: `repository_id`. |
 | `GET /api/v1/executions` | Bounded execution list. Filters: `repository_id`, `run_id`, `run_attempt`, `logical_job_key`, `github_job_id`, `executed`, `registered_after`, `registered_before`. |
 | `GET /api/v1/executions/{execution_id}` | One execution with event and journal counts. |
