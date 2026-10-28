@@ -7,6 +7,8 @@ on:
     paths:
       - "monitoring/scripts/**"
       - "monitoring/ci_observability/**"
+      - "monitoring/config/observability/**"
+      - "monitoring/quadlet/ci-observability-*.container"
       - "monitoring/tests/**"
       - ".github/workflows/monitoring-unit-tests.yml"
 
@@ -17,6 +19,20 @@ jobs:
   unit-tests:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    services:
+      postgres:
+        image: postgres@sha256:2d2b8998d31037bf721cfdf764d76ba74171b4fab3431b7f72c27c56ddbdf9e3
+        env:
+          POSTGRES_USER: ci_observability
+          POSTGRES_DB: ci_observability
+          # This database is disposable, private to this job, and has no secrets.
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - "127.0.0.1::5432"
+        options: >-
+          --cpus 2 --memory 1g
+          --health-cmd "pg_isready --username=ci_observability --dbname=ci_observability"
+          --health-interval 5s --health-timeout 5s --health-retries 12
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6
         with:
@@ -27,7 +43,13 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install dependencies
-        run: python3 -m pip install --quiet -r monitoring/tests/requirements.txt
+        run: >-
+          python3 -m pip install --quiet
+          -r monitoring/tests/requirements.txt
+          -r monitoring/ci_observability/runtime-requirements.txt
       - name: Run unit tests
         working-directory: monitoring/tests
+        env:
+          CI_OBSERVABILITY_TEST_DSN: >-
+            postgresql://ci_observability@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/ci_observability
         run: python3 -m pytest
