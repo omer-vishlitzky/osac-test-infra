@@ -42,6 +42,7 @@ except ModuleNotFoundError:
 
 from contract_helpers import MANIFEST_NAME, VALID_BUNDLES, copy_bundle, load_json, rewrite_journal
 from psycopg import sql
+from psycopg.conninfo import make_conninfo
 
 from monitoring.ci_observability import bundle_reader, ledger
 from monitoring.ci_observability.bundle_reader import (
@@ -2012,7 +2013,7 @@ def test_reader_role_cannot_read_source_tables(dsn: str) -> None:
 
     schema = f"ci_obs_w01b_reader_{os.getpid()}"
     role = f"ci_obs_w01b_reader_role_{os.getpid()}"
-    reader_dsn = f"postgresql://{role}@127.0.0.1:36907/ci_observability"
+    reader_dsn = make_conninfo(dsn, user=role)
     try:
         with psycopg.connect(dsn, autocommit=True) as conn:
             conn.execute(sql.SQL("CREATE ROLE {} LOGIN").format(sql.Identifier(role)))
@@ -2055,7 +2056,7 @@ def test_reader_isolation_covers_public_column_and_inherited_grants(dsn: str) ->
     schema = f"ci_obs_w01b_acl_{os.getpid()}"
     grantee = f"ci_obs_w01b_acl_grantee_{os.getpid()}"
     member = f"ci_obs_w01b_acl_member_{os.getpid()}"
-    member_dsn = f"postgresql://{member}@127.0.0.1:36907/ci_observability"
+    member_dsn = make_conninfo(dsn, user=member)
     migration_text = (Path(ledger.__file__).parent / "migrations" / "0002_sources.sql").read_text()
     try:
         with psycopg.connect(dsn, autocommit=True) as conn:
