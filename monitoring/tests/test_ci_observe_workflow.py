@@ -1,0 +1,314 @@
+"""Structural tests for the ci-observe CI integration (Milestone 2, C0).
+
+The integration is two YAML files: the composite action
+.github/actions/ci-observe-capture/action.yml and its wiring into the
+reusable e2e-vmaas-full-install.yml workflow. These tests pin the contract
+that makes the capture safe to turn on for a real E2E job:
+
+- the capture is opt-in (the workflow input defaults to false),
+- the action reuses the repo's collector configs instead of its own copies,
+- the capture artifact name carries the run id and the attempt,
+- the test command's exit code is preserved: the run step has no
+  continue-on-error and exits with the captured return code, while every
+  capture-side step degrades to a warning instead of failing the job.
+
+The automatic backend wiring is pinned too: the scheduled
+ci-observe-sync.yml workflow on the central monitoring machine and the
+Grafana datasources that point at its fixed ports.
+
+Runtime behavior (deploy, capture, close) is exercised on a live cluster by
+the capture supervisor's own validation; see monitoring/ci-observe.md.
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+import pytest
+import yaml
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+ACTION_PATH = REPO_ROOT / ".github" / "actions" / "ci-observe-capture" / "action.yml"
+WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "e2e-vmaas-full-install.yml"
+SYNC_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "ci-observe-sync.yml"
+DATASOURCES_PATH = REPO_ROOT / "monitoring" / "config" / "grafana" / "datasources.yml"
+CLUSTER_MANIFEST = REPO_ROOT / "monitoring" / "config" / "ci-observe" / "cluster.yaml"
+COLLECTOR_CONFIG = REPO_ROOT / "monitoring" / "config" / "ci-observe" / "collector.yaml"
+
+UPLOAD_ACTION = "./.github/actions/upload-artifacts"
+CAPTURE_ACTION = "./.github/actions/ci-observe-capture"
+
+
+@pytest.fixture(scope="module")
+def action() -> dict:
+    return yaml.safe_load(ACTION_PATH.read_text())
+
+
+@pytest.fixture(scope="module")
+def workflow() -> dict:
+    return yaml.safe_load(WORKFLOW_PATH.read_text())
+
+
+@pytest.fixture(scope="module")
+def sync_workflow() -> dict:
+    return yaml.safe_load(SYNC_WORKFLOW_PATH.read_text())
+
+
+@pytest.fixture(scope="module")
+def datasources() -> dict:
+    return yaml.safe_load(DATASOURCES_PATH.read_text())
+
+
+def workflow_call(document: dict) -> dict:
+    """The workflow_call trigger of a parsed workflow file.
+
+    PyYAML parses the YAML 1.1 boolean-looking ``on`` key as True.
+    """
+    triggers = document.get("on") or document.get(True)
+    assert isinstance(triggers, dict)
+    return triggers["workflow_call"]
+
+
+def steps_of(document: dict) -> list[dict]:
+    return document["jobs"]["e2e"]["steps"]
+
+
+def step_by_id(steps: list[dict], step_id: str) -> dict:
+    matches = [step for step in steps if step.get("id") == step_id]
+    assert len(matches) == 1, f"expected exactly one step with id {step_id}"
+    return matches[0]
+
+
+def sync_steps(document: dict) -> list[dict]:
+    return document["jobs"]["sync"]["steps"]
+
+
+class TestAction:
+    def test_is_a_well_formed_composite_action(self, action: dict) -> None:
+        assert action["runs"]["using"] == "composite"
+        inputs = action["inputs"]
+        assert inputs["kubeconfig-path"]["required"] is True
+        assert inputs["namespace"]["required"] is True
+        assert inputs["command"]["required"] is True
+        assert inputs["capture-id"]["required"] is False
+        assert inputs["capture-id"]["default"] == ""
+        # Self-contained: every step is an inline run or an existing repo
+        # action, never a script of its own.
+        for step in action["runs"]["steps"]:
+            assert "run" in step or "uses" in step, step.get("name")
+            assert not str(step.get("run", "")).startswith("python3 "), step.get("name")
+
+    def test_reuses_the_repo_collector_configs(self, action: dict) -> None:
+        deploy = step_by_id(action["runs"]["steps"], "deploy")
+        script = deploy["run"]
+        assert "monitoring/config/ci-observe/cluster.yaml" in script
+        assert "monitoring/config/ci-observe/collector.yaml" in script
+        assert CLUSTER_MANIFEST.is_file()
+        assert COLLECTOR_CONFIG.is_file()
+
+    def test_beyla_image_is_configurable_and_defaults_to_the_pinned_patch_build(self, action: dict) -> None:
+        beyla = action["inputs"]["beyla-image"]
+        assert beyla["required"] is False
+        documents = [doc for doc in yaml.safe_load_all(CLUSTER_MANIFEST.read_text()) if doc]
+        daemonset = next(doc for doc in documents if doc.get("kind") == "DaemonSet")
+        pinned = daemonset["spec"]["template"]["spec"]["containers"][0]["image"]
+        assert beyla["default"] == pinned
+
+    def test_artifact_name_carries_run_id_and_attempt(self, action: dict) -> None:
+        upload = next(step for step in action["runs"]["steps"] if step.get("uses") == UPLOAD_ACTION)
+        name = upload["with"]["artifact-name"]
+        assert "ci-observe-capture" in name
+        assert "${{ github.run_id }}" in name
+        assert "${{ github.run_attempt }}" in name
+
+    def test_upload_goes_through_the_gitleaks_scanning_path(self, action: dict) -> None:
+        upload = next(step for step in action["runs"]["steps"] if step.get("uses") == UPLOAD_ACTION)
+        stage = step_by_id(action["runs"]["steps"], "stage")
+        # Staged inside the standard artifact directory the upload action
+        # scans, and gated on that staging step's output.
+        assert "${RUNNER_TEMP}/osac-artifacts" in stage["run"]
+        assert upload["if"] == "always() && steps.stage.outputs.staged == 'true'"
+
+    def test_test_exit_code_is_preserved(self, action: dict) -> None:
+        steps = action["runs"]["steps"]
+        run = step_by_id(steps, "run")
+        # The run step is the only one without continue-on-error: its outcome
+        # is the test's own outcome.
+        assert "continue-on-error" not in run
+        assert 'bash -e -o pipefail "${ci_dir}/command.sh" || rc=$?' in run["run"]
+        assert 'exit "${rc}"' in run["run"]
+        for step in steps:
+            if step.get("id") != "run":
+                assert step.get("continue-on-error") is True, step.get("name", step)
+
+    def test_closing_steps_run_always_and_delete_the_capture_volume(self, action: dict) -> None:
+        close = step_by_id(action["runs"]["steps"], "close")
+        assert close["if"].startswith("always()")
+        script = close["run"]
+        assert "pvc/ci-observe-capture-" in script
+        assert "--ignore-not-found" in script
+        # The writers are stopped before the copy, so the capture files are
+        # closed on disk when the readout pod reads them.
+        assert "delete deployment/ci-observe-gateway" in script
+        assert "delete daemonset/ci-observe-beyla" in script
+
+    def test_run_step_sets_the_otel_environment(self, action: dict) -> None:
+        run = step_by_id(action["runs"]["steps"], "run")
+        script = run["run"]
+        assert 'OTEL_EXPORTER_OTLP_ENDPOINT="http://127.0.0.1:${CI_OBSERVE_OTLP_PORT}"' in script
+        assert 'OTEL_EXPORTER_OTLP_TIMEOUT="2"' in script
+        assert "--export-traces" in script
+        # Only when the collectors came up: a failed deployment must leave
+        # the command's environment untouched.
+        assert 'if [[ -n "${CI_OBSERVE_OTLP_PORT:-}" ]]' in script
+
+    def test_capture_metadata_matches_the_capture_schema(self, action: dict) -> None:
+        close = step_by_id(action["runs"]["steps"], "close")
+        script = close["run"]
+        assert '"osac.ci-observe.capture"' in script
+        assert '"cluster-objects"' in script
+        assert '"cluster-metrics"' in script
+        # A capture the test command never finished is interrupted, not
+        # closed: only closed captures can be imported.
+        assert '"interrupted"' in script
+
+
+class TestWorkflowWiring:
+    def test_capture_is_opt_in_and_defaults_to_false(self, workflow: dict) -> None:
+        entry = workflow_call(workflow)["inputs"]["ci-observe"]
+        assert entry["type"] == "boolean"
+        assert entry["required"] is False
+        assert entry["default"] is False
+
+    def test_every_workflow_using_the_action_gates_it_behind_the_input(self) -> None:
+        referencing = [
+            path for path in (REPO_ROOT / ".github" / "workflows").glob("*.yml") if CAPTURE_ACTION in path.read_text()
+        ]
+        assert WORKFLOW_PATH in referencing, "the reusable vmaas workflow must use the action"
+        for path in referencing:
+            entry = workflow_call(yaml.safe_load(path.read_text()))["inputs"]["ci-observe"]
+            assert entry.get("default") is False, path
+
+    def test_exactly_one_test_step_runs_depending_on_the_input(self, workflow: dict) -> None:
+        steps = steps_of(workflow)
+        plain = step_by_id(steps, "test")
+        observed = step_by_id(steps, "test-observed")
+        assert plain["if"] == "${{ !inputs.ci-observe }}"
+        assert observed["if"] == "${{ inputs.ci-observe }}"
+        assert observed["uses"] == CAPTURE_ACTION
+        assert steps.index(observed) == steps.index(plain) + 1
+        assert plain["name"] == "Run E2E tests"
+
+    def test_observed_command_mirrors_the_plain_test_invocation(self, workflow: dict) -> None:
+        steps = steps_of(workflow)
+        plain = step_by_id(steps, "test")
+        observed = step_by_id(steps, "test-observed")
+        command = observed["with"]["command"]
+        # Same pytest invocation and container as the plain step...
+        assert "--junitxml=/tmp/test-output/junit.xml -v" in command
+        assert '"osac-e2e-tests:${{ github.run_id }}"' in command
+        assert "tests/e2e/" in command
+        # ...plus the OTEL pass-through flags the action's exports need.
+        assert "-e OTEL_EXPORTER_OTLP_ENDPOINT" in command
+        assert "-e OTEL_EXPORTER_OTLP_TIMEOUT" in command
+        assert "-e PYTEST_ADDOPTS" in command
+        assert "${{ inputs.namespace }}" in command
+        # The plain step's own script stays the unwrapped podman run.
+        assert "-e OTEL_EXPORTER_OTLP_ENDPOINT" not in plain["run"]
+
+    def test_job_result_covers_both_test_steps(self, workflow: dict) -> None:
+        result = workflow["jobs"]["e2e"]["outputs"]["result"]
+        assert "steps.test.outcome" in result
+        assert "steps.test-observed.outcome" in result
+        assert "'PASSED'" in result and "'FAILED'" in result
+
+
+class TestSyncWorkflow:
+    """The scheduled backend wiring: ci-observe-sync.yml on monitoring-central."""
+
+    def test_runs_on_the_central_machine_every_15_minutes(self, sync_workflow: dict) -> None:
+        job = sync_workflow["jobs"]["sync"]
+        assert job["runs-on"] == "monitoring-central"
+        triggers = sync_workflow.get("on") or sync_workflow.get(True)
+        assert triggers["schedule"] == [{"cron": "*/15 * * * *"}]
+        assert "workflow_dispatch" in triggers
+
+    def test_serializes_runs_and_times_out(self, sync_workflow: dict) -> None:
+        job = sync_workflow["jobs"]["sync"]
+        assert job["concurrency"] == {"group": "ci-observe-sync", "cancel-in-progress": False}
+        assert job["timeout-minutes"] == 30
+        assert job["permissions"] == {"contents": "read"}
+
+    def test_the_vault_github_token_authenticates_gh(self, sync_workflow: dict) -> None:
+        steps = sync_steps(sync_workflow)
+        approle = step_by_id(steps, "approle")["run"]
+        assert "${HOME}/.vault-server/.approle" in approle
+        vault = step_by_id(steps, "vault")
+        assert vault["uses"].startswith("hashicorp/vault-action@")
+        assert "secret/data/osac/monitoring/github-token token | PRIVATE_GITHUB_TOKEN" in vault["with"]["secrets"]
+        for step_id in ("sync_osac", "sync_osac_test_infra"):
+            assert step_by_id(steps, step_id)["env"]["GH_TOKEN"] == "${{ steps.vault.outputs.PRIVATE_GITHUB_TOKEN }}"
+
+    def test_the_backend_uses_a_persistent_state_dir_and_fixed_ports(self, sync_workflow: dict) -> None:
+        steps = sync_steps(sync_workflow)
+        assert "${HOME}/monitoring/ci-observe" in step_by_id(steps, "prepare")["run"]
+        up = step_by_id(steps, "up")["run"]
+        assert 'python3 monitoring/scripts/ci-observe.py --state-dir "${CI_OBSERVE_STATE_DIR}" up' in up
+        for flag, port in (
+            ("--ui-port", "3300"),
+            ("--otlp-port", "4318"),
+            ("--tempo-port", "3200"),
+            ("--loki-port", "3100"),
+            ("--metrics-port", "9092"),
+        ):
+            assert f"{flag} {port}" in up
+
+    def test_both_osac_repositories_are_synced(self, sync_workflow: dict) -> None:
+        steps = sync_steps(sync_workflow)
+        assert "sync --repository osac-project/osac --since 24h" in step_by_id(steps, "sync_osac")["run"]
+        assert (
+            "sync --repository osac-project/osac-test-infra --since 24h"
+            in step_by_id(steps, "sync_osac_test_infra")["run"]
+        )
+        # Both syncs and the prune run against the same state dir as up.
+        for step_id in ("sync_osac", "sync_osac_test_infra"):
+            assert '"${CI_OBSERVE_STATE_DIR}"' in step_by_id(steps, step_id)["run"]
+
+    def test_prunes_cached_data_older_than_14_days(self, sync_workflow: dict) -> None:
+        prune = step_by_id(sync_steps(sync_workflow), "prune")
+        assert prune["if"] == "always()"
+        assert "-mtime +14" in prune["run"]
+        assert "captures" in prune["run"]
+        assert "artifacts" in prune["run"]
+
+    def test_posts_each_repository_report_to_the_job_summary(self, sync_workflow: dict) -> None:
+        summary = step_by_id(sync_steps(sync_workflow), "summary")
+        assert summary["if"] == "always()"
+        assert "$GITHUB_STEP_SUMMARY" in summary["run"]
+        assert "osac-project/${repo}" in summary["run"]
+
+
+class TestCiObserveDatasources:
+    """The Grafana datasources point at the ports the sync workflow publishes."""
+
+    def test_the_three_datasources_match_the_workflow_ports(self, sync_workflow: dict, datasources: dict) -> None:
+        entries = {ds["uid"]: ds for ds in datasources["datasources"]}
+        up = step_by_id(sync_steps(sync_workflow), "up")["run"]
+        for flag, uid, ds_type in (
+            ("--tempo-port", "ci-observe-traces", "tempo"),
+            ("--loki-port", "ci-observe-logs", "loki"),
+            ("--metrics-port", "ci-observe-metrics", "prometheus"),
+        ):
+            entry = entries[uid]
+            port = re.search(rf"{flag} (\d+)", up).group(1)
+            assert entry["type"] == ds_type
+            assert entry["url"] == f"http://127.0.0.1:{port}"
+            assert entry["editable"] is False
+        assert entries["ci-observe-metrics"]["jsonData"]["timeInterval"] == "60s"
+
+    def test_existing_datasources_are_unchanged(self, datasources: dict) -> None:
+        entries = {ds["uid"]: ds for ds in datasources["datasources"]}
+        assert entries["prometheus"]["url"] == "http://127.0.0.1:9091"
+        assert entries["prometheus"]["isDefault"] is True
+        assert entries["workflow-api"]["type"] == "yesoreyeram-infinity-datasource"

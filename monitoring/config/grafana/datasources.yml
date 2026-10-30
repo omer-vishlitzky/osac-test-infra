@@ -9,6 +9,12 @@ deleteDatasources:
     orgId: 1
   - name: Workflow Exporter API
     orgId: 1
+  - name: CI Observe Traces
+    orgId: 1
+  - name: CI Observe Logs
+    orgId: 1
+  - name: CI Observe Metrics
+    orgId: 1
 
 datasources:
   - name: Prometheus
@@ -20,6 +26,33 @@ datasources:
     editable: false
     jsonData:
       timeInterval: 15s
+
+  # The ci-observe telemetry backend (monitoring/scripts/ci-observe.py up),
+  # kept in sync by the scheduled .github/workflows/ci-observe-sync.yml on
+  # this machine. This Grafana runs with host networking, so it reaches the
+  # backend's loopback-published ports directly.
+  - name: CI Observe Traces
+    uid: ci-observe-traces
+    type: tempo
+    access: proxy
+    url: http://127.0.0.1:3200
+    editable: false
+
+  - name: CI Observe Logs
+    uid: ci-observe-logs
+    type: loki
+    access: proxy
+    url: http://127.0.0.1:3100
+    editable: false
+
+  - name: CI Observe Metrics
+    uid: ci-observe-metrics
+    type: prometheus
+    access: proxy
+    url: http://127.0.0.1:9092
+    editable: false
+    jsonData:
+      timeInterval: 60s
 
   - name: Workflow Exporter API
     uid: workflow-api
