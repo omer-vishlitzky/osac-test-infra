@@ -1,9 +1,9 @@
 """Structural tests for the ci-observe CI integration (Milestone 2, C0).
 
-The integration is two YAML files: the composite action
+The integration is the composite action
 .github/actions/ci-observe-capture/action.yml and its wiring into the
-reusable e2e-vmaas-full-install.yml workflow. These tests pin the contract
-that makes the capture safe to turn on for a real E2E job:
+reusable e2e-{vmaas,bmaas,caas}-full-install.yml workflows. These tests pin
+the contract that makes the capture safe to turn on for a real E2E job:
 
 - the capture is opt-in (the workflow input defaults to false),
 - the action reuses the repo's collector configs instead of its own copies,
@@ -30,14 +30,29 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 ACTION_PATH = REPO_ROOT / ".github" / "actions" / "ci-observe-capture" / "action.yml"
-WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "e2e-vmaas-full-install.yml"
 SYNC_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "ci-observe-sync.yml"
 DATASOURCES_PATH = REPO_ROOT / "monitoring" / "config" / "grafana" / "datasources.yml"
 CLUSTER_MANIFEST = REPO_ROOT / "monitoring" / "config" / "ci-observe" / "cluster.yaml"
 COLLECTOR_CONFIG = REPO_ROOT / "monitoring" / "config" / "ci-observe" / "collector.yaml"
 
+# The three full-install reusable workflows wired for capture, and the
+# callers that own their workflow_dispatch inputs.
+SUITES = ("vmaas", "bmaas", "caas")
+FULL_INSTALL_WORKFLOWS = {
+    suite: REPO_ROOT / ".github" / "workflows" / f"e2e-{suite}-full-install.yml" for suite in SUITES
+}
+FULL_INSTALL_CALLERS = {
+    suite: REPO_ROOT / ".github" / "workflows" / f"e2e-{suite}-full-install-caller.yml" for suite in SUITES
+}
+PR_SUITE_STARTERS = {suite: REPO_ROOT / ".github" / "workflows" / f"e2e-pr-{suite}.yml" for suite in SUITES}
+
 UPLOAD_ACTION = "./.github/actions/upload-artifacts"
 CAPTURE_ACTION = "./.github/actions/ci-observe-capture"
+
+# The -e flags the observed command adds so the action's OTEL exports reach
+# the container under test. Trailing backslash: each is a continued podman
+# argument line inside the invocation.
+OTEL_PASS_THROUGH = ("-e OTEL_EXPORTER_OTLP_ENDPOINT \\", "-e OTEL_EXPORTER_OTLP_TIMEOUT \\", "-e PYTEST_ADDOPTS \\")
 
 
 @pytest.fixture(scope="module")
@@ -46,8 +61,18 @@ def action() -> dict:
 
 
 @pytest.fixture(scope="module")
-def workflow() -> dict:
-    return yaml.safe_load(WORKFLOW_PATH.read_text())
+def workflow(request: pytest.FixtureRequest) -> dict:
+    return yaml.safe_load(FULL_INSTALL_WORKFLOWS[request.param].read_text())
+
+
+@pytest.fixture(scope="module")
+def caller(request: pytest.FixtureRequest) -> dict:
+    return yaml.safe_load(FULL_INSTALL_CALLERS[request.param].read_text())
+
+
+@pytest.fixture(scope="module")
+def pr_starter(request: pytest.FixtureRequest) -> dict:
+    return yaml.safe_load(PR_SUITE_STARTERS[request.param].read_text())
 
 
 @pytest.fixture(scope="module")
@@ -70,6 +95,13 @@ def workflow_call(document: dict) -> dict:
     return triggers["workflow_call"]
 
 
+def workflow_dispatch_inputs(document: dict) -> dict:
+    """The workflow_dispatch inputs of a parsed workflow file."""
+    triggers = document.get("on") or document.get(True)
+    assert isinstance(triggers, dict)
+    return triggers["workflow_dispatch"]["inputs"]
+
+
 def steps_of(document: dict) -> list[dict]:
     return document["jobs"]["e2e"]["steps"]
 
@@ -82,6 +114,27 @@ def step_by_id(steps: list[dict], step_id: str) -> dict:
 
 def sync_steps(document: dict) -> list[dict]:
     return document["jobs"]["sync"]["steps"]
+
+
+def called_workflow_with(document: dict) -> dict:
+    """The `with:` block of the caller's single reusable-workflow job."""
+    calling = [job for job in document["jobs"].values() if "uses" in job]
+    assert len(calling) == 1, "expected exactly one job calling a reusable workflow"
+    return calling[0]["with"]
+
+
+def podman_invocation(script: str) -> list[str]:
+    """The podman run invocation of a test script, one stripped line per line.
+
+    The block runs from the ``podman run`` line to the pytest line ending in
+    the junitxml flag; the shell around it selects the arguments.
+    """
+    lines = [line.strip() for line in script.splitlines()]
+    start = next(i for i, line in enumerate(lines) if line.startswith("podman run"))
+    for offset, line in enumerate(lines[start:]):
+        if line.endswith("--junitxml=/tmp/test-output/junit.xml -v"):
+            return lines[start : start + offset + 1]
+    raise AssertionError("podman invocation is not terminated by the junitxml pytest line")
 
 
 class TestAction:
@@ -174,21 +227,40 @@ class TestAction:
         assert '"interrupted"' in script
 
 
+def test_every_workflow_using_the_action_gates_it_behind_the_input() -> None:
+    referencing = [
+        path for path in (REPO_ROOT / ".github" / "workflows").glob("*.yml") if CAPTURE_ACTION in path.read_text()
+    ]
+    assert set(referencing) == set(FULL_INSTALL_WORKFLOWS.values()), (
+        "exactly the three full-install reusable workflows must use the action"
+    )
+    for path in referencing:
+        entry = workflow_call(yaml.safe_load(path.read_text()))["inputs"]["ci-observe"]
+        assert entry.get("default") is False, path
+
+
+@pytest.mark.parametrize(
+    "workflow, suite_env",
+    [
+        ("vmaas", ("-e OSAC_VM_TEMPLATE", "-e OSAC_CLUSTER_TEMPLATE", "-e METERING_ADAPTER_URL")),
+        ("bmaas", ("-e OSAC_BMI_TEMPLATE", "-e OSAC_BMH_NAMESPACE")),
+        ("caas", ("-e OSAC_CLUSTER_TEMPLATE", "-e METERING_ADAPTER_URL", "caas_ssh_key.pub")),
+    ],
+    indirect=["workflow"],
+)
+def test_observed_command_carries_the_suite_specific_environment(workflow: dict, suite_env: tuple[str, ...]) -> None:
+    command = step_by_id(steps_of(workflow), "test-observed")["with"]["command"]
+    for fragment in suite_env:
+        assert fragment in command
+
+
+@pytest.mark.parametrize("workflow", SUITES, indirect=True)
 class TestWorkflowWiring:
     def test_capture_is_opt_in_and_defaults_to_false(self, workflow: dict) -> None:
         entry = workflow_call(workflow)["inputs"]["ci-observe"]
         assert entry["type"] == "boolean"
         assert entry["required"] is False
         assert entry["default"] is False
-
-    def test_every_workflow_using_the_action_gates_it_behind_the_input(self) -> None:
-        referencing = [
-            path for path in (REPO_ROOT / ".github" / "workflows").glob("*.yml") if CAPTURE_ACTION in path.read_text()
-        ]
-        assert WORKFLOW_PATH in referencing, "the reusable vmaas workflow must use the action"
-        for path in referencing:
-            entry = workflow_call(yaml.safe_load(path.read_text()))["inputs"]["ci-observe"]
-            assert entry.get("default") is False, path
 
     def test_exactly_one_test_step_runs_depending_on_the_input(self, workflow: dict) -> None:
         steps = steps_of(workflow)
@@ -205,23 +277,69 @@ class TestWorkflowWiring:
         plain = step_by_id(steps, "test")
         observed = step_by_id(steps, "test-observed")
         command = observed["with"]["command"]
-        # Same pytest invocation and container as the plain step...
-        assert "--junitxml=/tmp/test-output/junit.xml -v" in command
+
+        # The observed podman invocation is the plain one, line for line,
+        # plus the OTEL pass-through flags the action's exports need.
+        plain_run = podman_invocation(plain["run"])
+        observed_run = podman_invocation(command)
+        without_pass_through = [line for line in observed_run if line not in OTEL_PASS_THROUGH]
+        assert without_pass_through == plain_run
+        for flag in OTEL_PASS_THROUGH:
+            assert flag in observed_run
+
+        # Same container, same suite selection, same action inputs.
         assert '"osac-e2e-tests:${{ github.run_id }}"' in command
         assert "tests/e2e/" in command
-        # ...plus the OTEL pass-through flags the action's exports need.
-        assert "-e OTEL_EXPORTER_OTLP_ENDPOINT" in command
-        assert "-e OTEL_EXPORTER_OTLP_TIMEOUT" in command
-        assert "-e PYTEST_ADDOPTS" in command
         assert "${{ inputs.namespace }}" in command
+
         # The plain step's own script stays the unwrapped podman run.
-        assert "-e OTEL_EXPORTER_OTLP_ENDPOINT" not in plain["run"]
+        for flag in OTEL_PASS_THROUGH:
+            assert flag not in plain["run"]
 
     def test_job_result_covers_both_test_steps(self, workflow: dict) -> None:
         result = workflow["jobs"]["e2e"]["outputs"]["result"]
         assert "steps.test.outcome" in result
         assert "steps.test-observed.outcome" in result
         assert "'PASSED'" in result and "'FAILED'" in result
+
+
+@pytest.mark.parametrize("caller", SUITES, indirect=True)
+class TestCallerWiring:
+    """The full-install callers own the workflow_dispatch input and pass it on."""
+
+    def test_dispatch_input_is_opt_in_and_defaults_to_false(self, caller: dict) -> None:
+        entry = workflow_dispatch_inputs(caller)["ci-observe"]
+        assert entry["type"] == "boolean"
+        assert entry["required"] is False
+        assert entry["default"] is False
+
+    def test_input_is_passed_to_the_reusable_workflow(self, caller: dict) -> None:
+        assert called_workflow_with(caller)["ci-observe"] == "${{ inputs.ci-observe || false }}"
+
+
+@pytest.mark.parametrize("pr_starter", SUITES, indirect=True)
+class TestPrStarterWiring:
+    """A pull request turns the capture on with the ci-observe label: the suite
+    starters read it from the pull request (their runs are dispatches, whose
+    events carry no labels) and pass it to the reusable workflow."""
+
+    def test_the_suite_job_waits_for_a_labels_job(self, pr_starter: dict) -> None:
+        suite_job = next(job for name, job in pr_starter["jobs"].items() if name != "verify" and name != "labels")
+        assert suite_job["needs"] == ["verify", "labels"]
+
+    def test_the_labels_job_reads_the_ci_observe_label(self, pr_starter: dict) -> None:
+        labels = pr_starter["jobs"]["labels"]
+        assert labels["permissions"] == {"pull-requests": "read"}
+        script = labels["steps"][0]["run"]
+        assert "pulls/" in script and "ci-observe" in script
+        assert "${{ inputs.pr-number }}" in script
+        # The pull request lives in this repository even for a fork's commit:
+        # the label query must not use inputs.repo.
+        assert "github.repository" in script
+
+    def test_the_label_reaches_the_reusable_workflow(self, pr_starter: dict) -> None:
+        suite_job = next(job for name, job in pr_starter["jobs"].items() if name != "verify" and name != "labels")
+        assert suite_job["with"]["ci-observe"] == "${{ needs.labels.outputs.ci-observe == 'true' }}"
 
 
 class TestSyncWorkflow:

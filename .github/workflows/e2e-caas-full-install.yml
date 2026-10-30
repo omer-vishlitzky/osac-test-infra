@@ -151,6 +151,16 @@ on:
         required: false
         type: string
         default: "osac-project/osac"
+      ci-observe:
+        description: >-
+          Capture ci-observe telemetry (OTel collector gateway plus Beyla in
+          the ci-observability-canary namespace) around the E2E test run and
+          upload it as its own workflow artifact. Opt-in, default off: the
+          plain test step runs unchanged when false. A capture problem is a
+          warning in the job summary and never changes the test result.
+        required: false
+        type: boolean
+        default: false
     outputs:
       result:
         description: "Test result: PASSED or FAILED"
@@ -164,7 +174,9 @@ jobs:
       contents: read
       id-token: write # only exercised when enable-ai-diagnostic is true (always false for fork PR runs)
     outputs:
-      result: ${{ steps.test.outcome == 'success' && 'PASSED' || 'FAILED' }}
+      # Considers both test steps: the plain one (ci-observe off) and the
+      # ci-observe-capture wrapper (ci-observe on); exactly one of them runs.
+      result: ${{ (steps.test.outcome == 'success' || steps.test-observed.outcome == 'success') && 'PASSED' || 'FAILED' }}
 
     env:
       FLAVOR_LOCK: "/tmp/cluster-tool-flavor-${{ inputs.flavor-name }}.lock"
@@ -815,6 +827,9 @@ jobs:
 
       - name: Run E2E tests
         id: test
+        # The ci-observe-capture wrapper below runs the tests instead when
+        # the ci-observe input is set; exactly one of the two steps runs.
+        if: ${{ !inputs.ci-observe }}
         env:
           TEST_FILTER: ${{ inputs.test-filter }}
           TEST_MARKER: ${{ inputs.test-marker }}
@@ -872,6 +887,84 @@ jobs:
             "${E2E_IMAGE}" \
             pytest ${TEST_ARGS} "${FILTER_ARGS[@]}" "${MARKER_ARGS[@]}" \
               --junitxml=/tmp/test-output/junit.xml -v
+
+      # ci-observe variant of "Run E2E tests" (opt-in via the ci-observe
+      # input; the plain step above keeps running when it is false). The
+      # command below mirrors the plain step's script -- keep the two in
+      # sync. The action deploys the collector gateway and Beyla before the
+      # command, runs it with the OTEL exporter environment pointed at the
+      # gateway (the three pass-through -e flags below), and afterwards --
+      # always, even after a failure or cancellation -- closes the capture,
+      # copies it off its PVC and uploads it as an artifact through the
+      # gitleaks-scanning upload path. The command's own exit code is the
+      # step's outcome; capture problems surface as warnings only.
+      - name: Run E2E tests (ci-observe capture)
+        id: test-observed
+        if: ${{ inputs.ci-observe }}
+        uses: ./.github/actions/ci-observe-capture
+        with:
+          kubeconfig-path: ${{ runner.temp }}/kubeconfig
+          namespace: ${{ inputs.namespace }}
+          command: |
+            export TEST_FILTER="${{ inputs.test-filter }}"
+            export TEST_MARKER="${{ inputs.test-marker }}"
+            export OSAC_NAMESPACE="${{ inputs.namespace }}"
+            export OSAC_CLUSTER_TEMPLATE="${{ inputs.cluster-template }}"
+            export E2E_IMAGE="osac-e2e-tests:${{ github.run_id }}"
+            export METERING_ADAPTER_URL="${{ steps.metering-adapter.outputs.url }}"
+
+            KUBECONFIG_PATH="$RUNNER_TEMP/kubeconfig"
+
+            TEST_ARGS="tests/e2e/"
+            if [ -n "${EFFECTIVE_TEST_SUITE}" ]; then
+              TEST_ARGS="tests/e2e/${EFFECTIVE_TEST_SUITE}/"
+              if [ -n "${TEST_MARKER}" ]; then
+                case "${EFFECTIVE_TEST_SUITE}" in
+                  # Sanity stays strictly within its directory, even with -m.
+                  caas|caas/regression) TEST_ARGS="${TEST_ARGS} tests/e2e/references/" ;;
+                esac
+              fi
+            fi
+
+            # Keep compound -k expressions in one argument, just like -m below.
+            FILTER_ARGS=()
+            if [ -n "${TEST_FILTER}" ]; then
+              FILTER_ARGS=(-k "${TEST_FILTER}")
+            fi
+
+            # Array, not a plain string: TEST_MARKER can be a compound pytest
+            # expression (e.g. "sanity or regression"), and unquoted string
+            # expansion below would word-split it into separate arguments --
+            # "or"/"regression" would then be misread as extra test paths
+            # instead of part of the -m expression. Matches
+            # e2e-bmaas-full-install.yml's existing MARKER_ARGS handling.
+            MARKER_ARGS=()
+            if [ -n "${TEST_MARKER}" ]; then
+              MARKER_ARGS=(-m "${TEST_MARKER}")
+            fi
+
+            mkdir -p "$RUNNER_TEMP/test-output"
+
+            rm -f "$RUNNER_TEMP/caas_ssh_key" "$RUNNER_TEMP/caas_ssh_key.pub"
+            ssh-keygen -t ed25519 -f "$RUNNER_TEMP/caas_ssh_key" -N '' -q
+
+            podman run --rm --network=host \
+              -v "${KUBECONFIG_PATH}":/root/.kube/config:ro,Z \
+              -v "${RUNNER_TEMP}/pull-secret.json":/root/pull-secret:ro,Z \
+              -v "${RUNNER_TEMP}/aap-license.zip":/root/aap-license.zip:ro,Z \
+              -v "${RUNNER_TEMP}/caas_ssh_key.pub":/root/.ssh/id_rsa.pub:ro,Z \
+              -v "${RUNNER_TEMP}/test-output":/tmp/test-output:Z \
+              -e KUBECONFIG=/root/.kube/config \
+              -e OSAC_NAMESPACE="${OSAC_NAMESPACE}" \
+              -e OSAC_CLUSTER_TEMPLATE="${OSAC_CLUSTER_TEMPLATE}" \
+              -e OSAC_PULL_SECRET_PATH=/root/pull-secret \
+              -e METERING_ADAPTER_URL="${METERING_ADAPTER_URL}" \
+              -e OTEL_EXPORTER_OTLP_ENDPOINT \
+              -e OTEL_EXPORTER_OTLP_TIMEOUT \
+              -e PYTEST_ADDOPTS \
+              "${E2E_IMAGE}" \
+              pytest ${TEST_ARGS} "${FILTER_ARGS[@]}" "${MARKER_ARGS[@]}" \
+                --junitxml=/tmp/test-output/junit.xml -v
 
       # Teardown comes right after the collection, ahead of the slow scan and
       # upload: a cancelled job gets only 5 minutes for its always() steps.
