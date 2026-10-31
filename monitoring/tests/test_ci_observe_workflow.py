@@ -23,6 +23,7 @@ the capture supervisor's own validation; see monitoring/ci-observe.md.
 from __future__ import annotations
 
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -241,6 +242,45 @@ class TestAction:
         # A capture the test command never finished is interrupted, not
         # closed: only closed captures can be imported.
         assert '"interrupted"' in script
+
+
+def _shell_scripts() -> list[tuple[str, str]]:
+    """Every embedded shell script: all run: blocks of the action, the sync
+    workflow and the wired workflows, plus the observed command inputs (they
+    are bash too)."""
+    scripts: list[tuple[str, str]] = []
+
+    def walk(node: object, origin: str) -> None:
+        if isinstance(node, dict):
+            run = node.get("run")
+            if isinstance(run, str):
+                scripts.append((origin, run))
+            command = node.get("with", {}).get("command") if isinstance(node.get("with"), dict) else None
+            if isinstance(command, str):
+                scripts.append((origin, command))
+            for value in node.values():
+                walk(value, origin)
+        elif isinstance(node, list):
+            for value in node:
+                walk(value, origin)
+
+    origins = [ACTION_PATH, SYNC_WORKFLOW_PATH, *FULL_INSTALL_WORKFLOWS.values(), *PR_SUITE_STARTERS.values()]
+    for origin in origins:
+        for doc in (d for d in yaml.safe_load_all(origin.read_text()) if d):
+            walk(doc, str(origin))
+    return scripts
+
+
+@pytest.mark.parametrize(
+    "origin,script", _shell_scripts(), ids=[f"{Path(o).name}:{i}" for i, (o, _) in enumerate(_shell_scripts())]
+)
+def test_every_embedded_shell_script_parses(origin: str, script: str) -> None:
+    """bash -n on every embedded script. A review of an earlier revision found
+    a `fi` and a `for` joined onto one line by an editing slip: syntactically
+    valid YAML, a broken shell script, and a close step that would have lost
+    every capture. This test keeps that class of mistake out."""
+    result = subprocess.run(["bash", "-n"], input=script, capture_output=True, text=True)
+    assert result.returncode == 0, f"{origin}: {result.stderr}"
 
 
 def test_every_workflow_using_the_action_gates_it_behind_the_input() -> None:

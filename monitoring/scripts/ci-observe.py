@@ -150,6 +150,15 @@ class ToolError(Exception):
         self.code = code
 
 
+class BackendUnavailable(ToolError):
+    """The local backend is down, not the capture's fault.
+
+    A sync that hits this must retry the import on a later pass (the backend
+    comes back with `up`), so unlike a capture refusal it is never recorded
+    as permanent.
+    """
+
+
 def emit(obj: dict[str, Any]) -> None:
     print(json.dumps(obj, indent=2, sort_keys=True))
 
@@ -714,10 +723,10 @@ def import_capture(
         raise ToolError("capture contains no non-empty signal files; nothing to import")
     stack = load_json(stack_path(state_dir))
     if stack is None:
-        raise ToolError("no local stack record; run 'up' first")
+        raise BackendUnavailable("no local stack record; run 'up' first")
     info = inspect_container(stack["container"])
     if info is None or not info["running"]:
-        raise ToolError(f"local stack container {stack['container']} is not running; run 'up' first")
+        raise BackendUnavailable(f"local stack container {stack['container']} is not running; run 'up' first")
     require_owned(info, stack["container"])
     config = replay_config if replay_config is not None else REPLAY_CONFIG
     if not config.is_file():
@@ -1194,6 +1203,15 @@ def sync_artifact(
         }
         if result["status"] == "already-imported":
             detail["reason"] = "already imported"
+        return detail
+    except BackendUnavailable:
+        # The backend being down is recoverable: the next pass retries once
+        # `up` has brought it back, so nothing is recorded and the artifact
+        # is reported as deferred, not failed.
+        shutil.rmtree(staging, ignore_errors=True)
+        detail = base | {"status": "deferred", "reason": "backend unavailable; will retry on the next pass"}
+        if capture_id is not None:
+            detail["capture_id"] = capture_id
         return detail
     except ToolError as err:
         shutil.rmtree(staging, ignore_errors=True)

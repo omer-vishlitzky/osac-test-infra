@@ -416,6 +416,9 @@ def test_sync_downloads_extracts_and_fails_without_a_stack(
     tool: Tool, tmp_path: Path, capsys: Capsys, fake_gh: Callable[..., None]
 ) -> None:
     cap_dir = write_capture(tmp_path, "cap-sync-1")
+    # An interrupted capture is refused deterministically: the refusal is
+    # recorded so the scheduled sync does not re-fail it every 15 minutes.
+    rewrite_metadata(cap_dir, state="interrupted")
     zip_path = zip_capture(cap_dir, tmp_path / "cap-sync-1.zip")
     fake_gh(
         runs=[gh_run(101), gh_run(102), gh_run(900, age_s=3 * 86400)],  # run 900 is outside the 24h window
@@ -429,7 +432,7 @@ def test_sync_downloads_extracts_and_fails_without_a_stack(
     )
     state = tmp_path / "state"
     code, out = main_json(tool, sync_argv(state), capsys)
-    assert code == 1  # the capture import itself failed: no local stack
+    assert code == 1  # the capture itself is not importable: an honest failure
     assert out["runs_found"] == 2  # run 900 was created outside the window
     assert out["artifacts_found"] == 1
     assert out["artifacts_downloaded"] == 1
@@ -440,7 +443,7 @@ def test_sync_downloads_extracts_and_fails_without_a_stack(
     assert by_id[557]["status"] == "ignored"
     assert "expired" in by_id[557]["reason"]
     assert by_id[555]["status"] == "failed"
-    assert "run 'up' first" in by_id[555]["reason"]
+    assert "interrupted" in by_id[555]["reason"]
     assert by_id[555]["capture_id"] == "cap-sync-1"
     assert 556 not in by_id and 558 not in by_id
     cached = state / "artifacts" / "101" / "1" / "artifact.zip"
@@ -460,10 +463,31 @@ def test_sync_downloads_extracts_and_fails_without_a_stack(
     assert out["captures_skipped"] == 1
     skipped = next(d for d in out["details"] if d["artifact_id"] == 555)
     assert "refused earlier" in skipped["reason"]
-    assert "run 'up' first" in skipped["reason"]
+    assert "interrupted" in skipped["reason"]
     record = json.loads((state / "artifacts" / "101" / "1" / "record.json").read_text())
     assert record["status"] == "refused"
     assert record["capture_id"] == "cap-sync-1"
+
+
+def test_sync_defers_a_valid_capture_while_the_backend_is_down(
+    tool: Tool, tmp_path: Path, capsys: Capsys, fake_gh: Callable[..., None]
+) -> None:
+    """A missing backend is recoverable: no refusal is recorded, later passes retry."""
+    cap_dir = write_capture(tmp_path, "cap-sync-down")
+    zip_path = zip_capture(cap_dir, tmp_path / "cap-sync-down.zip")
+    fake_gh(runs=[gh_run(101)], artifacts=[gh_artifact(555, 101)], zips={555: zip_path})
+    state = tmp_path / "state"
+    code, out = main_json(tool, sync_argv(state), capsys)
+    assert code == 0  # deferred, not failed: the backend comes back with `up`
+    detail = next(d for d in out["details"] if d["artifact_id"] == 555)
+    assert detail["status"] == "deferred"
+    assert "backend unavailable" in detail["reason"]
+    assert not (state / "artifacts" / "101" / "1" / "record.json").exists()
+    # The next pass retries the import (still deferred while the stack is down).
+    code, out = main_json(tool, sync_argv(state), capsys)
+    assert code == 0
+    detail = next(d for d in out["details"] if d["artifact_id"] == 555)
+    assert detail["status"] == "deferred"
 
 
 def test_sync_skips_already_imported_capture(
@@ -542,10 +566,10 @@ def test_sync_limit_bounds_downloads_per_invocation(
     )
     state = tmp_path / "state"
     code, out = main_json(tool, sync_argv(state, "--limit", "1"), capsys)
-    assert code == 1  # the one processed capture still fails without a stack
+    assert code == 0  # the processed capture is deferred without a stack, not failed
     assert out["artifacts_downloaded"] == 1
     statuses = sorted(detail["status"] for detail in out["details"])
-    assert statuses == ["deferred", "failed"]
+    assert statuses == ["deferred", "deferred"]
     assert not (state / "artifacts" / "102" / "1" / "artifact.zip").exists()
 
 
@@ -670,11 +694,11 @@ def test_sync_accepts_the_ci_capture_artifact_name_and_nested_zip(
     )
     state = tmp_path / "state"
     code, out = main_json(tool, sync_argv(state), capsys)
-    assert code == 1  # the import fails only because no local stack is running
+    assert code == 0  # the import is deferred only because no local stack is running
     assert out["artifacts_found"] == 1
     detail = out["details"][0]
-    assert detail["status"] == "failed"
-    assert "run 'up' first" in detail["reason"]
+    assert detail["status"] == "deferred"
+    assert "backend unavailable" in detail["reason"]
     assert detail["capture_id"] == "run-101-attempt-1"
     assert (state / "captures" / "run-101-attempt-1" / "metadata.json").is_file()
     assert (state / "artifacts" / "101" / "1" / "artifact.zip").is_file()

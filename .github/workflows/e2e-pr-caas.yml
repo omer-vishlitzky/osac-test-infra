@@ -82,7 +82,14 @@ jobs:
               exit 0
               ;;
           esac
-          if gh api "repos/${{ github.repository }}/pulls/${PR_NUMBER}" --jq '.labels[].name' | grep -qx 'ci-observe'; then
+          if ! labels_json="$(gh api "repos/${{ github.repository }}/pulls/${PR_NUMBER}" --jq '.labels[].name')"; then
+            # An API failure must be visible, not silent: without this warning
+            # a labeled pull request would quietly run without telemetry.
+            echo "::warning::ci-observe: could not read the pull request labels; running without capture"
+            echo 'ci-observe=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if grep -qx 'ci-observe' <<<"${labels_json}"; then
             echo 'ci-observe=true' >> "$GITHUB_OUTPUT"
           else
             echo 'ci-observe=false' >> "$GITHUB_OUTPUT"

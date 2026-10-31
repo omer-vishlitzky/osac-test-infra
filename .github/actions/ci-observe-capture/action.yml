@@ -267,7 +267,8 @@ runs:
         POD
         if ! oc wait --for=condition=Ready "pod/${readout_pod}" -n ci-observability-canary --timeout=120s; then
           fail=1
-        fi        for name in traces.jsonl metrics.jsonl logs.jsonl; do
+        fi
+        for name in traces.jsonl metrics.jsonl logs.jsonl; do
           if ! oc exec -n ci-observability-canary "pod/${readout_pod}" -- cat "/capture/${name}" \
             > "${destination}/${name}" 2>/dev/null; then
             # A missing signal file is a gap, not an error: the metadata
