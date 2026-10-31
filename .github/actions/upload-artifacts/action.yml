@@ -217,7 +217,7 @@ runs:
         # even after this one fails.
         status=0
         python3 -I "${{ github.workspace }}/.github/scripts/release_gate.py" \
-          "${ARTIFACT_DIR}" "${args[@]}" || status=$?
+          "${ARTIFACT_DIR}" --max-file-mbytes "${MAX_FILE_MBYTES}" "${args[@]}" || status=$?
         # The snapshot of the cluster's Secrets has done its job; do not leave it
         # on a runner that outlives this job.
         rm -f "${RUNNER_TEMP}/osac-secret-inventory/k8s-secrets.json"

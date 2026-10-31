@@ -575,7 +575,17 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--report", help=f"report path (default: <directory>/{REPORT_NAME})")
     parser.add_argument("--check", action="store_true", help="change nothing; exit 1 if anything is found")
     parser.add_argument("--fail-on-find", action="store_true", help="exit 1 if anything had to be censored")
+    parser.add_argument(
+        "--max-file-mbytes",
+        type=int,
+        default=512,
+        help="files larger than this are withheld instead of inspected; the default bounds every "
+        "ordinary artifact, callers with legitimately larger payloads (the ci-observe telemetry "
+        "capture) raise it to their known ceiling",
+    )
     args = parser.parse_args(argv[1:])
+    global MAX_FILE_BYTES
+    MAX_FILE_BYTES = args.max_file_mbytes * 1024 * 1024
 
     root = pathlib.Path(args.directory)
     if not root.is_dir():
