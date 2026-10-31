@@ -585,7 +585,10 @@ def up_quadlet(state_dir: Path) -> int:
     for override in (PROMETHEUS_OVERRIDE, LOKI_OVERRIDE, PYROSCOPE_STUB):
         target = config / override.name
         shutil.copyfile(override, target)
-        os.chmod(target, 0o600)
+        # The stub is executed by the image's entrypoint; the image's own
+        # component scripts are 0755, and a non-executable copy aborts the
+        # whole stack with "run-pyroscope.sh: Permission denied".
+        os.chmod(target, 0o755 if override is PYROSCOPE_STUB else 0o600)
     quadlet_dir = Path.home() / ".config" / "containers" / "systemd"
     quadlet_dir.mkdir(parents=True, exist_ok=True)
     atomic_write(quadlet_dir / f"{QUADLET_NAME}.container", render_quadlet(state_dir))
