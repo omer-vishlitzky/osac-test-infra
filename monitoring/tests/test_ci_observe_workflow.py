@@ -22,7 +22,7 @@ the capture supervisor's own validation; see monitoring/ci-observe.md.
 
 from __future__ import annotations
 
-import re
+import importlib.util
 import subprocess
 from pathlib import Path
 
@@ -33,6 +33,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 ACTION_PATH = REPO_ROOT / ".github" / "actions" / "ci-observe-capture" / "action.yml"
 SYNC_WORKFLOW_PATH = REPO_ROOT / ".github" / "workflows" / "ci-observe-sync.yml"
 DATASOURCES_PATH = REPO_ROOT / "monitoring" / "config" / "grafana" / "datasources.yml"
+SCRIPT = REPO_ROOT / "monitoring" / "scripts" / "ci-observe.py"
+_spec = importlib.util.spec_from_file_location("ci_observe_workflow_mod", SCRIPT)
+ci_observe = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(ci_observe)
 CLUSTER_MANIFEST = REPO_ROOT / "monitoring" / "config" / "ci-observe" / "cluster.yaml"
 COLLECTOR_CONFIG = REPO_ROOT / "monitoring" / "config" / "ci-observe" / "collector.yaml"
 
@@ -435,19 +439,32 @@ class TestSyncWorkflow:
         for step_id in ("sync_osac", "sync_osac_test_infra"):
             assert step_by_id(steps, step_id)["env"]["GH_TOKEN"] == "${{ steps.vault.outputs.PRIVATE_GITHUB_TOKEN }}"
 
-    def test_the_backend_uses_a_persistent_state_dir_and_fixed_ports(self, sync_workflow: dict) -> None:
+    def test_the_backend_uses_a_persistent_state_dir_and_a_quadlet(self, sync_workflow: dict) -> None:
         steps = sync_steps(sync_workflow)
         assert "${HOME}/monitoring/ci-observe" in step_by_id(steps, "prepare")["run"]
         up = step_by_id(steps, "up")["run"]
-        assert 'python3 monitoring/scripts/ci-observe.py --state-dir "${CI_OBSERVE_STATE_DIR}" up' in up
-        for flag, port in (
-            ("--ui-port", "3300"),
-            ("--otlp-port", "4318"),
-            ("--tempo-port", "3200"),
-            ("--loki-port", "3100"),
-            ("--metrics-port", "9092"),
+        assert 'python3 monitoring/scripts/ci-observe.py --state-dir "${CI_OBSERVE_STATE_DIR}" up --quadlet' in up
+        # An ad-hoc container would lose its port forwarding when the runner
+        # reaps the job's process group; the backend must be a systemd quadlet.
+        assert "--ui-port" not in up
+
+    def test_the_quadlet_ports_match_the_provisioned_datasources(self, sync_workflow: dict) -> None:
+        """The rendered quadlet publishes the ports the Grafana datasources point at."""
+        rendered = ci_observe.render_quadlet(Path("/home/github-runner/monitoring/ci-observe"))
+        datasources = yaml.safe_load((REPO_ROOT / "monitoring" / "config" / "grafana" / "datasources.yml").read_text())
+        by_uid = {ds["uid"]: ds for ds in datasources["datasources"]}
+        for uid, attr in (
+            ("ci-observe-traces", "tempo"),
+            ("ci-observe-logs", "loki"),
+            ("ci-observe-metrics", "metrics"),
         ):
-            assert f"{flag} {port}" in up
+            port = ci_observe.QUADLET_PORTS[attr]
+            assert by_uid[uid]["url"] == f"http://127.0.0.1:{port}", uid
+            assert f"PublishPort=127.0.0.1:{port}:" in rendered, uid
+        # The stack record's ports are the quadlet's, so the import path and
+        # the Grafana URL never drift apart.
+        assert ci_observe.QUADLET_PORTS["otlp"] == 4318
+        assert ci_observe.QUADLET_PORTS["ui"] == 3300
 
     def test_both_osac_repositories_are_synced(self, sync_workflow: dict) -> None:
         steps = sync_steps(sync_workflow)
@@ -477,18 +494,16 @@ class TestSyncWorkflow:
 class TestCiObserveDatasources:
     """The Grafana datasources point at the ports the sync workflow publishes."""
 
-    def test_the_three_datasources_match_the_workflow_ports(self, sync_workflow: dict, datasources: dict) -> None:
+    def test_the_three_datasources_match_the_quadlet_ports(self, datasources: dict) -> None:
         entries = {ds["uid"]: ds for ds in datasources["datasources"]}
-        up = step_by_id(sync_steps(sync_workflow), "up")["run"]
-        for flag, uid, ds_type in (
-            ("--tempo-port", "ci-observe-traces", "tempo"),
-            ("--loki-port", "ci-observe-logs", "loki"),
-            ("--metrics-port", "ci-observe-metrics", "prometheus"),
+        for uid, ds_type, attr in (
+            ("ci-observe-traces", "tempo", "tempo"),
+            ("ci-observe-logs", "loki", "loki"),
+            ("ci-observe-metrics", "prometheus", "metrics"),
         ):
             entry = entries[uid]
-            port = re.search(rf"{flag} (\d+)", up).group(1)
             assert entry["type"] == ds_type
-            assert entry["url"] == f"http://127.0.0.1:{port}"
+            assert entry["url"] == f"http://127.0.0.1:{ci_observe.QUADLET_PORTS[attr]}"
             assert entry["editable"] is False
         assert entries["ci-observe-metrics"]["jsonData"]["timeInterval"] == "60s"
 

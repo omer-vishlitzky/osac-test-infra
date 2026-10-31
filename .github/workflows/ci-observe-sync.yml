@@ -90,14 +90,17 @@ jobs:
           unset CONTAINERS_STORAGE_CONF
           mkdir -p "${CI_OBSERVE_STATE_DIR}"
           chmod 700 "${CI_OBSERVE_STATE_DIR}"
-          # Fixed ports so the provisioned Grafana datasources
+          # A quadlet, not an ad-hoc container: the runner reaps the job's
+          # process group when it ends, which kills rootless podman's port
+          # forwarder (pasta) and network-isolates an ad-hoc container. Under
+          # systemd the backend outlives the job. The quadlet publishes fixed
+          # ports so the provisioned Grafana datasources
           # (monitoring/config/grafana/datasources.yml) keep pointing at the
-          # same backend. Chosen around the ports monitoring-setup.sh already
-          # occupies on this machine: 3000 Grafana, 3443 Caddy, 9090 cockpit,
-          # 9091 central Prometheus, 9100-9104 exporters.
-          python3 monitoring/scripts/ci-observe.py --state-dir "${CI_OBSERVE_STATE_DIR}" up \
-            --ui-port 3300 --otlp-port 4318 \
-            --tempo-port 3200 --loki-port 3100 --metrics-port 9092
+          # same backend: 3300 UI, 4318 OTLP, 3200 Tempo, 3100 Loki, 9092
+          # metrics, chosen around the ports monitoring-setup.sh already
+          # occupies on this machine (3000 Grafana, 3443 Caddy, 9090 cockpit,
+          # 9091 central Prometheus, 9100-9104 exporters).
+          python3 monitoring/scripts/ci-observe.py --state-dir "${CI_OBSERVE_STATE_DIR}" up --quadlet
 
       # gh reads GH_TOKEN. The variable is step-scoped, so it never reaches
       # any later step. Sync failures fail the workflow: an honest red

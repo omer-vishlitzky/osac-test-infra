@@ -521,7 +521,117 @@ def wait_healthy(url: str, timeout_s: float) -> None:
     raise ToolError(f"{url} did not become healthy within {int(timeout_s)}s")
 
 
+QUADLET_NAME = "ci-observe-backend"
+QUADLET_CONTAINER = "ci-observe-lgtm"
+QUADLET_VOLUME = "ci-observe-lgtm-quadlet-data"
+# The ports the rendered quadlet publishes; they must match the Grafana
+# datasource URLs provisioned by monitoring/config/grafana/datasources.yml.
+QUADLET_PORTS = {"ui": 3300, "otlp": 4318, "tempo": 3200, "loki": 3100, "metrics": 9092}
+
+
+def systemctl_user(*args: str) -> None:
+    result = subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise ToolError(f"systemctl --user {' '.join(args)} failed: {result.stderr.strip() or result.returncode}")
+
+
+def render_quadlet(state_dir: Path) -> str:
+    """The systemd quadlet for the CI backend container.
+
+    A workflow job cannot own a long-lived rootless container: the runner
+    reaps the job's process group when it ends, which kills pasta (rootless
+    podman's port forwarder) and network-isolates the container. Running the
+    backend as a user quadlet hands it to systemd, exactly like every other
+    long-lived rootless container on the central machine. The config mounts
+    point at copies inside the state dir, which is stable across jobs.
+    """
+    config = state_dir / "config"
+    lines = [
+        "[Unit]",
+        "Description=ci-observe telemetry backend (Grafana LGTM stack)",
+        "",
+        "[Container]",
+        f"ContainerName={QUADLET_CONTAINER}",
+        f"Image={LGTM_IMAGE}",
+        f"Label={OWNED_LABEL}=true",
+        "Label=osac.ci-observe.state=quadlet",
+        f"PublishPort=127.0.0.1:{QUADLET_PORTS['ui']}:3000",
+        f"PublishPort=127.0.0.1:{QUADLET_PORTS['otlp']}:4318",
+        f"PublishPort=127.0.0.1:{QUADLET_PORTS['tempo']}:3200",
+        f"PublishPort=127.0.0.1:{QUADLET_PORTS['loki']}:3100",
+        f"PublishPort=127.0.0.1:{QUADLET_PORTS['metrics']}:9090",
+        f"Volume={QUADLET_VOLUME}:/data",
+        f"Volume={config / PROMETHEUS_OVERRIDE.name}:/otel-lgtm/prometheus.yaml:ro,Z",
+        f"Volume={config / LOKI_OVERRIDE.name}:/otel-lgtm/loki-config.yaml:ro,Z",
+        f"Volume={config / PYROSCOPE_STUB.name}:/otel-lgtm/run-pyroscope.sh:ro,Z",
+        "",
+        "[Service]",
+        "Restart=on-failure",
+        "",
+        "[Install]",
+        "WantedBy=default.target",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def up_quadlet(state_dir: Path) -> int:
+    for override in (PROMETHEUS_OVERRIDE, LOKI_OVERRIDE, PYROSCOPE_STUB):
+        if not override.is_file():
+            raise ToolError(f"required LGTM override {override} is missing from this checkout")
+    config = state_dir / "config"
+    config.mkdir(parents=True, exist_ok=True)
+    os.chmod(config, 0o700)
+    for override in (PROMETHEUS_OVERRIDE, LOKI_OVERRIDE, PYROSCOPE_STUB):
+        target = config / override.name
+        shutil.copyfile(override, target)
+        os.chmod(target, 0o600)
+    quadlet_dir = Path.home() / ".config" / "containers" / "systemd"
+    quadlet_dir.mkdir(parents=True, exist_ok=True)
+    atomic_write(quadlet_dir / f"{QUADLET_NAME}.container", render_quadlet(state_dir))
+    systemctl_user("daemon-reload")
+    # restart (not start): a config or image change must reach an already
+    # running backend, and a first install is a restart of nothing.
+    systemctl_user("restart", f"{QUADLET_NAME}.service")
+    wait_healthy(f"http://127.0.0.1:{QUADLET_PORTS['ui']}/api/health", 120)
+    atomic_write(
+        stack_path(state_dir),
+        json.dumps(
+            {
+                "version": STACK_VERSION,
+                "managed": "quadlet",
+                "container": QUADLET_CONTAINER,
+                "volume": QUADLET_VOLUME,
+                "image": LGTM_IMAGE,
+                "ui_port": QUADLET_PORTS["ui"],
+                "otlp_port": QUADLET_PORTS["otlp"],
+                "tempo_port": QUADLET_PORTS["tempo"],
+                "loki_port": QUADLET_PORTS["loki"],
+                "metrics_port": QUADLET_PORTS["metrics"],
+                "lgtm_overrides": str(config),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+    )
+    emit(
+        {
+            "status": "started",
+            "url": f"http://127.0.0.1:{QUADLET_PORTS['ui']}",
+            "state_dir": str(state_dir),
+            "container": QUADLET_CONTAINER,
+            "unit": f"{QUADLET_NAME}.service",
+            "image": LGTM_IMAGE,
+            "otlp_endpoint": f"http://127.0.0.1:{QUADLET_PORTS['otlp']}",
+        }
+    )
+    return 0
+
+
 def cmd_up(args: argparse.Namespace) -> int:
+    if getattr(args, "quadlet", False):
+        return up_quadlet(args.state_dir)
     state_dir = args.state_dir
     iid = instance_id(state_dir)
     container, volume = f"ci-observe-lgtm-{iid}", f"ci-observe-lgtm-data-{iid}"
@@ -656,6 +766,20 @@ def cmd_up(args: argparse.Namespace) -> int:
 
 
 def cmd_down(args: argparse.Namespace) -> int:
+    record = load_json(stack_path(args.state_dir))
+    if record is not None and record.get("managed") == "quadlet":
+        systemctl_user("stop", f"{QUADLET_NAME}.service")
+        emit(
+            {
+                "status": "down",
+                "state_dir": str(args.state_dir),
+                "container": record.get("container"),
+                "unit": f"{QUADLET_NAME}.service",
+                "volume": record.get("volume"),
+                "volume_preserved": True,
+            }
+        )
+        return 0
     iid = instance_id(args.state_dir)
     container, volume = f"ci-observe-lgtm-{iid}", f"ci-observe-lgtm-data-{iid}"
     info = inspect_container(container)
@@ -1335,6 +1459,12 @@ def build_parser() -> argparse.ArgumentParser:
     up = sub.add_parser("up", help="start the pinned local Grafana/LGTM stack on loopback ports")
     up.add_argument("--ui-port", type=int, default=DEFAULT_UI_PORT, help="loopback Grafana UI port (0 = ephemeral)")
     up.add_argument("--otlp-port", type=int, default=DEFAULT_OTLP_PORT, help="loopback OTLP/HTTP port (0 = ephemeral)")
+    up.add_argument(
+        "--quadlet",
+        action="store_true",
+        help="manage the backend as a systemd user quadlet instead of an ad-hoc container: required on CI runners, "
+        "where the job's process-tree cleanup kills an ad-hoc container's port forwarding; fixed ports",
+    )
     up.add_argument(
         "--tempo-port",
         type=int,
