@@ -317,8 +317,11 @@ from pathlib import Path
 args = sys.argv[1:]
 if args[:2] == ["run", "list"]:
     sys.stdout.write(os.environ["FAKE_GH_RUNS"])
-elif args[0] == "api" and args[1].endswith("/actions/artifacts?per_page=100"):
-    sys.stdout.write(os.environ["FAKE_GH_ARTIFACTS"])
+elif args[0] == "api" and "/actions/runs/" in args[1] and args[1].endswith("/artifacts?per_page=100"):
+    run_id = args[1].split("/actions/runs/")[1].split("/")[0]
+    by_run = json.loads(os.environ["FAKE_GH_ARTIFACTS_BY_RUN"])
+    listing = by_run.get(run_id, [])
+    sys.stdout.write(json.dumps({"total_count": len(listing), "artifacts": listing}))
 elif args[0] == "api" and args[1].endswith("/zip"):
     artifact_id = args[1].rsplit("/", 2)[1]
     zips = json.loads(os.environ["FAKE_GH_ZIPS"])
@@ -345,9 +348,11 @@ def fake_gh(monkeypatch: MonkeyPatch, tmp_path: Path) -> Callable[..., None]:
         *, runs: list[dict] | None = None, artifacts: list[dict] | None = None, zips: dict[int, Path] | None = None
     ) -> None:
         monkeypatch.setenv("FAKE_GH_RUNS", json.dumps(runs or []))
-        monkeypatch.setenv(
-            "FAKE_GH_ARTIFACTS", json.dumps({"total_count": len(artifacts or []), "artifacts": artifacts or []})
-        )
+        by_run: dict[str, list[dict]] = {}
+        for artifact in artifacts or []:
+            workflow_run = artifact.get("workflow_run") if isinstance(artifact.get("workflow_run"), dict) else {}
+            by_run.setdefault(str(workflow_run.get("id")), []).append(artifact)
+        monkeypatch.setenv("FAKE_GH_ARTIFACTS_BY_RUN", json.dumps(by_run))
         monkeypatch.setenv("FAKE_GH_ZIPS", json.dumps({str(k): str(v) for k, v in (zips or {}).items()}))
 
     return configure
@@ -453,17 +458,14 @@ def test_sync_downloads_extracts_and_fails_without_a_stack(
     extracted = state / "captures" / "cap-sync-1"
     assert (extracted / "metadata.json").is_file()
     assert not (state / "artifacts" / "101" / "1" / "extracted").exists()
-    # A second sync records the refusal and skips instead of re-failing: the
-    # scheduled run must not go red every 15 minutes over an artifact whose
+    # A second sync does not even list the run again: the refusal record is
+    # the cache, so the scheduled run stays green over an artifact whose
     # import is deterministically refused.
     code, out = main_json(tool, sync_argv(state), capsys)
     assert code == 0
     assert out["artifacts_downloaded"] == 0
     assert out["captures_failed"] == 0
-    assert out["captures_skipped"] == 1
-    skipped = next(d for d in out["details"] if d["artifact_id"] == 555)
-    assert "refused earlier" in skipped["reason"]
-    assert "interrupted" in skipped["reason"]
+    assert out["captures_skipped"] == 0
     record = json.loads((state / "artifacts" / "101" / "1" / "record.json").read_text())
     assert record["status"] == "refused"
     assert record["capture_id"] == "cap-sync-1"
@@ -511,9 +513,8 @@ def test_sync_records_a_refusal_even_without_a_capture_id(
     assert out["captures_failed"] == 1
     code, out = main_json(tool, sync_argv(state), capsys)
     assert code == 0
-    assert out["captures_skipped"] == 1
-    skipped = next(d for d in out["details"] if d["artifact_id"] == 555)
-    assert "refused earlier" in skipped["reason"]
+    assert out["captures_skipped"] == 0
+    assert out["details"] == []
     record = json.loads((state / "artifacts" / "101" / "1" / "record.json").read_text())
     assert record["status"] == "refused"
     assert record["capture_id"] is None
@@ -571,11 +572,13 @@ def test_sync_skips_already_imported_capture(
     assert detail["status"] == "skipped"
     assert detail["capture_id"] == "cap-sync-2"
     assert (state / "artifacts" / "101" / "1" / "record.json").is_file()
-    # The next sync takes the cached-record fast path: no download, no extraction.
+    # The next sync takes the cached-record fast path: no download, no
+    # extraction, and not even an artifact listing -- the run is cached.
     code, out = main_json(tool, sync_argv(state), capsys)
     assert code == 0
     assert out["artifacts_downloaded"] == 0
-    assert out["captures_skipped"] == 1
+    assert out["captures_skipped"] == 0
+    assert out["details"] == []
 
 
 def test_sync_refuses_uncertain_partial_import(
@@ -1401,11 +1404,12 @@ def test_sync_imports_artifact_capture_into_the_stack(
     assert detail["status"] == "imported"
     assert detail["capture_id"] == "cap-sync-stack"
     assert (state / "captures" / "cap-sync-stack" / "metadata.json").is_file()
-    # The next sync reports the capture as skipped by digest, without a download.
+    # The next sync does not even list the run again: the import record is
+    # the cache, and nothing is downloaded or re-extracted.
     code, out = main_json(tool, sync_argv(state), capsys)
     assert code == 0
     assert out["artifacts_downloaded"] == 0
-    assert out["captures_skipped"] == 1
+    assert out["captures_skipped"] == 0
     # The default replay config persists file offsets as a container-mapped UID that
     # the test user cannot delete directly; remove them from inside the user namespace
     # so pytest's tmp cleanup stays quiet.

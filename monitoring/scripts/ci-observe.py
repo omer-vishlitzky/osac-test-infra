@@ -120,7 +120,7 @@ ARTIFACT_NAME_PATTERNS = (
 ARTIFACT_MEMBERS = frozenset({"metadata.json"} | set(SIGNALS))
 CAPTURE_ID_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._-]*$")
 SYNC_SINCE_HOURS = {"6h": 6, "12h": 12, "24h": 24, "2d": 48, "7d": 168}
-SYNC_RUN_LIST_LIMIT = 200  # runs fetched per sync iteration; the window is at most 7d
+SYNC_RUN_LIST_LIMIT = 1000  # runs fetched per sync iteration; busy repos exceed 200/day
 SYNC_WATCH_INTERVAL_S = 300
 SYNC_DEFAULT_LIMIT = 10
 REPLAY_CONFIG = Path(__file__).resolve().parents[1] / "config" / "ci-observe" / "replay.yaml"
@@ -1143,12 +1143,34 @@ def list_workflow_runs(repository: str, since: datetime) -> list[dict[str, Any]]
     return runs
 
 
-def list_artifacts(repository: str) -> list[dict[str, Any]]:
-    """Newest-first artifact records for the repository (one page, at most 100)."""
-    data = gh_json(["api", f"repos/{repository}/actions/artifacts?per_page=100"])
-    if not isinstance(data, dict) or not isinstance(data.get("artifacts"), list):
-        raise ToolError(f"unexpected artifact listing response for {repository}")
-    return [artifact for artifact in data["artifacts"] if isinstance(artifact, dict)]
+def list_run_artifacts(repository: str, run_id: int) -> list[dict[str, Any]]:
+    """Artifacts of one run, via the per-run listing endpoint, with retries.
+
+    The repository-wide listing (repos/{repo}/actions/artifacts) is unstable
+    for repositories with tens of thousands of artifacts: GitHub
+    intermittently answers it with a bare 500 and an empty body, which gh
+    surfaces as unparseable JSON. The per-run listing returns a handful of
+    records and is stable; transient failures still get a short retry. The
+    per-run response carries no workflow_run, so the run id is injected for
+    the artifact matching to cross-check.
+    """
+    args = ["api", f"repos/{repository}/actions/runs/{run_id}/artifacts?per_page=100"]
+    last_error = "no attempt made"
+    for remaining in range(3, 0, -1):
+        try:
+            data = gh_json(args)
+            if not isinstance(data, dict) or not isinstance(data.get("artifacts"), list):
+                raise ToolError(f"unexpected artifact listing response for run {run_id}")
+            return [
+                artifact | {"workflow_run": {"id": run_id}}
+                for artifact in data["artifacts"]
+                if isinstance(artifact, dict)
+            ]
+        except ToolError as err:
+            last_error = str(err)
+            if remaining > 1:
+                time.sleep(5)
+    raise ToolError(f"gh {' '.join(args)} failed after retries: {last_error}")
 
 
 def find_telemetry_artifacts(
@@ -1408,7 +1430,28 @@ def sync_iteration(state_dir: Path, *, repository: str, since: str, limit: int) 
     """One sync pass: list runs and artifacts, download and import what is new."""
     since_at, until_at = resolve_since(since)
     runs = list_workflow_runs(repository, since_at)
-    artifacts = list_artifacts(repository)
+    # Artifacts are listed per run (the repository-wide listing is unstable;
+    # see list_run_artifacts). Completed runs only: an in-progress run has
+    # no artifacts yet. Runs already processed on an earlier pass are
+    # skipped -- a record for the run's latest attempt means its artifact
+    # was imported or refused, a no-telemetry marker means it had none --
+    # so the steady state only lists runs that are new or re-run.
+    artifacts: list[dict[str, Any]] = []
+    for run in runs:
+        run_id, attempt_no, status = run.get("databaseId"), run.get("attempt") or 1, run.get("status")
+        if not isinstance(run_id, int) or status != "completed":
+            continue
+        run_cache = state_dir / "artifacts" / str(run_id) / str(attempt_no)
+        if (run_cache / "record.json").is_file() or (run_cache / ".no-telemetry").is_file():
+            continue
+        run_artifacts = list_run_artifacts(repository, run_id)
+        if not any(
+            isinstance(a.get("name"), str) and a["name"].startswith(ARTIFACT_NAME_PREFIX) for a in run_artifacts
+        ):
+            run_cache.mkdir(parents=True, exist_ok=True)
+            (run_cache / ".no-telemetry").write_text("")
+            continue
+        artifacts.extend(run_artifacts)
     matched, ignored = find_telemetry_artifacts(runs, artifacts)
     details: list[dict[str, Any]] = list(ignored)
     downloaded = imported = skipped = failed = 0
