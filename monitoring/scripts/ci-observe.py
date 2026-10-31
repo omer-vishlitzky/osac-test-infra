@@ -1160,23 +1160,33 @@ def list_run_artifacts(repository: str, run_id: int) -> list[dict[str, Any]]:
     per-run response carries no workflow_run, so the run id is injected for
     the artifact matching to cross-check.
     """
-    args = ["api", f"repos/{repository}/actions/runs/{run_id}/artifacts?per_page=100"]
-    last_error = "no attempt made"
-    for remaining in range(3, 0, -1):
-        try:
-            data = gh_json(args)
-            if not isinstance(data, dict) or not isinstance(data.get("artifacts"), list):
-                raise ToolError(f"unexpected artifact listing response for run {run_id}")
-            return [
-                artifact | {"workflow_run": {"id": run_id}}
-                for artifact in data["artifacts"]
-                if isinstance(artifact, dict)
-            ]
-        except ToolError as err:
-            last_error = str(err)
-            if remaining > 1:
-                time.sleep(5)
-    raise ToolError(f"gh {' '.join(args)} failed after retries: {last_error}")
+
+    def fetch_page(page: int) -> list[dict[str, Any]]:
+        args = ["api", f"repos/{repository}/actions/runs/{run_id}/artifacts?per_page=100&page={page}"]
+        last_error = "no attempt made"
+        for remaining in range(3, 0, -1):
+            try:
+                data = gh_json(args)
+                if not isinstance(data, dict) or not isinstance(data.get("artifacts"), list):
+                    raise ToolError(f"unexpected artifact listing response for run {run_id}")
+                return [artifact for artifact in data["artifacts"] if isinstance(artifact, dict)]
+            except ToolError as err:
+                last_error = str(err)
+                if remaining > 1:
+                    time.sleep(5)
+        raise ToolError(f"gh {' '.join(args)} failed after retries: {last_error}")
+
+    # Every page, not just the first: a run with more than 100 artifacts
+    # could carry its telemetry artifact on a later page, and a miss here
+    # would mark the run as having no telemetry permanently.
+    collected: list[dict[str, Any]] = []
+    page = 1
+    while True:
+        page_artifacts = fetch_page(page)
+        collected.extend(page_artifacts)
+        if len(page_artifacts) < 100:
+            return [artifact | {"workflow_run": {"id": run_id}} for artifact in collected]
+        page += 1
 
 
 def find_telemetry_artifacts(

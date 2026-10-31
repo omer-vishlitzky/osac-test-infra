@@ -317,7 +317,7 @@ from pathlib import Path
 args = sys.argv[1:]
 if args[:2] == ["run", "list"]:
     sys.stdout.write(os.environ["FAKE_GH_RUNS"])
-elif args[0] == "api" and "/actions/runs/" in args[1] and args[1].endswith("/artifacts?per_page=100"):
+elif args[0] == "api" and "/actions/runs/" in args[1] and "/artifacts?per_page=100" in args[1]:
     run_id = args[1].split("/actions/runs/")[1].split("/")[0]
     by_run = json.loads(os.environ["FAKE_GH_ARTIFACTS_BY_RUN"])
     listing = by_run.get(run_id, [])
