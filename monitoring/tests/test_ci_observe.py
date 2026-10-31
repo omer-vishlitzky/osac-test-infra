@@ -946,7 +946,7 @@ def test_import_rejects_symlinked_signal_file(tool: Tool, tmp_path: Path, capsys
 
 def test_import_rejects_capture_exceeding_total_bound(tool: Tool, tmp_path: Path, capsys: Capsys) -> None:
     cap_dir = write_capture(tmp_path, "cap-big")
-    big = 200 * 1024 * 1024
+    big = 900 * 1024 * 1024
     rewrite_metadata(
         cap_dir,
         files=[
@@ -956,7 +956,7 @@ def test_import_rejects_capture_exceeding_total_bound(tool: Tool, tmp_path: Path
     )
     code, err = main_err(tool, import_argv(tmp_path / "state", cap_dir), capsys)
     assert code == 1
-    assert "256 MiB bound" in err
+    assert "1 GiB bound" in err
 
 
 def test_import_rejects_oversized_otlp_line(tool: Tool, tmp_path: Path, capsys: Capsys) -> None:

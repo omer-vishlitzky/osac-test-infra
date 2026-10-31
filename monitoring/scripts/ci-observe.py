@@ -20,7 +20,7 @@ Safety rules:
     holds recent traces in a container-local live store) and the data volume is never
     deleted. `down --purge` explicitly removes both.
   - Capture content is untrusted data: imports accept only closed captures whose metadata
-    matches the on-disk files (256 MiB total bound, regular files only, no symlinks,
+    matches the on-disk files (1 GiB total bound, regular files only, no symlinks,
     verified sha256, 16 MiB OTLP line bound). Nothing inside a capture is executed.
   - An import is marked imported only when the exporter counters show every accepted item
     sent (otelcol_receiver_accepted_* == otelcol_exporter_sent_* > 0, nothing refused or
@@ -28,7 +28,7 @@ Safety rules:
   - sync runs locally only (never inside CI, which holds no backend credentials) and treats
     GitHub artifact ZIPs as untrusted data: the ZIP structure is validated before anything
     is extracted (only the capture's file names, flat or under one directory, regular files
-    only, no symlinks, 256 MiB uncompressed bound enforced while streaming), each capture
+    only, no symlinks, 1 GiB uncompressed bound enforced while streaming), each capture
     then goes through the full import validation. Downloaded ZIPs are cached privately
     under the 0700 state tree and never re-downloaded; already-imported captures are
     skipped by digest and uncertain partial imports keep their refusal. The --watch loop
@@ -98,7 +98,10 @@ REPLAY_METRICS_PORT = 8888  # otelcol self-metrics, reachable on loopback via ho
 # requested port needs 'down --purge' before it can gain one.
 OPTIONAL_PORTS = {"tempo": (3200, "Tempo"), "loki": (3100, "Loki"), "metrics": (9090, "Prometheus")}
 
-CAPTURE_MAX_BYTES = 256 * 1024 * 1024
+# The capture PVC in cluster.yaml is 1 Gi, which is the real ceiling: a full
+# E2E suite under Beyla produces close to it (the first real capture was
+# 965 MB). The sync's bound matches the PVC so real captures are not refused.
+CAPTURE_MAX_BYTES = 1024 * 1024 * 1024
 OTLP_LINE_MAX_BYTES = 16 * 1024 * 1024
 METADATA_MAX_BYTES = 1024 * 1024
 CAPTURE_SCHEMA = "osac.ci-observe.capture"
@@ -419,7 +422,7 @@ def validate_capture(capture_dir: Path, *, tolerate_modified: bool = False) -> d
         total += size
         entries.append((rel_path, size, file_hash))
     if total > CAPTURE_MAX_BYTES:
-        raise ToolError(f"declared capture size {total} bytes exceeds the 256 MiB bound")
+        raise ToolError(f"declared capture size {total} bytes exceeds the 1 GiB bound")
     actual: set[str] = set()
     for cur, dirnames, filenames in os.walk(capture_dir, followlinks=False):
         for name in dirnames + filenames:
@@ -1231,7 +1234,7 @@ def download_artifact(repository: str, artifact_id: object, dest: Path) -> None:
     os.chmod(dest.parent, 0o700)
     proc = gh(["api", f"repos/{repository}/actions/artifacts/{artifact_id}/zip"])
     if len(proc.stdout) > CAPTURE_MAX_BYTES:
-        raise ToolError(f"artifact {artifact_id} exceeds the 256 MiB bound")
+        raise ToolError(f"artifact {artifact_id} exceeds the 1 GiB bound")
     tmp = dest.with_name(dest.name + ".tmp")
     tmp.write_bytes(proc.stdout)
     os.chmod(tmp, 0o600)
@@ -1290,7 +1293,7 @@ def extract_artifact_zip(zip_path: Path, staging: Path) -> dict[str, Any]:
             if metadata_size > METADATA_MAX_BYTES:
                 raise ToolError("artifact metadata.json exceeds the 1 MiB bound")
             if total > CAPTURE_MAX_BYTES:
-                raise ToolError(f"artifact ZIP expands to {total} bytes, exceeding the 256 MiB bound")
+                raise ToolError(f"artifact ZIP expands to {total} bytes, exceeding the 1 GiB bound")
             staging.mkdir(mode=0o700, parents=True)
             written = 0
             for info, rel in entries:
@@ -1299,7 +1302,7 @@ def extract_artifact_zip(zip_path: Path, staging: Path) -> dict[str, Any]:
                     while chunk := source.read(1024 * 1024):
                         written += len(chunk)
                         if written > CAPTURE_MAX_BYTES:
-                            raise ToolError("artifact ZIP exceeded the 256 MiB bound while extracting")
+                            raise ToolError("artifact ZIP exceeded the 1 GiB bound while extracting")
                         sink.write(chunk)
                 # The replay collector reads the capture as an unrelated mapped UID;
                 # the 0700 state tree above it keeps the files private on the host.
