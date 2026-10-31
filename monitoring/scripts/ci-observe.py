@@ -129,6 +129,7 @@ REPLAY_CONFIG = Path(__file__).resolve().parents[1] / "config" / "ci-observe" / 
 LGTM_OVERRIDES_DIR = Path(__file__).resolve().parents[1] / "config" / "ci-observe" / "lgtm-overrides"
 PROMETHEUS_OVERRIDE = LGTM_OVERRIDES_DIR / "prometheus.yaml"
 LOKI_OVERRIDE = LGTM_OVERRIDES_DIR / "loki-config.yaml"
+PYROSCOPE_STUB = LGTM_OVERRIDES_DIR / "pyroscope-stub.sh"
 STACK_VERSION = 2  # bump when the container layout changes; up refuses mismatched stacks
 OWNED_LABEL = "osac.ci-observe.owned"
 BACKEND_LIMITS = [
@@ -524,7 +525,7 @@ def cmd_up(args: argparse.Namespace) -> int:
     state_dir = args.state_dir
     iid = instance_id(state_dir)
     container, volume = f"ci-observe-lgtm-{iid}", f"ci-observe-lgtm-data-{iid}"
-    for override in (PROMETHEUS_OVERRIDE, LOKI_OVERRIDE):
+    for override in (PROMETHEUS_OVERRIDE, LOKI_OVERRIDE, PYROSCOPE_STUB):
         if not override.is_file():
             raise ToolError(f"required LGTM override {override} is missing from this checkout")
     requested = {name: getattr(args, f"{name}_port") for name in OPTIONAL_PORTS}
@@ -606,6 +607,14 @@ def cmd_up(args: argparse.Namespace) -> int:
                 f"{PROMETHEUS_OVERRIDE.resolve()}:/otel-lgtm/prometheus.yaml:ro,Z",
                 "-v",
                 f"{LOKI_OVERRIDE.resolve()}:/otel-lgtm/loki-config.yaml:ro,Z",
+                # Pyroscope cannot start under rootless podman's pasta
+                # networking (its ring lifecyclers insist on an address on
+                # eth0/en0, which pasta does not create when it mirrors the
+                # host's interface names). The capture stack uses traces,
+                # metrics and logs only, so a stub keeps the component slot
+                # alive and the rest of the stack serves normally.
+                "-v",
+                f"{PYROSCOPE_STUB.resolve()}:/otel-lgtm/run-pyroscope.sh:ro,Z",
                 LGTM_IMAGE,
             ]
         )
