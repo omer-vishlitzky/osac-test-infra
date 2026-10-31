@@ -469,6 +469,56 @@ def test_sync_downloads_extracts_and_fails_without_a_stack(
     assert record["capture_id"] == "cap-sync-1"
 
 
+def test_validate_capture_tolerates_redacted_files(tool: Tool, tmp_path: Path) -> None:
+    """The CI upload path redacts capture files in place after the close step
+    hashed them (gitleaks, the release gate); the sync must import the actual
+    bytes and record the difference instead of refusing the capture."""
+    cap_dir = write_capture(tmp_path, "cap-redacted")
+    (cap_dir / "logs.jsonl").write_text((cap_dir / "logs.jsonl").read_text() + "redacted\n")
+    with pytest.raises(ci_observe.ToolError, match="does not match metadata"):
+        ci_observe.validate_capture(cap_dir)
+    tolerant = ci_observe.validate_capture(cap_dir, tolerate_modified=True)
+    assert tolerant["modified"] == ["logs.jsonl"]
+
+
+def test_sync_imports_a_redacted_capture(
+    tool: Tool, tmp_path: Path, capsys: Capsys, fake_gh: Callable[..., None]
+) -> None:
+    """End to end: a capture whose files were modified after close passes the
+    sync's validation (deferred here only because no backend is running)."""
+    cap_dir = write_capture(tmp_path, "cap-redact-sync")
+    (cap_dir / "logs.jsonl").write_text((cap_dir / "logs.jsonl").read_text() + "redacted\n")
+    zip_path = zip_capture(cap_dir, tmp_path / "cap-redact-sync.zip")
+    fake_gh(runs=[gh_run(101)], artifacts=[gh_artifact(555, 101)], zips={555: zip_path})
+    state = tmp_path / "state"
+    code, out = main_json(tool, sync_argv(state), capsys)
+    assert code == 0
+    detail = next(d for d in out["details"] if d["artifact_id"] == 555)
+    assert detail["status"] == "deferred"
+
+
+def test_sync_records_a_refusal_even_without_a_capture_id(
+    tool: Tool, tmp_path: Path, capsys: Capsys, fake_gh: Callable[..., None]
+) -> None:
+    """A malformed artifact (no metadata.json) is refused deterministically;
+    the refusal is recorded even though no capture id was ever extracted, so
+    later passes skip it instead of re-failing every 15 minutes."""
+    zip_path = write_bad_zip(tmp_path / "nometa.zip", [("traces.jsonl", b"{}\n")])
+    fake_gh(runs=[gh_run(101)], artifacts=[gh_artifact(555, 101)], zips={555: zip_path})
+    state = tmp_path / "state"
+    code, out = main_json(tool, sync_argv(state), capsys)
+    assert code == 1
+    assert out["captures_failed"] == 1
+    code, out = main_json(tool, sync_argv(state), capsys)
+    assert code == 0
+    assert out["captures_skipped"] == 1
+    skipped = next(d for d in out["details"] if d["artifact_id"] == 555)
+    assert "refused earlier" in skipped["reason"]
+    record = json.loads((state / "artifacts" / "101" / "1" / "record.json").read_text())
+    assert record["status"] == "refused"
+    assert record["capture_id"] is None
+
+
 def test_sync_defers_a_valid_capture_while_the_backend_is_down(
     tool: Tool, tmp_path: Path, capsys: Capsys, fake_gh: Callable[..., None]
 ) -> None:

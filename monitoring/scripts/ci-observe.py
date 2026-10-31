@@ -366,8 +366,17 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def validate_capture(capture_dir: Path) -> dict[str, Any]:
-    """Validate a closed capture directory; return its metadata and content digest."""
+def validate_capture(capture_dir: Path, *, tolerate_modified: bool = False) -> dict[str, Any]:
+    """Validate a closed capture directory; return its metadata and content digest.
+
+    tolerate_modified: the CI upload path redacts capture files in place after
+    the close step hashed them (gitleaks and the release gate both rewrite
+    findings), so a size or sha256 mismatch on an artifact that came through
+    that path is the scanners doing their job, not corruption. With the flag
+    set, a mismatching file is imported as it actually is and recorded in the
+    result's "modified" list instead of refusing the capture. The sync sets
+    this; local imports stay strict.
+    """
     if capture_dir.is_symlink() or not capture_dir.is_dir():
         raise ToolError(f"capture path {capture_dir} is not a plain directory")
     meta_path = capture_dir / "metadata.json"
@@ -423,23 +432,27 @@ def validate_capture(capture_dir: Path) -> dict[str, Any]:
             f"missing: {sorted(expected - actual)}"
         )
     lines_for_digest = []
+    modified: list[str] = []
     for rel, size, file_hash in entries:
         target = capture_dir / rel
         st = target.lstat()
         if not stat.S_ISREG(st.st_mode):
             raise ToolError(f"{rel} is not a regular file")
-        if st.st_size != size:
-            raise ToolError(f"{rel}: actual size {st.st_size} does not match metadata {size}")
-        if sha256_file(target) != file_hash:
-            raise ToolError(f"{rel}: sha256 does not match metadata")
+        actual_hash = sha256_file(target)
+        if st.st_size != size or actual_hash != file_hash:
+            if not tolerate_modified:
+                if st.st_size != size:
+                    raise ToolError(f"{rel}: actual size {st.st_size} does not match metadata {size}")
+                raise ToolError(f"{rel}: sha256 does not match metadata")
+            modified.append(rel.as_posix())
         if rel.name in SIGNALS:
             with target.open("rb") as handle:
                 for line in handle:
                     if len(line) > OTLP_LINE_MAX_BYTES:
                         raise ToolError(f"{rel}: OTLP line exceeds the 16 MiB bound; refusing to split")
-        lines_for_digest.append(f"{rel.as_posix()} {file_hash}\n")
+        lines_for_digest.append(f"{rel.as_posix()} {actual_hash}\n")
     capture_digest = hashlib.sha256("".join(sorted(lines_for_digest)).encode()).hexdigest()
-    return {"metadata": meta, "capture_digest": capture_digest}
+    return {"metadata": meta, "capture_digest": capture_digest, "modified": modified}
 
 
 METRIC_RE = re.compile(r"^(otelcol_[a-z_]+)(?:\{[^}]*\})?\s+([0-9.eE+-]+)$")
@@ -694,14 +707,17 @@ def import_capture(
     replay_config: Path | None = None,
     collector_image: str = COLLECTOR_IMAGE,
     timeout: int = 300,
+    tolerate_modified: bool = False,
 ) -> dict[str, Any]:
     """Validate a closed capture and replay it into the local stack.
 
     Returns the result dict (status "imported" or "already-imported") for the caller
     to emit or tally. Raises ToolError for every refusal, including the refusal to
-    retry an import whose delivery state is uncertain.
+    retry an import whose delivery state is uncertain. tolerate_modified is passed
+    through to validate_capture (the sync sets it: the CI upload path redacts
+    capture files after the close step hashed them).
     """
-    validated = validate_capture(capture_dir)
+    validated = validate_capture(capture_dir, tolerate_modified=tolerate_modified)
     meta, digest = validated["metadata"], validated["capture_digest"]
     entry = load_index(state_dir)["imports"].get(digest)
     if entry and entry.get("status") == "imported":
@@ -808,6 +824,7 @@ def import_capture(
     # immediately; the stock image hides unflushed old logs from queries.
     flush = podman(["exec", stack["container"], "curl", "-s", "-X", "POST", "http://localhost:3100/flush"], check=False)
     loki_flush = "ok" if flush.returncode == 0 else f"failed: {flush.stderr.strip() or flush.returncode}"
+    modified_files = validated.get("modified", [])
     record_import(
         state_dir,
         digest,
@@ -817,6 +834,7 @@ def import_capture(
             "imported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "counts": counts,
             "loki_flush": loki_flush,
+            **({"modified_files": modified_files} if modified_files else {}),
         },
     )
     return {
@@ -825,6 +843,7 @@ def import_capture(
         "capture_digest": digest,
         "counts": counts,
         "loki_flush": loki_flush,
+        **({"modified_files": modified_files} if modified_files else {}),
     }
 
 
@@ -1191,7 +1210,11 @@ def sync_artifact(
             (state_dir / "captures").mkdir(mode=0o700, parents=True, exist_ok=True)
             os.rename(staging, target)
             os.chmod(target, 0o755)
-        result = import_capture(state_dir, target)
+        # The upload path's scanners may have redacted the capture's files
+        # after the close step hashed them; import what is actually there
+        # and record the difference instead of refusing (local imports of
+        # untouched captures stay strict).
+        result = import_capture(state_dir, target, tolerate_modified=True)
         atomic_write(
             cache_dir / "record.json",
             json.dumps(
@@ -1213,6 +1236,8 @@ def sync_artifact(
         }
         if result["status"] == "already-imported":
             detail["reason"] = "already imported"
+        if result.get("modified_files"):
+            detail["modified_files"] = result["modified_files"]
         return detail
     except BackendUnavailable:
         # The backend being down is recoverable: the next pass retries once
@@ -1228,23 +1253,21 @@ def sync_artifact(
         detail = base | {"status": "failed", "reason": str(err)}
         if capture_id is not None:
             detail["capture_id"] = capture_id
-            # Record the refusal so later passes do not download, extract and
-            # fail the same artifact every 15 minutes for the rest of the
-            # window (the ZIP stays cached; deleting record.json retries).
-            atomic_write(
-                cache_dir / "record.json",
-                json.dumps(
-                    {
-                        "capture_id": capture_id,
-                        "status": "refused",
-                        "reason": str(err),
-                        "processed_at": iso_z(utc_now()),
-                    },
-                    indent=2,
-                    sort_keys=True,
-                )
-                + "\n",
+        # Record the refusal -- with or without a capture id -- so later
+        # passes do not download, extract and fail the same artifact every
+        # 15 minutes for the rest of the window. A failure before the
+        # capture id is known (a malformed ZIP, a missing metadata.json) is
+        # just as deterministic as one after it. The ZIP stays cached;
+        # deleting record.json retries.
+        atomic_write(
+            cache_dir / "record.json",
+            json.dumps(
+                {"capture_id": capture_id, "status": "refused", "reason": str(err), "processed_at": iso_z(utc_now())},
+                indent=2,
+                sort_keys=True,
             )
+            + "\n",
+        )
         return detail
 
 

@@ -124,20 +124,6 @@ def called_workflow_with(document: dict) -> dict:
     return calling[0]["with"]
 
 
-def podman_invocation(script: str) -> list[str]:
-    """The podman run invocation of a test script, one stripped line per line.
-
-    The block runs from the ``podman run`` line to the pytest line ending in
-    the junitxml flag; the shell around it selects the arguments.
-    """
-    lines = [line.strip() for line in script.splitlines()]
-    start = next(i for i, line in enumerate(lines) if line.startswith("podman run"))
-    for offset, line in enumerate(lines[start:]):
-        if line.endswith("--junitxml=/tmp/test-output/junit.xml -v"):
-            return lines[start : start + offset + 1]
-    raise AssertionError("podman invocation is not terminated by the junitxml pytest line")
-
-
 class TestAction:
     def test_is_a_well_formed_composite_action(self, action: dict) -> None:
         assert action["runs"]["using"] == "composite"
@@ -343,14 +329,18 @@ class TestWorkflowWiring:
         observed = step_by_id(steps, "test-observed")
         command = observed["with"]["command"]
 
-        # The observed podman invocation is the plain one, line for line,
-        # plus the OTEL pass-through flags the action's exports need.
-        plain_run = podman_invocation(plain["run"])
-        observed_run = podman_invocation(command)
-        without_pass_through = [line for line in observed_run if line not in OTEL_PASS_THROUGH]
-        assert without_pass_through == plain_run
+        # The observed script is the plain step's WHOLE script, line for
+        # line -- preamble, test selection, podman invocation and pytest
+        # args -- plus the three OTEL pass-through flags. Comparing only
+        # the podman block would let a preamble edit drift silently and
+        # make a labeled pull request run a different test selection than
+        # the plain path.
+        plain_lines = [line.strip() for line in plain["run"].splitlines() if line.strip()]
+        command_lines = [line.strip() for line in command.splitlines() if line.strip()]
+        observed_lines = [line for line in command_lines if line not in OTEL_PASS_THROUGH]
+        assert observed_lines == plain_lines
         for flag in OTEL_PASS_THROUGH:
-            assert flag in observed_run
+            assert flag in command_lines
 
         # Same container, same suite selection, same action inputs. The
         # image tag and every suite input reach the script as environment

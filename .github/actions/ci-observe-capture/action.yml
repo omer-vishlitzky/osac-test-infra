@@ -67,9 +67,14 @@ runs:
         fi
         echo "CI_OBSERVE_CAPTURE_ID=${capture_id}" >> "${GITHUB_ENV}"
 
+        # Every fallible command below carries an explicit "|| return 1":
+        # this function runs inside an `if !` condition, where bash suspends
+        # errexit for the whole call, so an unguarded failure would be
+        # swallowed and the function would return the status of its last
+        # command (success) -- a partial deployment reported as deployed.
         deploy_collectors() {
-          cluster_uid="$(oc get namespace kube-system -o jsonpath='{.metadata.uid}')"
-          kubelet_endpoint="https://$(oc get nodes -o jsonpath='{.items[0].status.addresses[0].address}'):10250"
+          cluster_uid="$(oc get namespace kube-system -o jsonpath='{.metadata.uid}')" || return 1
+          kubelet_endpoint="https://$(oc get nodes -o jsonpath='{.items[0].status.addresses[0].address}'):10250" || return 1
 
           # Render the coordinator tokens the cluster manifest expects
           # (same envsubst-style substitution as the local capture
@@ -91,11 +96,11 @@ runs:
           # that the collector ConfigMap applies into. The gateway pod only
           # starts once both exist, and the readiness wait below comes after
           # both.
-          oc apply -f "${rendered}"
+          oc apply -f "${rendered}" || return 1
           oc create configmap ci-observe-collector -n ci-observability-canary \
             --from-file=config.yaml="${GITHUB_WORKSPACE}/monitoring/config/ci-observe/collector.yaml" \
-            --dry-run=client -o yaml | oc apply -f -
-          oc -n ci-observability-canary set image daemonset/ci-observe-beyla beyla="${BEYLA_IMAGE_INPUT}"
+            --dry-run=client -o yaml | oc apply -f - || return 1
+          oc -n ci-observability-canary set image daemonset/ci-observe-beyla beyla="${BEYLA_IMAGE_INPUT}" || return 1
           # From here on the close step must clean up cluster resources.
           echo "CI_OBSERVE_DEPLOYED=1" >> "${GITHUB_ENV}"
 
@@ -124,11 +129,11 @@ runs:
           supplementalGroups:
             type: RunAsAny
         SCC
-          oc adm policy add-scc-to-user ci-observe-beyla -z ci-observe-beyla -n ci-observability-canary
-          oc adm policy add-scc-to-user hostmount-anyuid -z ci-observe-gateway -n ci-observability-canary
+          oc adm policy add-scc-to-user ci-observe-beyla -z ci-observe-beyla -n ci-observability-canary || return 1
+          oc adm policy add-scc-to-user hostmount-anyuid -z ci-observe-gateway -n ci-observability-canary || return 1
 
           oc wait --for=condition=Available deployment/ci-observe-gateway \
-            -n ci-observability-canary --timeout=180s
+            -n ci-observability-canary --timeout=180s || return 1
 
           # Local OTLP endpoint for the test command, on loopback like the
           # local pipeline. The test container reaches it because the E2E
@@ -204,9 +209,12 @@ runs:
         if [[ -f "${ci_dir}/port-forward.pid" ]]; then
           kill "$(cat "${ci_dir}/port-forward.pid")" 2>/dev/null || true
         fi
-        oc delete deployment/ci-observe-gateway -n ci-observability-canary --wait=false --ignore-not-found || true
-        oc delete daemonset/ci-observe-beyla -n ci-observability-canary --wait=false --ignore-not-found || true
-        oc delete pvc/ci-observe-capture-${CI_OBSERVE_CAPTURE_ID} -n ci-observability-canary --wait=false --ignore-not-found || true
+        # --request-timeout bounds the API request itself (a --wait timeout
+        # does not): a dying API server must not hang these past the
+        # cancellation budget this cheap path must fit in.
+        oc delete deployment/ci-observe-gateway -n ci-observability-canary --request-timeout=30s --wait=false --ignore-not-found || true
+        oc delete daemonset/ci-observe-beyla -n ci-observability-canary --request-timeout=30s --wait=false --ignore-not-found || true
+        oc delete pvc/ci-observe-capture-${CI_OBSERVE_CAPTURE_ID} -n ci-observability-canary --request-timeout=30s --wait=false --ignore-not-found || true
 
     - name: Close and copy capture
       id: close
@@ -244,7 +252,7 @@ runs:
           --cascade=foreground --wait=true --timeout=120s --ignore-not-found || fail=1
 
         readout_pod="ci-observe-readout-${capture_id}"
-        oc apply -f - <<POD || fail=1
+        oc apply -f - --request-timeout=60s <<POD || fail=1
         apiVersion: v1
         kind: Pod
         metadata:
@@ -269,7 +277,7 @@ runs:
           fail=1
         fi
         for name in traces.jsonl metrics.jsonl logs.jsonl; do
-          if ! oc exec -n ci-observability-canary "pod/${readout_pod}" -- cat "/capture/${name}" \
+          if ! oc exec --request-timeout=60s -n ci-observability-canary "pod/${readout_pod}" -- cat "/capture/${name}" \
             > "${destination}/${name}" 2>/dev/null; then
             # A missing signal file is a gap, not an error: the metadata
             # records it as a missing source.
