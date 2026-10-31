@@ -197,14 +197,30 @@ class TestAction:
 
     def test_closing_steps_run_always_and_delete_the_capture_volume(self, action: dict) -> None:
         close = step_by_id(action["runs"]["steps"], "close")
-        assert close["if"].startswith("always()")
+        # The full close runs for every non-cancelled outcome; a cancelled
+        # job takes the quick-cleanup step instead (cancellation budget).
+        assert close["if"].startswith("always() && !cancelled()")
         script = close["run"]
         assert "pvc/ci-observe-capture-" in script
         assert "--ignore-not-found" in script
         # The writers are stopped before the copy, so the capture files are
-        # closed on disk when the readout pod reads them.
+        # closed on disk when the readout pod reads them. Foreground cascade:
+        # the delete must not return while the gateway pod still flushes.
         assert "delete deployment/ci-observe-gateway" in script
         assert "delete daemonset/ci-observe-beyla" in script
+        assert "--cascade=foreground" in script
+
+    def test_a_cancelled_job_takes_the_cheap_cleanup_path(self, action: dict) -> None:
+        steps = action["runs"]["steps"]
+        quick = step_by_id(steps, "quick-cancelled-cleanup")
+        assert quick["if"] == "cancelled() && env.CI_OBSERVE_DEPLOYED == '1'"
+        script = quick["run"]
+        assert "--wait=false" in script
+        assert "pvc/ci-observe-capture-" in script
+        # The expensive steps are skipped for a cancelled job: the full close
+        # (cluster waits, file copy) and the staged upload (gitleaks scan).
+        assert step_by_id(steps, "close")["if"].startswith("always() && !cancelled()")
+        assert step_by_id(steps, "stage")["if"].startswith("always() && !cancelled()")
 
     def test_run_step_sets_the_otel_environment(self, action: dict) -> None:
         run = step_by_id(action["runs"]["steps"], "run")
@@ -248,10 +264,19 @@ def test_every_workflow_using_the_action_gates_it_behind_the_input() -> None:
     ],
     indirect=["workflow"],
 )
-def test_observed_command_carries_the_suite_specific_environment(workflow: dict, suite_env: tuple[str, ...]) -> None:
-    command = step_by_id(steps_of(workflow), "test-observed")["with"]["command"]
+def test_observed_command_carries_the_suite_specific_environment(
+    workflow: dict, suite_env: tuple[str, str, ...]
+) -> None:
+    observed = step_by_id(steps_of(workflow), "test-observed")
+    command = observed["with"]["command"]
     for fragment in suite_env:
         assert fragment in command
+    # Every suite-specific value the plain step passes through its env block
+    # is present on the observed step too (as data, not script text).
+    plain_env = step_by_id(steps_of(workflow), "test")["env"]
+    for name in plain_env:
+        if name in command or f"${{{name}}}" in command:
+            assert name in observed["env"], name
 
 
 @pytest.mark.parametrize("workflow", SUITES, indirect=True)
@@ -287,10 +312,15 @@ class TestWorkflowWiring:
         for flag in OTEL_PASS_THROUGH:
             assert flag in observed_run
 
-        # Same container, same suite selection, same action inputs.
-        assert '"osac-e2e-tests:${{ github.run_id }}"' in command
+        # Same container, same suite selection, same action inputs. The
+        # image tag and every suite input reach the script as environment
+        # variables -- the same data-only channel the plain step uses.
+        assert observed["env"]["E2E_IMAGE"] == "osac-e2e-tests:${{ github.run_id }}"
         assert "tests/e2e/" in command
-        assert "${{ inputs.namespace }}" in command
+        assert observed["with"]["namespace"] == "${{ inputs.namespace }}"
+        assert observed["env"]["OSAC_NAMESPACE"] == "${{ inputs.namespace }}"
+        assert "${{ inputs." not in command
+        assert "${{ steps." not in command
 
         # The plain step's own script stays the unwrapped podman run.
         for flag in OTEL_PASS_THROUGH:
@@ -330,9 +360,16 @@ class TestPrStarterWiring:
     def test_the_labels_job_reads_the_ci_observe_label(self, pr_starter: dict) -> None:
         labels = pr_starter["jobs"]["labels"]
         assert labels["permissions"] == {"pull-requests": "read"}
-        script = labels["steps"][0]["run"]
+        step = labels["steps"][0]
+        # The input reaches the shell through an environment variable, never
+        # through the script text (the convention of the osac-ci e2e dispatch).
+        assert step["env"]["PR_NUMBER"] == "${{ inputs.pr-number }}"
+        script = step["run"]
         assert "pulls/" in script and "ci-observe" in script
-        assert "${{ inputs.pr-number }}" in script
+        assert '"${PR_NUMBER}"' in script
+        # A non-numeric input degrades to ci-observe=false instead of reaching
+        # the API URL.
+        assert "*[!0-9]*" in script
         # The pull request lives in this repository even for a fork's commit:
         # the label query must not use inputs.repo.
         assert "github.repository" in script

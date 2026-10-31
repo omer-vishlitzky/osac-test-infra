@@ -31,7 +31,9 @@ The bare-metal runner receives no privileged observer.
 
 Local listeners bind to loopback. Raw captures and authentication material stay outside Git.
 Application logs stay private until the approved redaction and scanning path accepts them for publication.
-Test parameters, exception text, request payloads and authorization headers must not become published attributes.
+Exactly two long-lived secrets are scrubbed from telemetry (the registry pull secret and the
+AAP license); raw parameter values, exception text and command lines are kept on purpose for
+debuggability, per the user decision recorded in the collector config.
 
 ## Evidence rules
 

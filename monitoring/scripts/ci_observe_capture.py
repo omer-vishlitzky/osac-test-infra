@@ -288,8 +288,29 @@ def _copy_capture_files(*, kubeconfig: Path, pod: str, destination: Path) -> Non
 
 def _close_capture(*, kubeconfig: Path, capture_id: str, destination: Path) -> None:
     """Stop the writers, mount a readout, copy the closed files, remove the volume."""
-    _kubectl(kubeconfig, "delete", "deployment/ci-observe-gateway", "-n", CAPTURE_NAMESPACE, "--wait=true")
-    _kubectl(kubeconfig, "delete", "daemonset/ci-observe-beyla", "-n", CAPTURE_NAMESPACE, "--wait=true")
+    # Foreground cascade: the delete must not return while the gateway pod is
+    # still flushing its last batch, or the readout below can copy a
+    # truncated final JSONL line.
+    _kubectl(
+        kubeconfig,
+        "delete",
+        "deployment/ci-observe-gateway",
+        "-n",
+        CAPTURE_NAMESPACE,
+        "--cascade=foreground",
+        "--wait=true",
+        "--timeout=120s",
+    )
+    _kubectl(
+        kubeconfig,
+        "delete",
+        "daemonset/ci-observe-beyla",
+        "-n",
+        CAPTURE_NAMESPACE,
+        "--cascade=foreground",
+        "--wait=true",
+        "--timeout=120s",
+    )
     pod = f"ci-observe-readout-{capture_id}"
     claim = f"ci-observe-capture-{capture_id}"
     _kubectl(
@@ -387,8 +408,12 @@ def capture(args: object) -> int:
         "-o",
         "yaml",
     )
-    _kubectl(kubeconfig, "apply", "-f", "-", stdin=configmap)
+    # Manifest first: it creates the capture namespace the ConfigMap applies
+    # into (the same order as the CI composite action). On a cluster that has
+    # never run a capture, applying the ConfigMap first fails with
+    # "namespace not found".
     _kubectl(kubeconfig, "apply", "-f", "-", stdin=rendered)
+    _kubectl(kubeconfig, "apply", "-f", "-", stdin=configmap)
     _kubectl(kubeconfig, "apply", "-f", "-", stdin=SCC_MANIFEST)
     subprocess.run(
         [

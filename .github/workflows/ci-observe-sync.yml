@@ -69,9 +69,11 @@ jobs:
           # so the job may inherit a runner-scoped CONTAINERS_STORAGE_CONF that
           # would put the LGTM container into storage nothing else on the
           # machine sees (see the longer rationale in monitoring-setup.sh).
-          # An empty value is treated as unset by containers/storage. The
-          # XDG_RUNTIME_DIR default matches monitoring-setup.sh.
-          echo "CONTAINERS_STORAGE_CONF=" >> "$GITHUB_ENV"
+          # It must be unset INSIDE the podman-calling steps' shells: writing
+          # an empty value through GITHUB_ENV leaves the variable set-to-empty,
+          # which podman treats as a (nonexistent) config path and fails on
+          # ("Failed to obtain podman configuration"). The XDG_RUNTIME_DIR
+          # default matches monitoring-setup.sh.
           echo "XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" >> "$GITHUB_ENV"
           # Persistent across runs: the stack, the import index and the
           # artifact cache all live here so nothing is re-downloaded or
@@ -85,6 +87,7 @@ jobs:
         id: up
         run: |
           set -euo pipefail
+          unset CONTAINERS_STORAGE_CONF
           mkdir -p "${CI_OBSERVE_STATE_DIR}"
           chmod 700 "${CI_OBSERVE_STATE_DIR}"
           # Fixed ports so the provisioned Grafana datasources
@@ -105,16 +108,22 @@ jobs:
           GH_TOKEN: ${{ steps.vault.outputs.PRIVATE_GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          unset CONTAINERS_STORAGE_CONF
           python3 monitoring/scripts/ci-observe.py --state-dir "${CI_OBSERVE_STATE_DIR}" \
             sync --repository osac-project/osac --since 24h \
             | tee "${RUNNER_TEMP}/ci-observe-sync-osac.json"
 
       - name: Sync osac-project/osac-test-infra
         id: sync_osac_test_infra
+        # Runs even when the first repository's sync failed: one bad capture
+        # in osac must not block every osac-test-infra import for the window.
+        # The job still reports the first failure.
+        if: always() && !cancelled()
         env:
           GH_TOKEN: ${{ steps.vault.outputs.PRIVATE_GITHUB_TOKEN }}
         run: |
           set -euo pipefail
+          unset CONTAINERS_STORAGE_CONF
           python3 monitoring/scripts/ci-observe.py --state-dir "${CI_OBSERVE_STATE_DIR}" \
             sync --repository osac-project/osac-test-infra --since 24h \
             | tee "${RUNNER_TEMP}/ci-observe-sync-osac-test-infra.json"

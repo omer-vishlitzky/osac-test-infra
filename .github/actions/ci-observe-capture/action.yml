@@ -184,9 +184,37 @@ runs:
         echo "CI_OBSERVE_TEST_EXIT_CODE=${rc}" >> "${GITHUB_ENV}"
         exit "${rc}"
 
+    - name: Quick cleanup (job cancelled)
+      id: quick-cancelled-cleanup
+      # A cancelled job gets only ~5 minutes for ALL of its always() steps,
+      # which the workflow's own short-cap gather and teardown must also fit
+      # in. A cancelled capture is interrupted evidence of little value, so
+      # this path spends seconds, not minutes: stop the port-forward and
+      # fire-and-forget the cluster resources (the ephemeral cluster is
+      # destroyed by the workflow teardown anyway). No readout, no copy, no
+      # artifact.
+      if: cancelled() && env.CI_OBSERVE_DEPLOYED == '1'
+      continue-on-error: true
+      shell: bash
+      env:
+        KUBECONFIG: ${{ inputs.kubeconfig-path }}
+      run: |
+        set -u
+        ci_dir="${RUNNER_TEMP}/ci-observe"
+        if [[ -f "${ci_dir}/port-forward.pid" ]]; then
+          kill "$(cat "${ci_dir}/port-forward.pid")" 2>/dev/null || true
+        fi
+        oc delete deployment/ci-observe-gateway -n ci-observability-canary --wait=false --ignore-not-found || true
+        oc delete daemonset/ci-observe-beyla -n ci-observability-canary --wait=false --ignore-not-found || true
+        oc delete pvc/ci-observe-capture-${CI_OBSERVE_CAPTURE_ID} -n ci-observability-canary --wait=false --ignore-not-found || true
+
     - name: Close and copy capture
       id: close
-      if: always() && env.CI_OBSERVE_DEPLOYED == '1'
+      # The full close runs only while the job is alive: it waits on cluster
+      # resources and copies potentially large files, which the cancellation
+      # budget cannot afford (see the quick-cleanup step above). Every oc
+      # call carries an explicit timeout as a hang backstop.
+      if: always() && !cancelled() && env.CI_OBSERVE_DEPLOYED == '1'
       continue-on-error: true
       shell: bash
       env:
@@ -207,8 +235,13 @@ runs:
         fail=0
         # Stop the writers so the capture files close, then mount the capture
         # volume in a short-lived readout pod and copy the files off it.
-        oc delete deployment/ci-observe-gateway -n ci-observability-canary --wait=true --ignore-not-found || fail=1
-        oc delete daemonset/ci-observe-beyla -n ci-observability-canary --wait=true --ignore-not-found || fail=1
+        # Foreground cascade: the delete must not return while the gateway
+        # pod is still flushing its last batch, or the readout below can copy
+        # a truncated final JSONL line.
+        oc delete deployment/ci-observe-gateway -n ci-observability-canary \
+          --cascade=foreground --wait=true --timeout=120s --ignore-not-found || fail=1
+        oc delete daemonset/ci-observe-beyla -n ci-observability-canary \
+          --cascade=foreground --wait=true --timeout=120s --ignore-not-found || fail=1
 
         readout_pod="ci-observe-readout-${capture_id}"
         oc apply -f - <<POD || fail=1
@@ -234,8 +267,7 @@ runs:
         POD
         if ! oc wait --for=condition=Ready "pod/${readout_pod}" -n ci-observability-canary --timeout=120s; then
           fail=1
-        fi
-        for name in traces.jsonl metrics.jsonl logs.jsonl; do
+        fi        for name in traces.jsonl metrics.jsonl logs.jsonl; do
           if ! oc exec -n ci-observability-canary "pod/${readout_pod}" -- cat "/capture/${name}" \
             > "${destination}/${name}" 2>/dev/null; then
             # A missing signal file is a gap, not an error: the metadata
@@ -246,8 +278,8 @@ runs:
         # The capture volume must not outlive the copy: the cluster is
         # destroyed after this job, but a leaked claim would hold its volume
         # until then.
-        oc delete "pod/${readout_pod}" -n ci-observability-canary --wait=true --ignore-not-found || true
-        oc delete "pvc/ci-observe-capture-${capture_id}" -n ci-observability-canary --wait=true --ignore-not-found || true
+        oc delete "pod/${readout_pod}" -n ci-observability-canary --wait=true --timeout=60s --ignore-not-found || true
+        oc delete "pvc/ci-observe-capture-${capture_id}" -n ci-observability-canary --wait=true --timeout=120s --ignore-not-found || true
 
         # A capture the test command never finished (cancelled job) is
         # interrupted, the same state the local supervisor records.
@@ -309,7 +341,9 @@ runs:
 
     - name: Stage capture for upload
       id: stage
-      if: always() && env.CI_OBSERVE_DEPLOYED == '1'
+      # Skipped for cancelled jobs: the upload's gitleaks scan would eat the
+      # cancellation budget (see the quick-cleanup step).
+      if: always() && !cancelled() && env.CI_OBSERVE_DEPLOYED == '1'
       continue-on-error: true
       shell: bash
       run: |

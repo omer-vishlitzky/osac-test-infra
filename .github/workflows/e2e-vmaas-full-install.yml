@@ -1270,17 +1270,22 @@ jobs:
         id: test-observed
         if: ${{ inputs.ci-observe }}
         uses: ./.github/actions/ci-observe-capture
+        # The suite inputs reach the generated script as environment
+        # variables, never as interpolated script text -- the same data-only
+        # channel the plain step uses (an interpolated value would be shell
+        # source on the self-hosted runner).
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+          TEST_MARKER: ${{ inputs.test-marker }}
+          OSAC_NAMESPACE: ${{ inputs.namespace }}
+          OSAC_VM_TEMPLATE: ${{ inputs.vm-template }}
+          OSAC_CLUSTER_TEMPLATE: ${{ inputs.cluster-template }}
+          METERING_ADAPTER_URL: ${{ steps.metering-adapter.outputs.url }}
+          E2E_IMAGE: osac-e2e-tests:${{ github.run_id }}
         with:
           kubeconfig-path: ${{ runner.temp }}/kubeconfig
           namespace: ${{ inputs.namespace }}
           command: |
-            export TEST_FILTER="${{ inputs.test-filter }}"
-            export TEST_MARKER="${{ inputs.test-marker }}"
-            export OSAC_NAMESPACE="${{ inputs.namespace }}"
-            export OSAC_VM_TEMPLATE="${{ inputs.vm-template }}"
-            export OSAC_CLUSTER_TEMPLATE="${{ inputs.cluster-template }}"
-            export E2E_IMAGE="osac-e2e-tests:${{ github.run_id }}"
-            export METERING_ADAPTER_URL="${{ steps.metering-adapter.outputs.url }}"
 
             KUBECONFIG_PATH="$RUNNER_TEMP/kubeconfig"
 

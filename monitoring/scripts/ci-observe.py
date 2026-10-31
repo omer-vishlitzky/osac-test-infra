@@ -906,7 +906,9 @@ def cmd_report(args: argparse.Namespace) -> int:
         status = sources.get(name)
         if status is None:
             gaps.append(f"source {name}: no status reported")
-        elif status != "collected":
+        elif status not in ("collected", "delivered"):
+            # The capture writers report "delivered" or "missing"; accept
+            # both spellings so a fully delivered capture is not a gap.
             gaps.append(f"source {name}: status {status!r}")
     files = meta.get("files") if isinstance(meta.get("files"), list) else []
     for fname in SIGNALS:
@@ -1140,6 +1142,16 @@ def sync_artifact(
         base["downloaded"] = True
     record = load_json(cache_dir / "record.json")
     if record is not None:
+        if record.get("status") == "refused":
+            # A previous pass already downloaded and extracted this artifact
+            # and the import refused it (an interrupted capture, an empty
+            # capture). The refusal is deterministic, so retrying every
+            # 15-minute pass would only re-fail; delete record.json to retry.
+            return base | {
+                "status": "skipped",
+                "capture_id": record.get("capture_id"),
+                "reason": f"refused earlier: {record.get('reason')}",
+            }
         entry = load_index(state_dir)["imports"].get(record.get("capture_digest"))
         if entry is not None and entry.get("status") == "imported":
             return base | {"status": "skipped", "capture_id": record.get("capture_id"), "reason": "already imported"}
@@ -1188,6 +1200,23 @@ def sync_artifact(
         detail = base | {"status": "failed", "reason": str(err)}
         if capture_id is not None:
             detail["capture_id"] = capture_id
+            # Record the refusal so later passes do not download, extract and
+            # fail the same artifact every 15 minutes for the rest of the
+            # window (the ZIP stays cached; deleting record.json retries).
+            atomic_write(
+                cache_dir / "record.json",
+                json.dumps(
+                    {
+                        "capture_id": capture_id,
+                        "status": "refused",
+                        "reason": str(err),
+                        "processed_at": iso_z(utc_now()),
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+            )
         return detail
 
 

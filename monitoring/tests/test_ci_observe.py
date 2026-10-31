@@ -450,11 +450,20 @@ def test_sync_downloads_extracts_and_fails_without_a_stack(
     extracted = state / "captures" / "cap-sync-1"
     assert (extracted / "metadata.json").is_file()
     assert not (state / "artifacts" / "101" / "1" / "extracted").exists()
-    # A second sync reuses the cached ZIP and re-attempts only the import.
+    # A second sync records the refusal and skips instead of re-failing: the
+    # scheduled run must not go red every 15 minutes over an artifact whose
+    # import is deterministically refused.
     code, out = main_json(tool, sync_argv(state), capsys)
-    assert code == 1
+    assert code == 0
     assert out["artifacts_downloaded"] == 0
-    assert out["captures_failed"] == 1
+    assert out["captures_failed"] == 0
+    assert out["captures_skipped"] == 1
+    skipped = next(d for d in out["details"] if d["artifact_id"] == 555)
+    assert "refused earlier" in skipped["reason"]
+    assert "run 'up' first" in skipped["reason"]
+    record = json.loads((state / "artifacts" / "101" / "1" / "record.json").read_text())
+    assert record["status"] == "refused"
+    assert record["capture_id"] == "cap-sync-1"
 
 
 def test_sync_skips_already_imported_capture(
