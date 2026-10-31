@@ -679,6 +679,31 @@ def test_sync_watch_repeats_until_interrupted(
     assert sleeps == [ci_observe.SYNC_WATCH_INTERVAL_S]
 
 
+def test_sync_tolerates_the_release_gate_report_in_the_artifact_zip(
+    tool: Tool, tmp_path: Path, capsys: Capsys, fake_gh: Callable[..., None]
+) -> None:
+    """The upload path's release gate writes redaction-report.json next to the
+    staged capture, and the upload zips the whole directory; the sync must not
+    reject the artifact for carrying the gate's own scan output."""
+    cap_dir = write_capture(tmp_path, "run-102-attempt-1")
+    zip_path = zip_capture(cap_dir, tmp_path / "gate-report.zip", prefix="ci-observe/run-102-attempt-1/")
+    with zipfile.ZipFile(zip_path, "a") as archive:
+        archive.writestr("redaction-report.json", '{"findings": []}')
+        archive.writestr(".redaction-complete", "")
+    fake_gh(
+        runs=[gh_run(102)],
+        artifacts=[gh_artifact(555, 102, name="ci-observe-capture-102-attempt-1")],
+        zips={555: zip_path},
+    )
+    state = tmp_path / "state"
+    code, out = main_json(tool, sync_argv(state), capsys)
+    assert code == 0  # deferred only because no backend is running
+    detail = next(d for d in out["details"] if d["artifact_id"] == 555)
+    assert detail["status"] == "deferred"
+    assert detail["capture_id"] == "run-102-attempt-1"
+    assert (state / "captures" / "run-102-attempt-1" / "metadata.json").is_file()
+
+
 def test_sync_accepts_the_ci_capture_artifact_name_and_nested_zip(
     tool: Tool, tmp_path: Path, capsys: Capsys, fake_gh: Callable[..., None]
 ) -> None:

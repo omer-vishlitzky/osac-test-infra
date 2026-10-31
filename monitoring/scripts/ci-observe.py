@@ -1080,6 +1080,16 @@ def extract_artifact_zip(zip_path: Path, staging: Path) -> dict[str, Any]:
     try:
         with zipfile.ZipFile(zip_path) as archive:
             members = [info for info in archive.infolist() if not info.is_dir()]
+            # The upload path's release gate writes its report next to the
+            # staged capture (osac-artifacts/redaction-report.json), and the
+            # upload zips the whole directory, so a real capture ZIP carries
+            # the gate's own metadata beside the ci-observe/<capture_id> tree.
+            # It is scan output, not capture data: skip it (and the hidden
+            # redaction marker, should hidden files ever be included) instead
+            # of rejecting the artifact.
+            members = [
+                info for info in members if info.filename not in ("redaction-report.json", ".redaction-complete")
+            ]
             names = [info.filename for info in members]
             if len(set(names)) != len(names):
                 raise ToolError("artifact ZIP contains duplicate member names")
