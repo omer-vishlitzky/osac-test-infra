@@ -344,6 +344,14 @@
     _caas_enabled: "{{ _profile_values.global.services.caas.enabled | default(false) | bool }}"
   no_log: true
 
+# The forwarded ingress is reconciled after the install by the
+# ingress-forward role, not from these values. The controller, the UI and the
+# AAP jobs all fetch an issuer token while they start, and no pod can reach the
+# forwarded port until the Keycloak host alias is on the Deployment. Setting
+# :9444 here would make helm --wait deadlock on those pods. The install
+# therefore starts on the chart's portless issuer, which every pod can reach,
+# and the role flips the whole cluster to :9444 once the aliases exist.
+
 # Keep bmf.metal3.enabled false here: it enables the BMF subchart's own Secret
 # templates. The OSAC chart's testBackend templates provide those configs instead.
 # The inventory namespace must be bmaas_bmh_namespace: setup-bmaas creates the
@@ -482,19 +490,20 @@
 
 # --- Socat forwarder for OCP ingress ---
 
-# Forwards port 9444 to OCP 443
+# Forwards the ingress port to OCP 443
 - name: Create socat env file for OCP ingress
   ansible.builtin.copy:
-    dest: /etc/netris-lab/socat/0.0.0.0-9444.env
+    dest: /etc/netris-lab/socat/0.0.0.0-{{ ingress_forward_port }}.env
+    mode: "0644"
     content: |
       BIND_IP=0.0.0.0
-      PORT=9444
+      PORT={{ ingress_forward_port }}
       TARGET_IP={{ ocp_dnat_ip }}
       TARGET_PORT=443
 
 - name: Enable and start OCP ingress socat forwarder
   ansible.builtin.systemd:
-    name: socat-forwarder@0.0.0.0-9444
+    name: socat-forwarder@0.0.0.0-{{ ingress_forward_port }}
     state: started
     enabled: true
     daemon_reload: true
