@@ -57,7 +57,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import importlib.util
 import json
 import os
 import posixpath
@@ -1098,27 +1097,15 @@ def cmd_report(args: argparse.Namespace) -> int:
 
 
 def cmd_capture(args: argparse.Namespace) -> int:
-    sibling = Path(__file__).resolve().parent / "ci_observe_capture.py"
-    if not sibling.is_file():
-        raise ToolError(
-            "capture backend is not available yet: monitoring/scripts/ci_observe_capture.py "
-            "does not exist (it is supplied by the capture-backend integration, not this tool)",
-            code=2,
-        )
-    spec = importlib.util.spec_from_file_location("ci_observe_capture", sibling)
-    module = importlib.util.module_from_spec(spec)
-    # dataclass resolution looks the module up in sys.modules by __module__;
-    # without registration it crashes with 'NoneType' has no '__dict__'.
-    sys.modules[spec.name] = module
-    try:
-        assert spec.loader is not None
-        spec.loader.exec_module(module)
-    except Exception as err:
-        raise ToolError(f"failed to load capture backend {sibling}: {err}", code=2) from err
-    handler = getattr(module, "capture", None)
-    if not callable(handler):
-        raise ToolError(f"capture backend {sibling} does not define capture(args)", code=2)
-    return handler(args)
+    raise ToolError(
+        "local file capture is suspended: the capture pipeline now pushes telemetry "
+        "live to the central backend (see monitoring/ci-observe.md), and the shared "
+        "cluster manifest no longer deploys the capture volume this path read. "
+        "Run an E2E job with the ci-observe input, or use a local LGTM stack "
+        "('up') with your own OTLP exporter until the local path is reworked "
+        "onto live push",
+        code=2,
+    )
 
 
 def list_workflow_runs(repository: str, since: datetime) -> list[dict[str, Any]]:
