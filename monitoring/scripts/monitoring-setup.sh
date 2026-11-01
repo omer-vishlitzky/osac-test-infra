@@ -3,7 +3,8 @@
 #
 # Modes:
 #   --central   Deploy full stack (Prometheus, Grafana, Alertmanager,
-#               org-runner-exporter, node_exporter).
+#               org-runner-exporter, node_exporter, the ci-observe Tempo
+#               2.10 traces backend).
 #               Run on ONE designated central machine only.
 #
 #   --agent     Deploy exporters only (node_exporter).
@@ -299,6 +300,20 @@ deploy_caddyfile() {
         return 0
     fi
 
+    # The rendered Caddyfile proxies the OTLP ingest vhost to the
+    # otelcol-router on 127.0.0.1:14318. That router is a root-managed host
+    # service installed by monitoring/scripts/deploy-otelcol-router.sh --
+    # NOT by this script. If it is not running, every authenticated OTLP
+    # request fails the moment Caddy reloads with the new file. Warn loudly
+    # instead of gating: telemetry must never block a monitoring deploy.
+    if ! curl -sf -m 5 http://127.0.0.1:14333/healthcheck >/dev/null 2>&1; then
+        echo "  WARNING: otelcol-router is NOT healthy on 127.0.0.1:14333." >&2
+        echo "           Deploying this Caddyfile anyway will break the ci-observe OTLP" >&2
+        echo "           ingest (Caddy will proxy to a dead upstream on :14318)." >&2
+        echo "           Install/recover the router first:" >&2
+        echo "             sudo monitoring/scripts/deploy-otelcol-router.sh" >&2
+    fi
+
     local tmp
     tmp="$(mktemp)"
     # cp -f, not mv -- the Caddyfile is bind-mounted as a single file into
@@ -314,6 +329,27 @@ deploy_caddyfile() {
     cp -f "${tmp}" "${live_caddyfile}"
     rm -f "${tmp}"
     info "Caddyfile deployed (ci-observe OTLP ingest vhost rendered with the machine's hash)."
+}
+
+# Deploy the Tempo 2.10 config for the ci-observe traces backend
+# (quadlet/ci-observe-tempo210.container mounts it read-only). The quadlet
+# resolves the config at ~/monitoring/ci-observe/config/tempo210/tempo.yaml
+# -- inside the ci-observe state dir, the same layout the live 2026-11-01
+# cutover used -- so this function keeps that copy in sync with
+# monitoring/config/ci-observe/tempo210/tempo.yaml. Without it, a
+# --update-central run would refresh the quadlet but leave the config
+# behind, and a fresh central machine would start Tempo with no config at
+# all. ci-observe.py only manages its own four LGTM override files in that
+# directory; it never touches tempo210/, so the two deploy paths do not
+# collide.
+deploy_tempo210_config() {
+    local target_dir="${HOME}/monitoring/ci-observe/config/tempo210"
+    mkdir -p "${target_dir}"
+    # cp -f, not mv -- the config is bind-mounted as a single file into the
+    # Tempo container, which follows the inode, not the path (see the
+    # regenerate_remote_targets comment on prometheus.yml).
+    cp -f "${MONITORING_REPO_DIR}/config/ci-observe/tempo210/tempo.yaml" "${target_dir}/tempo.yaml"
+    info "Tempo 2.10 config deployed to ${target_dir}/tempo.yaml."
 }
 
 ###############################################################################
@@ -521,6 +557,7 @@ if [[ "${MODE}" == "update-central" ]]; then
     fi
     cp "${MONITORING_REPO_DIR}/config/grafana/datasources.yml" "${MONITORING_HOME}/config/grafana/datasources.yml"
     cp "${MONITORING_REPO_DIR}/config/grafana/dashboards.yml"  "${MONITORING_HOME}/config/grafana/dashboards.yml"
+    deploy_tempo210_config
     deploy_caddyfile
     # Remove stale dashboards first -- a plain cp only adds/overwrites, so a
     # dashboard removed from the repo would otherwise linger here and keep
@@ -549,7 +586,7 @@ if [[ "${MODE}" == "update-central" ]]; then
     phase 2 "Installing Quadlet units"
     for unit in node-exporter.container haproxy-exporter.container prometheus.container grafana.container \
                 alertmanager.container org-runner-exporter.container workflow-exporter.container \
-                caddy.container; do
+                caddy.container ci-observe-tempo210.container; do
         cp "${MONITORING_REPO_DIR}/quadlet/${unit}" "${QUADLET_DIR}/${unit}"
         info "Installed ${unit}"
     done
@@ -588,7 +625,7 @@ if [[ "${MODE}" == "update-central" ]]; then
     # rename; it always re-opens everything fresh.
     for svc in alertmanager.service prometheus.service grafana.service \
                org-runner-exporter.service workflow-exporter.service node-exporter.service \
-               haproxy-exporter.service caddy.service; do
+               haproxy-exporter.service caddy.service ci-observe-tempo210.service; do
         echo "  Restarting ${svc} ..."
         systemctl --user restart "${svc}"
     done
@@ -658,6 +695,7 @@ if [[ "${MODE}" == "central" ]]; then
     cp "${MONITORING_REPO_DIR}/config/alertmanager.yml" "${MONITORING_HOME}/config/alertmanager.yml"
     cp "${MONITORING_REPO_DIR}/config/grafana/datasources.yml" "${MONITORING_HOME}/config/grafana/datasources.yml"
     cp "${MONITORING_REPO_DIR}/config/grafana/dashboards.yml"  "${MONITORING_HOME}/config/grafana/dashboards.yml"
+    deploy_tempo210_config
     deploy_caddyfile
 
     # Copy dashboards
@@ -728,6 +766,7 @@ CENTRAL_UNITS=(
     "org-runner-exporter.container"
     "workflow-exporter.container"
     "caddy.container"
+    "ci-observe-tempo210.container"
 )
 
 for unit in "${COMMON_UNITS[@]}"; do
@@ -778,6 +817,7 @@ CENTRAL_SERVICES=(
     "org-runner-exporter.service"
     "workflow-exporter.service"
     "caddy.service"
+    "ci-observe-tempo210.service"
 )
 
 for svc in "${COMMON_SERVICES[@]}"; do
@@ -797,7 +837,8 @@ echo ""
 echo "Waiting for containers to be healthy ..."
 ALL_CONTAINERS=("node-exporter" "haproxy-exporter")
 if [[ "${MODE}" == "central" ]]; then
-    ALL_CONTAINERS+=("prometheus" "grafana" "alertmanager" "org-runner-exporter" "workflow-exporter" "caddy")
+    ALL_CONTAINERS+=("prometheus" "grafana" "alertmanager" "org-runner-exporter" "workflow-exporter" "caddy"
+                     "ci-observe-tempo210")
 fi
 
 containers_ready=true
