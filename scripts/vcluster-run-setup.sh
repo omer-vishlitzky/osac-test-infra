@@ -325,6 +325,7 @@ check_all_preconditions() {
     # the osac-infra create-controller-credentials hook in osacNamespace
     # (osac-installer/charts/osac-infra/files/hooks/create-controller-credentials.sh).
     check_secret_keys "${OSAC_SHARED_NAMESPACE}" fulfillment-controller-credentials client-id client-secret
+    check_secret_keys "${OSAC_SHARED_NAMESPACE}" osac-ui-backend-credentials client-id client-secret
 
     # Shared CA bundle, written by trust-manager into osacNamespace
     # (osac-installer/charts/osac-infra/files/hooks/apply-ca-bundle.sh).
@@ -720,6 +721,12 @@ copy_outer_secrets_into_vcluster() {
     # Keycloak client credentials for the fulfillment controller, referenced
     # by service.auth.controllerCredentials and service.idp.credentials.
     copy_secret_files "${OSAC_SHARED_NAMESPACE}" fulfillment-controller-credentials fulfillment-controller-credentials client-id client-secret
+
+    # Backend API credentials for the UI, created by the osac-infra chart's
+    # create-ui-backend-credentials hook in the outer cluster; the UI pod in
+    # the vcluster mounts them and stays in CreateContainerConfigError
+    # without them.
+    copy_secret_files "${OSAC_SHARED_NAMESPACE}" osac-ui-backend-credentials osac-ui-backend-credentials client-id client-secret
 
     # Shared CA bundle, referenced by service.certs.caBundle.configMap.
     copy_ca_bundle
