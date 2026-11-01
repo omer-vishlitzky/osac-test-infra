@@ -120,6 +120,7 @@ OSAC asks the infrastructure to create.
 | Strimzi secrets `osac-metering`, `osac-metering-echo-adapter` | `osac-kafka` | all keys | Secrets of the same names in an `osac-kafka` namespace | SASL credentials the metering pods' initContainers read by local API |
 | Secret `<aap-instance>-admin-password` | AAP namespace | `password` | Secret of the same name | Admin password for the osac-aap subchart's external-instance mode |
 | Secret `fulfillment-controller-credentials` | `osac` | `client-id`, `client-secret` | Secret of the same name | Keycloak client credentials (`service.auth.controllerCredentials`, `service.idp.credentials`) |
+| Secret `osac-ui-backend-credentials` | `osac` | `client-id`, `client-secret` | Secret of the same name | Backend API credentials for the UI pod, created by the osac-infra chart's hook in the outer cluster |
 | ConfigMap `ca-bundle` | `osac` | `bundle.pem` | ConfigMap of the same name | Shared CA bundle (`service.certs.caBundle.configMap`), includes the Kafka listener CA |
 
 The database connection secrets (`osac-db-config`,
