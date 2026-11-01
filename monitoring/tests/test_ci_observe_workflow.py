@@ -40,6 +40,7 @@ from __future__ import annotations
 import importlib.util
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -61,6 +62,11 @@ SCRIPT = REPO_ROOT / "monitoring" / "scripts" / "ci-observe.py"
 _spec = importlib.util.spec_from_file_location("ci_observe_workflow_mod", SCRIPT)
 ci_observe = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(ci_observe)
+CAPTURE_SCRIPT = REPO_ROOT / "monitoring" / "scripts" / "ci_observe_capture.py"
+_capture_spec = importlib.util.spec_from_file_location("ci_observe_capture_workflow_mod", CAPTURE_SCRIPT)
+capture_module = importlib.util.module_from_spec(_capture_spec)
+sys.modules[_capture_spec.name] = capture_module
+_capture_spec.loader.exec_module(capture_module)
 CLUSTER_MANIFEST = REPO_ROOT / "monitoring" / "config" / "ci-observe" / "cluster.yaml"
 COLLECTOR_LIVE_CONFIG = REPO_ROOT / "monitoring" / "config" / "ci-observe" / "collector-live.yaml"
 
@@ -202,6 +208,105 @@ class TestAction:
         assert "tr -cd 'a-z0-9-'" in script
         assert "tr -cd '0-9'" in script
 
+    def test_renders_the_run_identity_into_the_cluster_manifest(self, action: dict) -> None:
+        """The two git refs, the workflow name, the run attempt and the
+        deployed OSAC images become the CI_OBSERVE_TEST_REF /
+        _TEST_INFRA_REF / _WORKFLOW / _RUN_ATTEMPT / _OSAC_IMAGES env
+        values of the gateway (the collector turns them into the
+        osac.ci.test_ref / osac.ci.test_infra_ref / osac.ci.workflow /
+        osac.ci.run_attempt / osac.ci.osac_images resource attributes).
+        test_ref is the osac code under test, test_infra_ref the harness
+        revision (empty input falls back to GITHUB_SHA, the workflow's own
+        commit, which IS the harness revision on this repo's scheduled and
+        dispatched runs). The workflow name and attempt come from the
+        default runner env vars (the step runs directly on the runner, no
+        container). Refs fail loud: anything outside the SHA/branch/tag
+        charset degrades to "unknown" whole, never a mangled value; every
+        value coalesces to a non-empty fallback ("unknown", attempt "1"),
+        because an empty env value makes the collector reject its config
+        at load."""
+        deploy = step_by_id(action["runs"]["steps"], "deploy")
+        script = deploy["run"]
+        for name in ("test-ref", "test-infra-ref"):
+            assert action["inputs"][name]["required"] is False, name
+            assert action["inputs"][name]["default"] == "", name
+        assert deploy["env"]["TEST_REF_INPUT"] == "${{ inputs.test-ref }}"
+        assert deploy["env"]["TEST_INFRA_REF_INPUT"] == "${{ inputs.test-infra-ref }}"
+        for token in (
+            "CI_OBSERVE_TEST_REF",
+            "CI_OBSERVE_TEST_INFRA_REF",
+            "CI_OBSERVE_WORKFLOW",
+            "CI_OBSERVE_RUN_ATTEMPT",
+            "CI_OBSERVE_OSAC_IMAGES",
+        ):
+            assert f'-e "s|\\${{{token}}}' in script, token
+        # Fail-loud ref validation: a ref is safe only when the whole
+        # string is the allowlist charset. The regex alone is not enough --
+        # whether POSIX ERE "$" matches before a trailing newline is
+        # engine-dependent -- so ref_is_safe rejects newlines explicitly
+        # (see test_the_ref_validation_degrades_newline_refs_to_unknown).
+        # An invalid ref is "unknown", not a stripped remainder that
+        # matches no real ref.
+        assert "ref_is_safe() {" in script
+        assert "!= *$'\\n'*" in script
+        assert 'if ref_is_safe "${TEST_REF_INPUT}"; then' in script
+        assert 'test_infra_ref="${TEST_INFRA_REF_INPUT:-${GITHUB_SHA:-}}"' in script
+        assert 'if ! ref_is_safe "${test_infra_ref}"; then' in script
+        # The workflow name is a display string and keeps the denylist
+        # strip (newline, backslash, double quote, sed-special | and &).
+        assert "tr -d '\\n|\\\\&\"'" in script
+        assert 'workflow_name="${workflow_name:-unknown}"' in script
+        assert 'run_attempt="${run_attempt:-1}"' in script
+
+    def test_reads_the_deployed_osac_images_and_degrades_to_unknown(self, action: dict) -> None:
+        """The OSAC images come from the observed namespace (one
+        deployment=image1,image2 line per deployment) and degrade to the
+        literal "unknown" on any failure -- never an empty string, which the
+        collector's resource processor rejects at config load. Newlines
+        collapse to ";" separators: the value crosses the sed replacement
+        and the double-quoted manifest env value, neither of which can
+        carry a newline."""
+        deploy = step_by_id(action["runs"]["steps"], "deploy")
+        script = deploy["run"]
+        assert 'oc get deployments -n "${OBSERVED_NAMESPACE}"' in script
+        assert "jsonpath='{range .items[*]}{.metadata.name}={.spec.template.spec.containers[*].image}" in script
+        assert '\')" || osac_images=""' in script
+        assert "tr '\\n' ';'" in script
+        assert 'osac_images="${osac_images:-unknown}"' in script
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [
+            ("main", "safe"),
+            ("a902331b0b11c390a56381ad16ebd13914f8d5", "safe"),
+            ("feature_x", "safe"),
+            ("feature/x", "safe"),
+            ("main\n", "unknown"),
+            ("main\nsha", "unknown"),
+            ("feature!(x)", "unknown"),
+            ("", "unknown"),
+        ],
+    )
+    def test_the_ref_validation_degrades_newline_refs_to_unknown(self, action: dict, value: str, expected: str) -> None:
+        """Runs the deploy step's actual ref_is_safe on each value. A
+        trailing newline ("main\\n", from a YAML block scalar or a sloppy
+        dispatch input) must degrade to "unknown": whether POSIX ERE "$"
+        also matches just before a trailing newline is engine-dependent,
+        and a ref that slipped through would break the sed rendering --
+        with telemetry requested, the verify step would then gate the run
+        on a caller typo, against the never-gate design."""
+        deploy = step_by_id(action["runs"]["steps"], "deploy")
+        script = deploy["run"]
+        match = re.search(r"^ref_is_safe\(\) \{.*?\n\}", script, re.DOTALL | re.MULTILINE)
+        assert match, "ref_is_safe definition not found in the deploy script"
+        probe = subprocess.run(
+            ["bash", "-c", match.group(0) + '\nref_is_safe "$1" && echo safe || echo unknown\n', "probe", value],
+            capture_output=True,
+            text=True,
+        )
+        assert probe.returncode == 0, probe.stderr
+        assert probe.stdout.strip() == expected, (value, probe.stdout)
+
     def test_renders_the_otlp_endpoint_and_auth_into_the_cluster_manifest(self, action: dict) -> None:
         """The deploy step computes the basic-auth header from the
         otlp-password secret input ("Basic <base64 of ci-observe:password>",
@@ -320,6 +425,55 @@ class TestAction:
         # The verify step reads the run's duration to tell a dead capture
         # from a command that ended within seconds.
         assert "CI_OBSERVE_TEST_DURATION" in script
+
+
+class TestRunIdentityAttributes:
+    """The run identity contract across the three files that carry it: the
+    collector stamps the osac.ci.* attributes (collector-live.yaml), the
+    shared cluster manifest carries the gateway env values (cluster.yaml),
+    and the local capture supervisor must render every manifest token (its
+    rendering fails on unresolved tokens, so a token added for the CI action
+    alone would break local captures)."""
+
+    def test_collector_live_upserts_the_run_identity_attributes(self) -> None:
+        collector = yaml.safe_load(COLLECTOR_LIVE_CONFIG.read_text())
+        actions = {a["key"]: a for a in collector["processors"]["resource/capture"]["attributes"]}
+        expected = {
+            "osac.ci.test_ref": "${env:CI_OBSERVE_TEST_REF}",
+            "osac.ci.test_infra_ref": "${env:CI_OBSERVE_TEST_INFRA_REF}",
+            "osac.ci.workflow": "${env:CI_OBSERVE_WORKFLOW}",
+            "osac.ci.run_attempt": "${env:CI_OBSERVE_RUN_ATTEMPT}",
+            "osac.ci.osac_images": "${env:CI_OBSERVE_OSAC_IMAGES}",
+        }
+        for key, value in expected.items():
+            assert actions[key]["value"] == value, key
+            assert actions[key]["action"] == "upsert", key
+
+    def test_cluster_manifest_carries_the_run_identity_env_values(self) -> None:
+        documents = [doc for doc in yaml.safe_load_all(CLUSTER_MANIFEST.read_text()) if doc]
+        deployment = next(doc for doc in documents if doc.get("kind") == "Deployment")
+        env = {e["name"]: e["value"] for e in deployment["spec"]["template"]["spec"]["containers"][0]["env"]}
+        for name in (
+            "CI_OBSERVE_TEST_REF",
+            "CI_OBSERVE_TEST_INFRA_REF",
+            "CI_OBSERVE_WORKFLOW",
+            "CI_OBSERVE_RUN_ATTEMPT",
+            "CI_OBSERVE_OSAC_IMAGES",
+        ):
+            assert env[name] == "${" + name + "}", name
+
+    def test_the_local_supervisor_renders_every_manifest_token(self) -> None:
+        """render_manifest resolves every ${CI_OBSERVE_*} token in the shared
+        manifest with only its default (local) values: a token added for the
+        CI action alone would stay unresolved and fail every local
+        capture."""
+        rendered = capture_module.render_manifest(
+            capture_id="cap123",
+            namespace="osac-e2e-ci",
+            cluster_uid="uid-1",
+            kubelet_endpoint="https://192.0.2.1:10250",
+        )
+        assert "${CI_OBSERVE_" not in rendered
 
 
 class TestVerifyStep:
@@ -548,6 +702,19 @@ class TestWorkflowWiring:
         assert match.group("suite") in SUITES
         assert observed["with"]["suite"] == match.group("suite")
         assert observed["with"]["pr"] == "${{ inputs.pr-number }}"
+
+    def test_the_observed_step_passes_both_git_refs(self, workflow: dict) -> None:
+        """Two refs, each true in every flow. test-ref is the osac code
+        under test (the osac PR head in the osac PR flow, where osac's
+        callers pin these workflows and pass their own test-infra-ref:
+        feeding git identity from test-infra-ref alone would stamp the
+        literal "main" there). test-infra-ref is the harness revision (the
+        test-infra PR head in this repo's PR flow; empty on schedules and
+        dispatches, where the action falls back to GITHUB_SHA, the
+        workflow's own commit, which IS the harness revision)."""
+        observed = step_by_id(steps_of(workflow), "test-observed")
+        assert observed["with"]["test-ref"] == "${{ inputs.test-ref }}"
+        assert observed["with"]["test-infra-ref"] == "${{ inputs.test-infra-ref }}"
 
     def test_exactly_one_test_step_runs_depending_on_the_input(self, workflow: dict) -> None:
         steps = steps_of(workflow)

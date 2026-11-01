@@ -51,6 +51,27 @@ inputs:
       attribute by the gateway collector.
     required: false
     default: ""
+  test-ref:
+    description: >-
+      Git ref of the osac code under test, stamped onto every captured
+      signal as the osac.ci.test_ref resource attribute. The reusable E2E
+      workflows pass their test-ref input (the osac PR head SHA in the
+      osac PR flow, "main" on schedules -- a true statement of what ran).
+      A ref containing characters outside [a-zA-Z0-9._/+-] degrades to
+      "unknown" rather than a mangled value.
+    required: false
+    default: ""
+  test-infra-ref:
+    description: >-
+      Git ref of the test-infra harness revision, stamped onto every
+      captured signal as the osac.ci.test_infra_ref resource attribute.
+      The reusable E2E workflows pass their test-infra-ref input (the
+      test-infra PR head SHA in this repo's PR flow; empty on schedules
+      and dispatches, where the action falls back to GITHUB_SHA -- the
+      workflow's own commit, which IS the harness revision there). A ref
+      containing characters outside [a-zA-Z0-9._/+-] degrades to "unknown".
+    required: false
+    default: ""
   command:
     description: "The test command to run under telemetry (a bash script)"
     required: true
@@ -90,6 +111,8 @@ runs:
         CAPTURE_ID_INPUT: ${{ inputs.capture-id }}
         SUITE_INPUT: ${{ inputs.suite }}
         PR_INPUT: ${{ inputs.pr }}
+        TEST_REF_INPUT: ${{ inputs.test-ref }}
+        TEST_INFRA_REF_INPUT: ${{ inputs.test-infra-ref }}
         OTLP_PASSWORD_INPUT: ${{ inputs.otlp-password }}
         BEYLA_IMAGE_INPUT: ${{ inputs.beyla-image }}
       run: |
@@ -144,6 +167,49 @@ runs:
         suite="${suite:-none}"
         pr="${pr:-none}"
 
+        # Run identity. Two refs, each true in every flow: test_ref is the
+        # osac code under test (the callers' test-ref input; "main" on
+        # schedules, which is a true statement of what ran), test_infra_ref
+        # the harness revision (the callers' test-infra-ref input, the
+        # test-infra PR head in this repo's PR flow; empty on schedules
+        # and dispatches, where GITHUB_SHA -- the workflow's own commit --
+        # IS the harness revision). A ref that does not parse degrades to
+        # "unknown" rather than being silently mangled into a value that
+        # matches no real ref. GITHUB_WORKFLOW and GITHUB_RUN_ATTEMPT are
+        # default runner env vars, reliable here because this step runs
+        # directly on the runner, not in a container. Every value coalesces
+        # to a non-empty fallback for the same reason as suite and PR: the
+        # collector rejects an empty env value at load.
+        #
+        # A ref is safe only when the WHOLE string is the allowlist
+        # charset (SHA hex, branch and tag characters). The regex alone
+        # does not guarantee that: whether POSIX ERE "$" also matches just
+        # before a trailing newline is engine-dependent, and a ref like
+        # "main\n" (a YAML block scalar, a sloppy dispatch input) that
+        # slipped through would break the sed rendering below -- and, with
+        # telemetry requested, the verify step would gate the run on a
+        # caller typo, against the never-gate design. The explicit newline
+        # comparison makes the check engine-independent.
+        ref_is_safe() {
+          [[ -n "$1" && "$1" != *$'\n'* && "$1" =~ ^[a-zA-Z0-9._/+-]+$ ]]
+        }
+        if ref_is_safe "${TEST_REF_INPUT}"; then
+          test_ref="${TEST_REF_INPUT}"
+        else
+          test_ref="unknown"
+        fi
+        # An explicitly passed but invalid test-infra-ref is "unknown", not
+        # a silent fallback to GITHUB_SHA: the caller said something, and a
+        # different true value would hide that it did not parse.
+        test_infra_ref="${TEST_INFRA_REF_INPUT:-${GITHUB_SHA:-}}"
+        if ! ref_is_safe "${test_infra_ref}"; then
+          test_infra_ref="unknown"
+        fi
+        workflow_name="$(printf '%s' "${GITHUB_WORKFLOW:-}" | tr -d '\n|\\&"')"
+        workflow_name="${workflow_name:-unknown}"
+        run_attempt="$(printf '%s' "${GITHUB_RUN_ATTEMPT:-}" | tr -cd '0-9')"
+        run_attempt="${run_attempt:-1}"
+
         # Every fallible command below carries an explicit "|| return 1":
         # this function runs inside an `if !` condition, where bash suspends
         # errexit for the whole call, so an unguarded failure would be
@@ -163,11 +229,27 @@ runs:
           fi
           kubelet_endpoint="https://${kubelet_address}:10250"
 
+          # The OSAC images deployed in the observed namespace, one
+          # deployment=image1,image2 line per deployment. Any failure (oc
+          # error, empty namespace) degrades to "unknown", never an empty
+          # string: the collector rejects an empty env value at load.
+          # Newlines collapse to ";" separators and sed/YAML-unsafe
+          # characters are stripped: the value crosses the sed replacement
+          # and the double-quoted manifest env value below, neither of
+          # which can carry a newline.
+          osac_images="$(oc get deployments -n "${OBSERVED_NAMESPACE}" \
+            -o jsonpath='{range .items[*]}{.metadata.name}={.spec.template.spec.containers[*].image}{"\n"}{end}')" || osac_images=""
+          osac_images="$(printf '%s' "${osac_images}" | tr '\n' ';' | tr -d '|\\&"')"
+          osac_images="${osac_images%;}"
+          osac_images="${osac_images:-unknown}"
+
           # Render the coordinator tokens the cluster manifest expects
           # (same envsubst-style substitution as the local capture
           # supervisor, monitoring/scripts/ci_observe_capture.py). The
           # values are a UUID, a DNS name, a URL, a suite word, a PR
-          # number and a base64 blob, safe for sed.
+          # number, a git ref, a workflow name, an attempt number, an
+          # image list and a base64 blob, all narrowed to sed- and
+          # manifest-safe characters above.
           rendered="${ci_dir}/cluster-rendered.yaml"
           sed \
             -e "s|\${CI_OBSERVE_CAPTURE_ID}|${capture_id}|g" \
@@ -176,6 +258,11 @@ runs:
             -e "s|\${CI_OBSERVE_KUBELET_ENDPOINT}|${kubelet_endpoint}|g" \
             -e "s|\${CI_OBSERVE_SUITE}|${suite}|g" \
             -e "s|\${CI_OBSERVE_PR}|${pr}|g" \
+            -e "s|\${CI_OBSERVE_TEST_REF}|${test_ref}|g" \
+            -e "s|\${CI_OBSERVE_TEST_INFRA_REF}|${test_infra_ref}|g" \
+            -e "s|\${CI_OBSERVE_WORKFLOW}|${workflow_name}|g" \
+            -e "s|\${CI_OBSERVE_RUN_ATTEMPT}|${run_attempt}|g" \
+            -e "s|\${CI_OBSERVE_OSAC_IMAGES}|${osac_images}|g" \
             -e "s|\${CI_OBSERVE_OTLP_ENDPOINT}|${otlp_endpoint}|g" \
             -e "s|\${CI_OBSERVE_OTLP_AUTH}|${auth}|g" \
             "${GITHUB_WORKSPACE}/monitoring/config/ci-observe/cluster.yaml" > "${rendered}"
