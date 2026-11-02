@@ -32,8 +32,8 @@ What is missing or known gaps:
 - The Traces Drilldown app (v3.1.0) is installed and served but not yet confirmed
   rendering in a user's browser. Explore with query type Trace ID is the working
   path to a trace waterfall today.
-- Count stat panels render with an `ns` suffix (`17 ns`). The Tempo field carries
-  a nanosecond unit and the stat inherits it. Cosmetic, unfixed.
+- Count stat panels render unitless (`47`, not `47 ns`); `Run duration` keeps its
+  time unit. Verified in Grafana 13.2.4.
 - The router keeps its sending queues in memory. A router restart while a backend
   is down discards already accepted batches. Persistent queue storage is a
   follow-up, not part of the cutover.
