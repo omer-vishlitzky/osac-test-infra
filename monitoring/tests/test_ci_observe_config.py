@@ -203,19 +203,24 @@ class TestGateway:
         # Prometheus drop empty label values, so the labels are just absent).
         assert actions["osac.ci.suite"]["value"] == "${env:CI_OBSERVE_SUITE}"
         assert actions["osac.ci.pr"]["value"] == "${env:CI_OBSERVE_PR}"
-        # Run identity: the osac code under test (test_ref), the harness
-        # revision (test_infra_ref), the workflow name, the run attempt and
-        # the deployed OSAC images, so a span answers "what code on what
-        # cluster". The coordinator always sets the variables (to "unknown"
-        # when unavailable): an empty value would make the resource
-        # processor reject the config at load.
-        assert actions["osac.ci.test_ref"]["value"] == "${env:CI_OBSERVE_TEST_REF}"
-        assert actions["osac.ci.test_infra_ref"]["value"] == "${env:CI_OBSERVE_TEST_INFRA_REF}"
-        assert actions["osac.ci.workflow"]["value"] == "${env:CI_OBSERVE_WORKFLOW}"
-        assert actions["osac.ci.run_attempt"]["value"] == "${env:CI_OBSERVE_RUN_ATTEMPT}"
-        assert actions["osac.ci.osac_images"]["value"] == "${env:CI_OBSERVE_OSAC_IMAGES}"
-        for action in actions.values():
-            assert action["action"] == "upsert"
+        expected = {
+            "osac.ci.test_ref": "${env:CI_OBSERVE_TEST_REF}",
+            "osac.ci.test_sha": "${env:CI_OBSERVE_TEST_SHA}",
+            "osac.ci.test_infra_ref": "${env:CI_OBSERVE_TEST_INFRA_REF}",
+            "osac.ci.test_infra_sha": "${env:CI_OBSERVE_TEST_INFRA_SHA}",
+            "osac.ci.test_infra_workflow_sha": "${env:CI_OBSERVE_TEST_INFRA_WORKFLOW_SHA}",
+            "osac.ci.workflow": "${env:CI_OBSERVE_WORKFLOW}",
+            "osac.ci.run_attempt": "${env:CI_OBSERVE_RUN_ATTEMPT}",
+            "osac.ci.osac_images": "${env:CI_OBSERVE_OSAC_IMAGES}",
+            "osac.ci.osac_image_ids": "${env:CI_OBSERVE_OSAC_IMAGE_IDS}",
+            "osac.ci.osac_image_ids_complete": "${env:CI_OBSERVE_OSAC_IMAGE_IDS_COMPLETE}",
+            "osac.ci.test_suite": "${env:CI_OBSERVE_TEST_SUITE}",
+            "osac.ci.test_filter": "${env:CI_OBSERVE_TEST_FILTER}",
+            "osac.ci.test_marker": "${env:CI_OBSERVE_TEST_MARKER}",
+        }
+        for name, value in expected.items():
+            assert actions[name]["value"] == value, name
+            assert actions[name]["action"] == "upsert", name
 
     def test_pipelines_and_budgets(self, collector: dict[str, Any]) -> None:
         service = collector["service"]
@@ -401,10 +406,18 @@ class TestCluster:
             "CI_OBSERVE_SUITE",
             "CI_OBSERVE_PR",
             "CI_OBSERVE_TEST_REF",
+            "CI_OBSERVE_TEST_SHA",
             "CI_OBSERVE_TEST_INFRA_REF",
+            "CI_OBSERVE_TEST_INFRA_SHA",
+            "CI_OBSERVE_TEST_INFRA_WORKFLOW_SHA",
             "CI_OBSERVE_WORKFLOW",
             "CI_OBSERVE_RUN_ATTEMPT",
             "CI_OBSERVE_OSAC_IMAGES",
+            "CI_OBSERVE_OSAC_IMAGE_IDS",
+            "CI_OBSERVE_OSAC_IMAGE_IDS_COMPLETE",
+            "CI_OBSERVE_TEST_SUITE",
+            "CI_OBSERVE_TEST_FILTER",
+            "CI_OBSERVE_TEST_MARKER",
             "CI_OBSERVE_OTLP_ENDPOINT",
             "CI_OBSERVE_OTLP_AUTH",
         }

@@ -24,15 +24,29 @@
 #   CI_OBSERVE_KUBELET_ENDPOINT  https://<node-ip>:10250 (single-node canary)
 #   CI_OBSERVE_SUITE             test suite (vmaas/caas/bmaas); may be empty
 #   CI_OBSERVE_PR                pull request number; empty for non-PR runs
-#   CI_OBSERVE_TEST_REF          osac code under test; "unknown" for local
+#   CI_OBSERVE_TEST_REF          requested osac ref; "unknown" for local
 #                                captures and unparseable refs
-#   CI_OBSERVE_TEST_INFRA_REF    test-infra harness revision (local git
-#                                HEAD, or "unknown" outside a repository)
+#   CI_OBSERVE_TEST_SHA          resolved commit of the osac test source
+#                                checkout, "unknown" for local captures
+#   CI_OBSERVE_TEST_INFRA_REF    requested test-infra ref, "unspecified" for
+#                                local captures without a requested ref
+#   CI_OBSERVE_TEST_INFRA_SHA    clean local checkout SHA, or "unknown"
+#   CI_OBSERVE_TEST_INFRA_WORKFLOW_SHA  reusable-workflow file SHA, or
+#                                "unknown" for local captures
 #   CI_OBSERVE_WORKFLOW          workflow name, "local" for local captures
 #   CI_OBSERVE_RUN_ATTEMPT       run attempt number, "1" if unavailable
 #   CI_OBSERVE_OSAC_IMAGES       deployed OSAC images, "; "-separated
 #                                deployment=image1,image2 entries, "unknown"
 #                                if unavailable
+#   CI_OBSERVE_OSAC_IMAGE_IDS    running OSAC deployment container IDs,
+#                                deployment/container=imageID entries;
+#                                missing IDs are marked "unknown"
+#   CI_OBSERVE_OSAC_IMAGE_IDS_COMPLETE  true, false, or unknown
+#   CI_OBSERVE_TEST_SUITE        exact pytest path arguments, "unknown" when
+#                                no selection was reported; "local" for local
+#                                captures
+#   CI_OBSERVE_TEST_FILTER       pytest -k expression or "none"
+#   CI_OBSERVE_TEST_MARKER       pytest -m expression or "none"
 #
 # Capture interface (shared with the other lanes): /capture holds
 # traces.jsonl, metrics.jsonl, logs.jsonl and the coordinator-owned
@@ -187,19 +201,24 @@ processors:
       - key: osac.ci.pr
         value: ${env:CI_OBSERVE_PR}
         action: upsert
-      # Run identity: what exactly ran -- the osac code under test
-      # (test_ref), the harness revision (test_infra_ref), the workflow
-      # name, the run attempt and the OSAC images deployed on the cluster.
-      # Kept identical to collector-live.yaml's resource/capture: the two
-      # configs share the gateway env from cluster.yaml, and the local
-      # supervisor provides the same variables ("local"/"unknown" fallbacks
-      # for values a local capture does not have). Never empty: an empty
-      # value makes the resource processor reject the whole config at load.
+      # Run identity and test selection. Kept identical to
+      # collector-live.yaml's resource/capture: both configs share the
+      # gateway env from cluster.yaml, and the local supervisor provides
+      # non-empty local/unknown values where workflow context does not exist.
       - key: osac.ci.test_ref
         value: ${env:CI_OBSERVE_TEST_REF}
         action: upsert
+      - key: osac.ci.test_sha
+        value: ${env:CI_OBSERVE_TEST_SHA}
+        action: upsert
       - key: osac.ci.test_infra_ref
         value: ${env:CI_OBSERVE_TEST_INFRA_REF}
+        action: upsert
+      - key: osac.ci.test_infra_sha
+        value: ${env:CI_OBSERVE_TEST_INFRA_SHA}
+        action: upsert
+      - key: osac.ci.test_infra_workflow_sha
+        value: ${env:CI_OBSERVE_TEST_INFRA_WORKFLOW_SHA}
         action: upsert
       - key: osac.ci.workflow
         value: ${env:CI_OBSERVE_WORKFLOW}
@@ -209,6 +228,21 @@ processors:
         action: upsert
       - key: osac.ci.osac_images
         value: ${env:CI_OBSERVE_OSAC_IMAGES}
+        action: upsert
+      - key: osac.ci.osac_image_ids
+        value: ${env:CI_OBSERVE_OSAC_IMAGE_IDS}
+        action: upsert
+      - key: osac.ci.osac_image_ids_complete
+        value: ${env:CI_OBSERVE_OSAC_IMAGE_IDS_COMPLETE}
+        action: upsert
+      - key: osac.ci.test_suite
+        value: "${env:CI_OBSERVE_TEST_SUITE}"
+        action: upsert
+      - key: osac.ci.test_filter
+        value: "${env:CI_OBSERVE_TEST_FILTER}"
+        action: upsert
+      - key: osac.ci.test_marker
+        value: "${env:CI_OBSERVE_TEST_MARKER}"
         action: upsert
   memory_limiter:
     check_interval: 1s

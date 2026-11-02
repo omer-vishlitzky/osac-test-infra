@@ -16,6 +16,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from types import FrameType
+from typing import Any
 
 FORWARDED_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 
@@ -27,6 +28,11 @@ MANIFEST = CONFIG_DIR / "cluster.yaml"
 COLLECTOR_CONFIG = CONFIG_DIR / "collector.yaml"
 TOKEN_PATTERN = re.compile(r"\$\{(CI_OBSERVE_[A-Z_]+)\}")
 SIGNAL_FILES = ("traces.jsonl", "metrics.jsonl", "logs.jsonl")
+MAX_OSAC_IMAGE_IDS_LENGTH = 4096
+IMAGE_IDS_TRUNCATION_MARKER = "...[truncated]"
+MAX_TEST_SUITE_LENGTH = 256
+MAX_TEST_FILTER_LENGTH = 512
+MAX_TEST_MARKER_LENGTH = 512
 
 SCC_MANIFEST = """---
 apiVersion: security.openshift.io/v1
@@ -62,6 +68,12 @@ class TestResult:
         if self.returncode < 0:
             return 128 - self.returncode
         return self.returncode
+
+
+@dataclass(frozen=True, kw_only=True)
+class OSACImageIDCapture:
+    image_ids: str
+    complete: str
 
 
 class TestProcess:
@@ -161,15 +173,54 @@ def _kubelet_endpoint(kubeconfig: Path) -> str:
     return f"https://{address}:10250"
 
 
-def _test_infra_ref() -> str:
-    """The harness revision: the commit of the test-infra checkout the
-    supervisor runs from."""
+def _test_infra_sha() -> str:
+    """Return HEAD only when the local capture code matches that commit.
+
+    Every file the local supervisor runs must be tracked at HEAD and
+    byte-identical to the worktree copy: ``git diff`` alone stays quiet for
+    a path HEAD does not contain, which would claim a commit that never
+    had the running file. The overlay-style local edits to unrelated paths
+    (``tests/``) do not matter; only the harness files below are checked.
+    """
+    repository = Path(__file__).resolve().parents[2]
+    source_files = [
+        Path(__file__).resolve().relative_to(repository).as_posix(),
+        MANIFEST.relative_to(repository).as_posix(),
+        COLLECTOR_CONFIG.relative_to(repository).as_posix(),
+    ]
     try:
-        result = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True, check=False, timeout=30)
+        for source_file in source_files:
+            tracked = subprocess.run(
+                ["git", "-C", str(repository), "cat-file", "-e", f"HEAD:{source_file}"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+            )
+            if tracked.returncode != 0:
+                return "unknown"
+        changed = subprocess.run(
+            ["git", "-C", str(repository), "diff", "--quiet", "HEAD", "--", *source_files],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        if changed.returncode != 0:
+            return "unknown"
+        result = subprocess.run(
+            ["git", "-C", str(repository), "rev-parse", "--verify", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return "unknown"
     sha = result.stdout.strip()
-    return sha or "unknown"
+    if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", sha):
+        return "unknown"
+    return sha
 
 
 def _ref_or_unknown(ref: str) -> str:
@@ -185,8 +236,10 @@ def _ref_or_unknown(ref: str) -> str:
 def _manifest_safe(value: str) -> str:
     """Drop the characters that break the manifest's double-quoted env values
     or the CI action's sed rendering of the same tokens: newline, backslash,
-    double quote, and the sed-special ``|`` and ``&``."""
-    return re.sub(r"[\n|\\&\"]", "", value)
+    double quote, the sed-special ``|`` and ``&``, and ``$`` (the action's
+    sed chain substitutes tokens sequentially, so a value embedding a
+    ``${CI_OBSERVE_...}`` token would be rewritten by a later substitution)."""
+    return re.sub(r"[\n|\\&\"$]", "", value)
 
 
 def _osac_images(kubeconfig: Path, namespace: str) -> str:
@@ -207,6 +260,167 @@ def _osac_images(kubeconfig: Path, namespace: str) -> str:
     return _manifest_safe(raw.replace("\n", ";").strip(";")) or "unknown"
 
 
+def osac_image_ids(kubeconfig: Path, namespace: str) -> OSACImageIDCapture:
+    """Return runtime IDs and whether each expected OSAC replica was observed."""
+    try:
+        raw = _kubectl(kubeconfig, "get", "deployments,replicasets,pods", "-n", namespace, "-o", "json")
+        result = json.loads(raw)
+    except (json.JSONDecodeError, subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+        return OSACImageIDCapture(image_ids="unknown", complete="unknown")
+    if not isinstance(result, dict):
+        return OSACImageIDCapture(image_ids="unknown", complete="unknown")
+    resources = result.get("items", [])
+    if not isinstance(resources, list):
+        return OSACImageIDCapture(image_ids="unknown", complete="unknown")
+
+    deployments: dict[str, tuple[int, set[str]]] = {}
+    replica_set_deployments: dict[str, str] = {}
+    for resource in resources:
+        if not isinstance(resource, dict):
+            continue
+        metadata = resource.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        name = metadata.get("name")
+        if not isinstance(name, str):
+            continue
+        if resource.get("kind") == "Deployment":
+            labels = metadata.get("labels")
+            if not isinstance(labels, dict) or labels.get("app.kubernetes.io/part-of") != "osac":
+                continue
+            spec = resource.get("spec")
+            template = spec.get("template") if isinstance(spec, dict) else None
+            pod_spec = template.get("spec") if isinstance(template, dict) else None
+            containers = pod_spec.get("containers") if isinstance(pod_spec, dict) else None
+            if not isinstance(containers, list):
+                return OSACImageIDCapture(image_ids="unknown", complete="unknown")
+            replicas = spec.get("replicas", 1)
+            if not isinstance(replicas, int) or replicas < 0:
+                return OSACImageIDCapture(image_ids="unknown", complete="unknown")
+            container_names = set()
+            for container in containers:
+                if not isinstance(container, dict):
+                    continue
+                raw_container_name = container.get("name")
+                container_name = _safe_image_part(raw_container_name)
+                if not container_name or container_name != raw_container_name:
+                    return OSACImageIDCapture(image_ids="unknown", complete="unknown")
+                container_names.add(container_name)
+            if not container_names:
+                return OSACImageIDCapture(image_ids="unknown", complete="unknown")
+            # Deployment names cross the same rendering as container names
+            # and image IDs. A name outside the safe charset is impossible
+            # for a real Deployment (DNS-1123) but possible for a hostile
+            # API response; it degrades the whole value to "unknown" rather
+            # than being rewritten into a name that matches no deployment.
+            if _safe_image_part(name) != name:
+                return OSACImageIDCapture(image_ids="unknown", complete="unknown")
+            # A scaled-to-zero Deployment has no runtime image evidence.
+            deployments[name] = (max(replicas, 1), container_names)
+        elif resource.get("kind") == "ReplicaSet":
+            deployment = _controller_owner_name(resource, "Deployment")
+            if deployment:
+                replica_set_deployments[name] = deployment
+
+    if not deployments:
+        return OSACImageIDCapture(image_ids="unknown", complete="unknown")
+
+    image_entries: set[str] = set()
+    observed_counts: dict[tuple[str, str], int] = {}
+    complete = True
+    for resource in resources:
+        if not isinstance(resource, dict) or resource.get("kind") != "Pod":
+            continue
+        status = resource.get("status")
+        if not isinstance(status, dict) or status.get("phase") != "Running":
+            continue
+        replica_set = _controller_owner_name(resource, "ReplicaSet")
+        deployment = replica_set_deployments.get(replica_set, "")
+        if deployment not in deployments:
+            continue
+        container_statuses = status.get("containerStatuses")
+        if not isinstance(container_statuses, list):
+            complete = False
+            continue
+        seen_in_pod: set[str] = set()
+        for container_status in container_statuses:
+            if not isinstance(container_status, dict):
+                complete = False
+                continue
+            raw_container = container_status.get("name")
+            container = _safe_image_part(raw_container)
+            raw_image_id = container_status.get("imageID")
+            image_id = _safe_image_part(raw_image_id)
+            if not container or container != raw_container:
+                complete = False
+                continue
+            key = (deployment, container)
+            if not image_id or image_id != raw_image_id:
+                image_entries.add(f"{deployment}/{container}=unknown")
+                complete = False
+                continue
+            image_entries.add(f"{deployment}/{container}={image_id}")
+            if container not in seen_in_pod:
+                observed_counts[key] = observed_counts.get(key, 0) + 1
+                seen_in_pod.add(container)
+
+    for deployment, (replicas, container_names) in deployments.items():
+        for container in container_names:
+            key = (deployment, container)
+            if observed_counts.get(key, 0) < replicas:
+                image_entries.add(f"{deployment}/{container}=unknown")
+                complete = False
+
+    all_entries = sorted(image_entries)
+    full_value = ";".join(all_entries)
+    if len(full_value) <= MAX_OSAC_IMAGE_IDS_LENGTH:
+        return OSACImageIDCapture(image_ids=full_value or "unknown", complete=str(complete).lower())
+
+    prefix_limit = MAX_OSAC_IMAGE_IDS_LENGTH - len(IMAGE_IDS_TRUNCATION_MARKER) - 1
+    entries = []
+    total_length = 0
+    for entry in all_entries:
+        entry_length = len(entry) + (1 if entries else 0)
+        if total_length + entry_length > prefix_limit:
+            break
+        entries.append(entry)
+        total_length += entry_length
+    return OSACImageIDCapture(image_ids=";".join([*entries, IMAGE_IDS_TRUNCATION_MARKER]), complete="false")
+
+
+def _controller_owner_name(resource: dict[str, Any], kind: str) -> str:
+    metadata = resource.get("metadata")
+    if not isinstance(metadata, dict):
+        return ""
+    owners = metadata.get("ownerReferences")
+    if not isinstance(owners, list):
+        return ""
+    for owner in owners:
+        if not isinstance(owner, dict) or owner.get("kind") != kind or owner.get("controller") is not True:
+            continue
+        name = owner.get("name")
+        if isinstance(name, str):
+            return name
+    return ""
+
+
+def _safe_image_part(value: object) -> str:
+    """Keep the characters a container name, deployment name or image ID can
+    legitimately carry (underscores included -- container names use them) and
+    drop everything else: the value crosses the manifest's double-quoted env
+    values and the CI action's sed rendering, which cannot carry newlines,
+    quotes, backslashes or the sed/token-special characters."""
+    if not isinstance(value, str):
+        return ""
+    return re.sub(r"[^A-Za-z0-9._:/@+-]", "", value)
+
+
+def _bounded_selection(value: str, *, limit: int) -> str:
+    if len(value.encode("utf-8")) > limit:
+        return "unknown"
+    return value
+
+
 def render_manifest(
     *,
     capture_id: str,
@@ -216,10 +430,18 @@ def render_manifest(
     suite: str = "",
     pr: str = "",
     test_ref: str = "",
+    test_sha: str = "",
     test_infra_ref: str = "",
+    test_infra_sha: str = "",
+    test_infra_workflow_sha: str = "",
     workflow: str = "",
     run_attempt: str = "",
     osac_images: str = "",
+    osac_image_ids: str = "",
+    osac_image_ids_complete: str = "unknown",
+    test_suite: str = "",
+    test_filter: str = "",
+    test_marker: str = "",
     otlp_endpoint: str = "",
     otlp_auth: str = "",
 ) -> str:
@@ -231,13 +453,15 @@ def render_manifest(
     the same tokens through sed, and the gateway's collector config cannot
     expand an empty value.
 
-    The run identity tokens (test_ref, test_infra_ref, workflow,
-    run_attempt, osac_images) follow the same rule with "unknown"
-    (attempt: "1") fallbacks: they are stamped onto every signal as
-    osac.ci.* resource attributes, and an empty value would make the
-    collector reject its config at load. The refs degrade to "unknown"
-    whole rather than being mangled (see _ref_or_unknown); a local capture
-    has no osac ref, so its test_ref is always "unknown".
+    The run identity tokens have non-empty fallbacks because an empty value
+    makes the collector reject its config at load. Requested refs stay
+    separate from resolved SHAs: the resolved osac commit (test_sha) is a
+    40/64 lowercase hex SHA or "unknown", never the requested ref.
+    Test-selection strings are JSON-quoted YAML scalars so quotes,
+    backslashes and newlines remain safe and exact; an empty selection
+    means the caller reported nothing and records "unknown" ("none" for
+    filter and marker, which the wired workflows only pass when the test
+    command really ran without -k/-m).
 
     ``otlp_endpoint`` and ``otlp_auth`` serve the live-push collector
     config (collector-live.yaml); the local file-capture config never reads
@@ -247,10 +471,19 @@ def render_manifest(
     suite = re.sub(r"[^a-z0-9-]", "", suite) or "none"
     pr = re.sub(r"[^0-9]", "", pr) or "none"
     test_ref = _ref_or_unknown(test_ref)
-    test_infra_ref = _ref_or_unknown(test_infra_ref)
+    test_sha = _sha_or_unknown(test_sha)
+    test_infra_ref = _ref_or_unknown(test_infra_ref) if test_infra_ref else "unspecified"
+    test_infra_sha = _sha_or_unknown(test_infra_sha)
+    test_infra_workflow_sha = _sha_or_unknown(test_infra_workflow_sha)
     workflow = _manifest_safe(workflow) or "unknown"
     run_attempt = re.sub(r"[^0-9]", "", run_attempt) or "1"
     osac_images = _manifest_safe(osac_images) or "unknown"
+    osac_image_ids = _manifest_safe(osac_image_ids) or "unknown"
+    if osac_image_ids_complete not in ("true", "false", "unknown"):
+        osac_image_ids_complete = "unknown"
+    test_suite = _bounded_selection(test_suite or "unknown", limit=MAX_TEST_SUITE_LENGTH)
+    test_filter = _bounded_selection(test_filter or "none", limit=MAX_TEST_FILTER_LENGTH)
+    test_marker = _bounded_selection(test_marker or "none", limit=MAX_TEST_MARKER_LENGTH)
     tokens = {
         "CI_OBSERVE_CAPTURE_ID": capture_id,
         "CI_OBSERVE_NAMESPACE": namespace,
@@ -259,10 +492,18 @@ def render_manifest(
         "CI_OBSERVE_SUITE": suite,
         "CI_OBSERVE_PR": pr,
         "CI_OBSERVE_TEST_REF": test_ref,
+        "CI_OBSERVE_TEST_SHA": test_sha,
         "CI_OBSERVE_TEST_INFRA_REF": test_infra_ref,
+        "CI_OBSERVE_TEST_INFRA_SHA": test_infra_sha,
+        "CI_OBSERVE_TEST_INFRA_WORKFLOW_SHA": test_infra_workflow_sha,
         "CI_OBSERVE_WORKFLOW": workflow,
         "CI_OBSERVE_RUN_ATTEMPT": run_attempt,
         "CI_OBSERVE_OSAC_IMAGES": osac_images,
+        "CI_OBSERVE_OSAC_IMAGE_IDS": osac_image_ids,
+        "CI_OBSERVE_OSAC_IMAGE_IDS_COMPLETE": osac_image_ids_complete,
+        "CI_OBSERVE_TEST_SUITE": json.dumps(test_suite, ensure_ascii=True),
+        "CI_OBSERVE_TEST_FILTER": json.dumps(test_filter, ensure_ascii=True),
+        "CI_OBSERVE_TEST_MARKER": json.dumps(test_marker, ensure_ascii=True),
         "CI_OBSERVE_OTLP_ENDPOINT": otlp_endpoint,
         "CI_OBSERVE_OTLP_AUTH": otlp_auth,
     }
@@ -275,6 +516,10 @@ def render_manifest(
     if unresolved:
         raise ValueError(f"unresolved manifest tokens: {unresolved}")
     return rendered
+
+
+def _sha_or_unknown(sha: str) -> str:
+    return sha if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", sha) else "unknown"
 
 
 def _await_gateway_ready(kubeconfig: Path, *, timeout: int = 180) -> None:
@@ -488,6 +733,7 @@ def capture(args: object) -> int:
     destination.mkdir(parents=True, exist_ok=True)
     kubeconfig: Path = args.kubeconfig
     try:
+        image_capture = osac_image_ids(kubeconfig, args.namespace)
         rendered = render_manifest(
             capture_id=capture_id,
             namespace=args.namespace,
@@ -496,10 +742,22 @@ def capture(args: object) -> int:
             suite=args.suite,
             pr=args.pr,
             test_ref="unknown",
-            test_infra_ref=_test_infra_ref(),
+            # A local capture wraps an arbitrary command in an arbitrary
+            # working tree: there is no osac test checkout to resolve, so
+            # the resolved commit is honestly "unknown" -- never the
+            # requested ref or a guessed value.
+            test_sha="unknown",
+            test_infra_ref="unspecified",
+            test_infra_sha=_test_infra_sha(),
+            test_infra_workflow_sha="unknown",
             workflow="local",
             run_attempt="1",
             osac_images=_osac_images(kubeconfig, args.namespace),
+            osac_image_ids=image_capture.image_ids,
+            osac_image_ids_complete=image_capture.complete,
+            test_suite="local",
+            test_filter="none",
+            test_marker="none",
         )
     except subprocess.CalledProcessError as error:
         detail = (error.stderr or error.stdout or "").strip().splitlines()

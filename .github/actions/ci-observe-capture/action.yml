@@ -13,12 +13,10 @@ description: >-
   delivery failure caught by the post-test verification step are both loud
   (::error annotations, a red step marker, a summary line) but non-gating,
   because ci-observe is opt-in telemetry and must never fail a test -- or
-  the required E2E check -- on its own. Default-off: nothing runs unless a
-  workflow calls this action with the password input set.he
-  central backend -- a telemetry problem is always loud, never a changed
-  test result. An empty password is an intentional telemetry-less run and
-  stays warning-only. Default-off: nothing runs unless a workflow calls
-  this action.
+  the required E2E check -- on its own. An empty password is an
+  intentional telemetry-less run and stays warning-only. Default-off:
+  nothing runs unless a workflow calls this action with the password input
+  set.
 
 inputs:
   kubeconfig-path:
@@ -53,23 +51,47 @@ inputs:
     default: ""
   test-ref:
     description: >-
-      Git ref of the osac code under test, stamped onto every captured
-      signal as the osac.ci.test_ref resource attribute. The reusable E2E
-      workflows pass their test-ref input (the osac PR head SHA in the
-      osac PR flow, "main" on schedules -- a true statement of what ran).
-      A ref containing characters outside [a-zA-Z0-9._/+-] degrades to
-      "unknown" rather than a mangled value.
+      Requested git ref of the osac code under test, stamped onto every
+      captured signal as the osac.ci.test_ref resource attribute. The
+      reusable E2E workflows pass their test-ref input (the osac PR head
+      SHA in the osac PR flow, "main" on schedules). This is the requested
+      ref, not the resolved commit: a moving ref can advance between the
+      dispatch and the checkout. A ref containing characters outside
+      [a-zA-Z0-9._/+-] degrades to "unknown" rather than a mangled value.
+    required: false
+    default: ""
+  test-sha:
+    description: >-
+      Resolved commit of the osac test source checkout (the overlay step's
+      git rev-parse HEAD), stamped onto every captured signal as the
+      osac.ci.test_sha resource attribute. Must be a 40- or 64-character
+      lowercase hex SHA; empty or invalid values become "unknown" and never
+      fall back to the requested test-ref.
     required: false
     default: ""
   test-infra-ref:
     description: >-
-      Git ref of the test-infra harness revision, stamped onto every
+      Requested Git ref of the test-infra checkout, stamped onto every
       captured signal as the osac.ci.test_infra_ref resource attribute.
-      The reusable E2E workflows pass their test-infra-ref input (the
-      test-infra PR head SHA in this repo's PR flow; empty on schedules
-      and dispatches, where the action falls back to GITHUB_SHA -- the
-      workflow's own commit, which IS the harness revision there). A ref
-      containing characters outside [a-zA-Z0-9._/+-] degrades to "unknown".
+      Empty means "unspecified". This is not the resolved checkout SHA.
+    required: false
+    default: ""
+  test-infra-workflow-sha:
+    description: >-
+      Immutable SHA of the reusable workflow file that defines this job,
+      from job.workflow_sha. Empty or invalid values become "unknown".
+    required: false
+    default: ""
+  test-suite:
+    description: Exact pytest path arguments the test command ran (for example "tests/e2e/vmaas/ tests/e2e/references/"), or empty when the caller reported none (recorded as unknown). Values over 256 UTF-8 bytes are recorded as unknown.
+    required: false
+    default: ""
+  test-filter:
+    description: Exact pytest -k expression, or empty when no -k filter is selected. Values over 512 UTF-8 bytes are recorded as unknown.
+    required: false
+    default: ""
+  test-marker:
+    description: Exact pytest -m expression, or empty when no marker is selected. Values over 512 UTF-8 bytes are recorded as unknown.
     required: false
     default: ""
   command:
@@ -112,7 +134,12 @@ runs:
         SUITE_INPUT: ${{ inputs.suite }}
         PR_INPUT: ${{ inputs.pr }}
         TEST_REF_INPUT: ${{ inputs.test-ref }}
+        TEST_SHA_INPUT: ${{ inputs.test-sha }}
         TEST_INFRA_REF_INPUT: ${{ inputs.test-infra-ref }}
+        TEST_INFRA_WORKFLOW_SHA_INPUT: ${{ inputs.test-infra-workflow-sha }}
+        TEST_SUITE_INPUT: ${{ inputs.test-suite }}
+        TEST_FILTER_INPUT: ${{ inputs.test-filter }}
+        TEST_MARKER_INPUT: ${{ inputs.test-marker }}
         OTLP_PASSWORD_INPUT: ${{ inputs.otlp-password }}
         BEYLA_IMAGE_INPUT: ${{ inputs.beyla-image }}
       run: |
@@ -167,19 +194,14 @@ runs:
         suite="${suite:-none}"
         pr="${pr:-none}"
 
-        # Run identity. Two refs, each true in every flow: test_ref is the
-        # osac code under test (the callers' test-ref input; "main" on
-        # schedules, which is a true statement of what ran), test_infra_ref
-        # the harness revision (the callers' test-infra-ref input, the
-        # test-infra PR head in this repo's PR flow; empty on schedules
-        # and dispatches, where GITHUB_SHA -- the workflow's own commit --
-        # IS the harness revision). A ref that does not parse degrades to
-        # "unknown" rather than being silently mangled into a value that
-        # matches no real ref. GITHUB_WORKFLOW and GITHUB_RUN_ATTEMPT are
-        # default runner env vars, reliable here because this step runs
-        # directly on the runner, not in a container. Every value coalesces
-        # to a non-empty fallback for the same reason as suite and PR: the
-        # collector rejects an empty env value at load.
+        # Run identity: one requested ref, three resolved SHAs, each true in
+        # every flow. test_ref is the requested osac ref; test_sha is the
+        # commit the overlay step actually checked out (a moving ref can
+        # advance between dispatch and checkout). test_infra_sha is the
+        # workspace commit whose harness files this job runs. job.workflow_sha
+        # (passed through as test-infra-workflow-sha) is the commit of the
+        # reusable workflow file that defines this job. GITHUB_SHA is only the
+        # triggering event's commit and is none of these.
         #
         # A ref is safe only when the WHOLE string is the allowlist
         # charset (SHA hex, branch and tag characters). The regex alone
@@ -193,19 +215,122 @@ runs:
         ref_is_safe() {
           [[ -n "$1" && "$1" != *$'\n'* && "$1" =~ ^[a-zA-Z0-9._/+-]+$ ]]
         }
+        sha_is_safe() {
+          [[ "$1" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]]
+        }
+        # Byte length, not ${#value} character count: the local supervisor
+        # bounds the same values by UTF-8 bytes, and a multibyte dispatch
+        # input must not pass here what the supervisor would reject.
+        selection_is_bounded() {
+          local byte_length
+          byte_length="$(LC_ALL=C printf '%s' "$1" | wc -c)"
+          (( byte_length <= $2 ))
+        }
         if ref_is_safe "${TEST_REF_INPUT}"; then
           test_ref="${TEST_REF_INPUT}"
         else
           test_ref="unknown"
         fi
-        # An explicitly passed but invalid test-infra-ref is "unknown", not
-        # a silent fallback to GITHUB_SHA: the caller said something, and a
-        # different true value would hide that it did not parse.
-        test_infra_ref="${TEST_INFRA_REF_INPUT:-${GITHUB_SHA:-}}"
+        # The resolved osac commit is a SHA or "unknown" -- never the
+        # requested ref, which names a moving target and would claim a
+        # revision nothing verified.
+        test_sha="${TEST_SHA_INPUT}"
+        if ! sha_is_safe "${test_sha}"; then
+          if [[ -n "${test_sha}" ]]; then
+            echo "::warning::ci-observe: test-sha input is not a 40/64-character lowercase hex SHA (${#test_sha} characters); recording unknown"
+          fi
+          test_sha="unknown"
+        fi
+        test_infra_ref="${TEST_INFRA_REF_INPUT:-unspecified}"
         if ! ref_is_safe "${test_infra_ref}"; then
           test_infra_ref="unknown"
         fi
-        workflow_name="$(printf '%s' "${GITHUB_WORKFLOW:-}" | tr -d '\n|\\&"')"
+        # The harness files this job actually runs: the composite action,
+        # the capture supervisor and the three collector configs. HEAD is
+        # recorded only when every listed path is tracked at HEAD and
+        # byte-identical to the worktree copy. git diff alone stays quiet
+        # for a path HEAD does not contain (an untracked replacement would
+        # run instead of the committed file), and the overlay step's
+        # tests/ replacement must not matter: only these paths are checked.
+        # git itself missing or refusing the workspace (dubious ownership)
+        # keeps the conservative "unknown".
+        harness_paths=(
+          ".github/actions/ci-observe-capture/action.yml"
+          "monitoring/scripts/ci_observe_capture.py"
+          "monitoring/config/ci-observe/cluster.yaml"
+          "monitoring/config/ci-observe/collector.yaml"
+          "monitoring/config/ci-observe/collector-live.yaml"
+        )
+        harness_matches_head() {
+          local path
+          for path in "${harness_paths[@]}"; do
+            git -C "${GITHUB_WORKSPACE}" cat-file -e "HEAD:${path}" || return 1
+          done
+          git -C "${GITHUB_WORKSPACE}" diff --quiet HEAD -- "${harness_paths[@]}"
+        }
+        test_infra_sha="unknown"
+        if harness_matches_head; then
+          checked_out_sha="$(git -C "${GITHUB_WORKSPACE}" rev-parse --verify HEAD 2>/dev/null)" || checked_out_sha=""
+          if sha_is_safe "${checked_out_sha}"; then
+            test_infra_sha="${checked_out_sha}"
+          fi
+        fi
+        test_infra_workflow_sha="${TEST_INFRA_WORKFLOW_SHA_INPUT}"
+        if ! sha_is_safe "${test_infra_workflow_sha}"; then
+          test_infra_workflow_sha="unknown"
+        fi
+        # Empty selection inputs mean the caller reported nothing, not that
+        # every suite ran: the three wired workflows always pass the exact
+        # path list their test steps used, so an empty value is a wiring
+        # break and records "unknown" rather than a guess.
+        if [[ -n "${TEST_SUITE_INPUT}" ]]; then
+          if selection_is_bounded "${TEST_SUITE_INPUT}" 256; then
+            test_suite="${TEST_SUITE_INPUT}"
+          else
+            echo "::warning::ci-observe: test-suite is over 256 UTF-8 bytes; recording unknown"
+            test_suite="unknown"
+          fi
+        else
+          test_suite="unknown"
+        fi
+        test_filter_input="${TEST_FILTER_INPUT:-none}"
+        if selection_is_bounded "${test_filter_input}" 512; then
+          test_filter="${test_filter_input}"
+        else
+          echo "::warning::ci-observe: test-filter is over 512 UTF-8 bytes; recording unknown"
+          test_filter="unknown"
+        fi
+        test_marker_input="${TEST_MARKER_INPUT:-none}"
+        if selection_is_bounded "${test_marker_input}" 512; then
+          test_marker="${test_marker_input}"
+        else
+          echo "::warning::ci-observe: test-marker is over 512 UTF-8 bytes; recording unknown"
+          test_marker="unknown"
+        fi
+        # JSON-quoting makes any selection value a valid double-quoted YAML
+        # scalar. "$" is escaped to the JSON \u0024 form so the rendered
+        # text can never contain a literal ${CI_OBSERVE_...} sequence: the
+        # sed chain below replaces tokens sequentially, and a later token's
+        # substitution would otherwise rewrite a caller-controlled value
+        # that embeds an earlier-unsubstituted token (the Python renderer
+        # is immune because its single-pass regex never rescans).
+        yaml_quote() {
+          printf '%s' "$1" | python3 -c 'import json, sys; print(json.dumps(sys.stdin.read()).replace("$", "\\u0024"), end="")'
+        }
+        sed_escape() {
+          printf '%s' "$1" | sed 's/[\\&|]/\\&/g'
+        }
+        test_suite_yaml="$(yaml_quote "${test_suite}")"
+        test_filter_yaml="$(yaml_quote "${test_filter}")"
+        test_marker_yaml="$(yaml_quote "${test_marker}")"
+        test_suite_sed="$(sed_escape "${test_suite_yaml}")"
+        test_filter_sed="$(sed_escape "${test_filter_yaml}")"
+        test_marker_sed="$(sed_escape "${test_marker_yaml}")"
+        # The workflow name is a display string and keeps the denylist
+        # strip (newline, backslash, double quote, the sed-special | and &,
+        # and $ so an embedded ${CI_OBSERVE_...} token cannot be rewritten
+        # by a later substitution in the sed chain below).
+        workflow_name="$(printf '%s' "${GITHUB_WORKFLOW:-}" | tr -d '\n|\\&"$')"
         workflow_name="${workflow_name:-unknown}"
         run_attempt="$(printf '%s' "${GITHUB_RUN_ATTEMPT:-}" | tr -cd '0-9')"
         run_attempt="${run_attempt:-1}"
@@ -243,13 +368,42 @@ runs:
           osac_images="${osac_images%;}"
           osac_images="${osac_images:-unknown}"
 
+          # Read runtime image IDs from Running OSAC Deployment pods. The
+          # shared helper follows Pod -> ReplicaSet -> Deployment ownership,
+          # requires the OSAC part-of label, and bounds/sanitizes the output.
+          image_id_capture="$(PYTHONPATH="${GITHUB_WORKSPACE}/monitoring/scripts" python3 - "${OBSERVED_NAMESPACE}" <<'PY'
+        import os
+        import sys
+        from pathlib import Path
+
+        from ci_observe_capture import osac_image_ids
+
+        capture = osac_image_ids(Path(os.environ["KUBECONFIG"]), sys.argv[1])
+        print(f"{capture.complete}|{capture.image_ids}")
+        PY
+          )" || image_id_capture=""
+          if [[ "${image_id_capture}" == *"|"* ]]; then
+            osac_image_ids_complete="${image_id_capture%%|*}"
+            osac_image_ids="${image_id_capture#*|}"
+          else
+            osac_image_ids_complete="unknown"
+            osac_image_ids="unknown"
+          fi
+          if [[ "${osac_image_ids_complete}" != "true" \
+              && "${osac_image_ids_complete}" != "false" \
+              && "${osac_image_ids_complete}" != "unknown" ]]; then
+            osac_image_ids_complete="unknown"
+            osac_image_ids="unknown"
+          fi
+          osac_image_ids="${osac_image_ids:-unknown}"
+
           # Render the coordinator tokens the cluster manifest expects
           # (same envsubst-style substitution as the local capture
           # supervisor, monitoring/scripts/ci_observe_capture.py). The
-          # values are a UUID, a DNS name, a URL, a suite word, a PR
-          # number, a git ref, a workflow name, an attempt number, an
-          # image list and a base64 blob, all narrowed to sed- and
-          # manifest-safe characters above.
+          # selection values are JSON-quoted YAML scalars with sed
+          # replacement characters escaped and $ defused. Spec image refs,
+          # runtime image IDs and the resolved test SHA remain separate
+          # values from the requested refs.
           rendered="${ci_dir}/cluster-rendered.yaml"
           sed \
             -e "s|\${CI_OBSERVE_CAPTURE_ID}|${capture_id}|g" \
@@ -259,10 +413,18 @@ runs:
             -e "s|\${CI_OBSERVE_SUITE}|${suite}|g" \
             -e "s|\${CI_OBSERVE_PR}|${pr}|g" \
             -e "s|\${CI_OBSERVE_TEST_REF}|${test_ref}|g" \
+            -e "s|\${CI_OBSERVE_TEST_SHA}|${test_sha}|g" \
             -e "s|\${CI_OBSERVE_TEST_INFRA_REF}|${test_infra_ref}|g" \
+            -e "s|\${CI_OBSERVE_TEST_INFRA_SHA}|${test_infra_sha}|g" \
+            -e "s|\${CI_OBSERVE_TEST_INFRA_WORKFLOW_SHA}|${test_infra_workflow_sha}|g" \
             -e "s|\${CI_OBSERVE_WORKFLOW}|${workflow_name}|g" \
             -e "s|\${CI_OBSERVE_RUN_ATTEMPT}|${run_attempt}|g" \
             -e "s|\${CI_OBSERVE_OSAC_IMAGES}|${osac_images}|g" \
+            -e "s|\${CI_OBSERVE_OSAC_IMAGE_IDS}|${osac_image_ids}|g" \
+            -e "s|\${CI_OBSERVE_OSAC_IMAGE_IDS_COMPLETE}|${osac_image_ids_complete}|g" \
+            -e "s|\${CI_OBSERVE_TEST_SUITE}|${test_suite_sed}|g" \
+            -e "s|\${CI_OBSERVE_TEST_FILTER}|${test_filter_sed}|g" \
+            -e "s|\${CI_OBSERVE_TEST_MARKER}|${test_marker_sed}|g" \
             -e "s|\${CI_OBSERVE_OTLP_ENDPOINT}|${otlp_endpoint}|g" \
             -e "s|\${CI_OBSERVE_OTLP_AUTH}|${auth}|g" \
             "${GITHUB_WORKSPACE}/monitoring/config/ci-observe/cluster.yaml" > "${rendered}"

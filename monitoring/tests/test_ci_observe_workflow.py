@@ -175,6 +175,9 @@ class TestAction:
         assert inputs["suite"]["default"] == ""
         assert inputs["pr"]["required"] is False
         assert inputs["pr"]["default"] == ""
+        for name in ("test-sha", "test-infra-workflow-sha", "test-suite", "test-filter", "test-marker"):
+            assert inputs[name]["required"] is False, name
+            assert inputs[name]["default"] == "", name
         # The ingest password is a secret callers pass; empty is valid and
         # degrades to running the test without telemetry.
         assert inputs["otlp-password"]["required"] is False
@@ -209,35 +212,33 @@ class TestAction:
         assert "tr -cd '0-9'" in script
 
     def test_renders_the_run_identity_into_the_cluster_manifest(self, action: dict) -> None:
-        """The two git refs, the workflow name, the run attempt and the
-        deployed OSAC images become the CI_OBSERVE_TEST_REF /
-        _TEST_INFRA_REF / _WORKFLOW / _RUN_ATTEMPT / _OSAC_IMAGES env
-        values of the gateway (the collector turns them into the
-        osac.ci.test_ref / osac.ci.test_infra_ref / osac.ci.workflow /
-        osac.ci.run_attempt / osac.ci.osac_images resource attributes).
-        test_ref is the osac code under test, test_infra_ref the harness
-        revision (empty input falls back to GITHUB_SHA, the workflow's own
-        commit, which IS the harness revision on this repo's scheduled and
-        dispatched runs). The workflow name and attempt come from the
-        default runner env vars (the step runs directly on the runner, no
-        container). Refs fail loud: anything outside the SHA/branch/tag
-        charset degrades to "unknown" whole, never a mangled value; every
-        value coalesces to a non-empty fallback ("unknown", attempt "1"),
-        because an empty env value makes the collector reject its config
-        at load."""
+        """Requested refs, resolved SHAs, selection, workflow name, attempt,
+        spec image refs and runtime image IDs become distinct resource
+        attributes. The resolved osac commit (test-sha) and the harness
+        workspace SHA come from git metadata; job.workflow_sha identifies
+        the reusable-workflow file; GITHUB_SHA is only the event SHA."""
         deploy = step_by_id(action["runs"]["steps"], "deploy")
         script = deploy["run"]
-        for name in ("test-ref", "test-infra-ref"):
+        for name in ("test-ref", "test-sha", "test-infra-ref"):
             assert action["inputs"][name]["required"] is False, name
             assert action["inputs"][name]["default"] == "", name
         assert deploy["env"]["TEST_REF_INPUT"] == "${{ inputs.test-ref }}"
+        assert deploy["env"]["TEST_SHA_INPUT"] == "${{ inputs.test-sha }}"
         assert deploy["env"]["TEST_INFRA_REF_INPUT"] == "${{ inputs.test-infra-ref }}"
         for token in (
             "CI_OBSERVE_TEST_REF",
+            "CI_OBSERVE_TEST_SHA",
             "CI_OBSERVE_TEST_INFRA_REF",
+            "CI_OBSERVE_TEST_INFRA_SHA",
+            "CI_OBSERVE_TEST_INFRA_WORKFLOW_SHA",
             "CI_OBSERVE_WORKFLOW",
             "CI_OBSERVE_RUN_ATTEMPT",
             "CI_OBSERVE_OSAC_IMAGES",
+            "CI_OBSERVE_OSAC_IMAGE_IDS",
+            "CI_OBSERVE_OSAC_IMAGE_IDS_COMPLETE",
+            "CI_OBSERVE_TEST_SUITE",
+            "CI_OBSERVE_TEST_FILTER",
+            "CI_OBSERVE_TEST_MARKER",
         ):
             assert f'-e "s|\\${{{token}}}' in script, token
         # Fail-loud ref validation: a ref is safe only when the whole
@@ -250,13 +251,145 @@ class TestAction:
         assert "ref_is_safe() {" in script
         assert "!= *$'\\n'*" in script
         assert 'if ref_is_safe "${TEST_REF_INPUT}"; then' in script
-        assert 'test_infra_ref="${TEST_INFRA_REF_INPUT:-${GITHUB_SHA:-}}"' in script
+        assert 'test_infra_ref="${TEST_INFRA_REF_INPUT:-unspecified}"' in script
         assert 'if ! ref_is_safe "${test_infra_ref}"; then' in script
+        # The resolved osac commit is a SHA or "unknown" -- never the
+        # requested ref (see test_the_sha_validation_rejects_hostile_values).
+        assert 'test_sha="${TEST_SHA_INPUT}"' in script
+        assert 'if ! sha_is_safe "${test_sha}"; then' in script
+        assert "is not a 40/64-character lowercase hex SHA" in script
+        # The harness SHA is HEAD only when every harness file is tracked
+        # at HEAD and matches the worktree: the cat-file probes close the
+        # gap git diff alone leaves (an untracked replacement for a path
+        # HEAD does not contain).
+        assert "harness_paths=(" in script
+        assert 'git -C "${GITHUB_WORKSPACE}" cat-file -e "HEAD:${path}"' in script
+        assert 'git -C "${GITHUB_WORKSPACE}" diff --quiet HEAD -- "${harness_paths[@]}"' in script
+        assert "if harness_matches_head; then" in script
+        assert 'git -C "${GITHUB_WORKSPACE}" rev-parse --verify HEAD' in script
+        assert 'test_infra_sha="unknown"' in script
+        assert 'test_infra_workflow_sha="${TEST_INFRA_WORKFLOW_SHA_INPUT}"' in script
+        # An empty test-suite input means the caller reported nothing, not
+        # that every suite ran: only a reported selection is recorded.
+        assert 'if [[ -n "${TEST_SUITE_INPUT}" ]]; then' in script
+        assert 'selection_is_bounded "${TEST_SUITE_INPUT}" 256' in script
+        assert 'selection_is_bounded "${test_filter_input}" 512' in script
+        assert 'selection_is_bounded "${test_marker_input}" 512' in script
+        assert "test-suite is over 256 UTF-8 bytes; recording unknown" in script
+        assert "test-filter is over 512 UTF-8 bytes; recording unknown" in script
+        assert "test-marker is over 512 UTF-8 bytes; recording unknown" in script
+        # One selection_is_bounded definition, counting UTF-8 bytes like
+        # the local supervisor (a duplicate character-count definition
+        # silently overrode the byte-counting one in an earlier revision,
+        # and the extract-then-probe test below only saw the dead first
+        # copy).
+        assert script.count("selection_is_bounded() {") == 1
+        assert "wc -c" in script
+        assert '[[ "${#1}" -le "$2" ]]' not in script
+        assert "json.dumps(sys.stdin.read()).replace" in script
+        assert "\\u0024" in script
+        assert "sed_escape() {" in script
         # The workflow name is a display string and keeps the denylist
-        # strip (newline, backslash, double quote, sed-special | and &).
-        assert "tr -d '\\n|\\\\&\"'" in script
+        # strip (newline, backslash, double quote, sed-special | and &,
+        # and $ so an embedded token cannot be rewritten by a later
+        # substitution).
+        assert "tr -d '\\n|\\\\&\"$'" in script
         assert 'workflow_name="${workflow_name:-unknown}"' in script
         assert 'run_attempt="${run_attempt:-1}"' in script
+
+    def test_selection_length_check_rejects_overlong_values(self, action: dict) -> None:
+        """Runs the deploy step's actual selection_is_bounded. The bound is
+        UTF-8 bytes, matching the local supervisor's len(encode("utf-8"))
+        check: a multibyte dispatch input must not pass here five characters
+        at what the supervisor measures as ten bytes."""
+        script = step_by_id(action["runs"]["steps"], "deploy")["run"]
+        match = re.search(r"(?ms)^selection_is_bounded\(\) \{.*?^\}", script)
+        assert match
+        probe = match.group(0) + '\nselection_is_bounded "$1" 8 && echo accepted || echo unknown\n'
+        for value, expected in (
+            ("short", "accepted"),
+            ("123456789", "unknown"),
+            ("éééé", "accepted"),
+            ("ééééé", "unknown"),
+        ):
+            result = subprocess.run(["bash", "-c", probe, "probe", value], capture_output=True, text=True, check=True)
+            assert result.stdout.strip() == expected, value
+
+    def test_the_sha_validation_rejects_hostile_values(self, action: dict) -> None:
+        """Runs the deploy step's actual sha_is_safe on the shapes the
+        test-sha and workflow-sha inputs can meet: 40- and 64-character
+        lowercase hex pass; uppercase, short, long, ref-like and multiline
+        values all degrade to "unknown"."""
+        script = step_by_id(action["runs"]["steps"], "deploy")["run"]
+        match = re.search(r"(?ms)^sha_is_safe\(\) \{.*?^\}", script)
+        assert match
+        probe = match.group(0) + '\nsha_is_safe "$1" && echo sha || echo unknown\n'
+        for value, expected in (
+            ("a" * 40, "sha"),
+            ("a" * 64, "sha"),
+            ("A" * 40, "unknown"),
+            ("a" * 39, "unknown"),
+            ("a" * 65, "unknown"),
+            ("main", "unknown"),
+            ("main\nsha", "unknown"),
+            ("", "unknown"),
+        ):
+            result = subprocess.run(["bash", "-c", probe, "probe", value], capture_output=True, text=True, check=True)
+            assert result.stdout.strip() == expected, value
+
+    def test_test_selection_rendering_preserves_yaml_and_sed_special_characters(self, action: dict) -> None:
+        script = step_by_id(action["runs"]["steps"], "deploy")["run"]
+        yaml_quote = re.search(r"(?ms)^yaml_quote\(\) \{.*?^\}", script)
+        sed_escape = re.search(r"(?ms)^sed_escape\(\) \{.*?^\}", script)
+        assert yaml_quote and sed_escape
+        probe = (
+            yaml_quote.group(0)
+            + "\n"
+            + sed_escape.group(0)
+            + r"""
+quoted="$(yaml_quote "$1")"
+escaped="$(sed_escape "$quoted")"
+printf 'value: ${TOKEN}\n' | sed "s|\${TOKEN}|${escaped}|g"
+"""
+        )
+        value = 'not TestBmaasNetworking | "edge" & slash\\path\nsecond line café'
+        rendered = subprocess.run(
+            ["bash", "-c", probe, "probe", value], capture_output=True, text=True, check=True
+        ).stdout
+        assert yaml.safe_load(rendered)["value"] == value
+
+    def test_selection_rendering_defuses_embedded_tokens(self, action: dict) -> None:
+        """The deploy step's sed chain substitutes tokens sequentially, so a
+        caller-controlled selection value embedding a later token's text
+        (a test-filter containing ${CI_OBSERVE_TEST_MARKER}) would be
+        rewritten by that token's substitution. yaml_quote escapes $ to the
+        JSON \\u0024 form, which never matches a token pattern during the
+        chain and decodes back to $ in the final YAML scalar. The local
+        supervisor needs no equivalent: its single-pass regex substitution
+        never rescans replaced text."""
+        script = step_by_id(action["runs"]["steps"], "deploy")["run"]
+        yaml_quote = re.search(r"(?ms)^yaml_quote\(\) \{.*?^\}", script)
+        sed_escape = re.search(r"(?ms)^sed_escape\(\) \{.*?^\}", script)
+        assert yaml_quote and sed_escape
+        probe = (
+            yaml_quote.group(0)
+            + "\n"
+            + sed_escape.group(0)
+            + r"""
+filter_replacement="$(sed_escape "$(yaml_quote "$1")")"
+marker_replacement="$(sed_escape "$(yaml_quote 'sanity')")"
+printf 'filter: ${CI_OBSERVE_TEST_FILTER}\nmarker: ${CI_OBSERVE_TEST_MARKER}\n' \
+  | sed -e "s|\${CI_OBSERVE_TEST_FILTER}|${filter_replacement}|g" \
+        -e "s|\${CI_OBSERVE_TEST_MARKER}|${marker_replacement}|g"
+"""
+        )
+        value = "a or ${CI_OBSERVE_TEST_MARKER} and $b"
+        rendered = subprocess.run(
+            ["bash", "-c", probe, "probe", value], capture_output=True, text=True, check=True
+        ).stdout
+        document = yaml.safe_load(rendered)
+        assert document["filter"] == value
+        assert document["marker"] == "sanity"
 
     def test_reads_the_deployed_osac_images_and_degrades_to_unknown(self, action: dict) -> None:
         """The OSAC images come from the observed namespace (one
@@ -273,6 +406,16 @@ class TestAction:
         assert '\')" || osac_images=""' in script
         assert "tr '\\n' ';'" in script
         assert 'osac_images="${osac_images:-unknown}"' in script
+
+    def test_reads_runtime_image_ids_with_the_shared_osac_pod_filter(self, action: dict) -> None:
+        deploy = step_by_id(action["runs"]["steps"], "deploy")
+        script = deploy["run"]
+        assert "from ci_observe_capture import osac_image_ids" in script
+        assert 'osac_image_ids(Path(os.environ["KUBECONFIG"]), sys.argv[1])' in script
+        assert 'osac_image_ids="${osac_image_ids:-unknown}"' in script
+        assert 'osac_image_ids_complete="${image_id_capture%%|*}"' in script
+        assert "CI_OBSERVE_OSAC_IMAGE_IDS_COMPLETE" in script
+        assert "CI_OBSERVE_OSAC_IMAGE_IDS" in script
 
     @pytest.mark.parametrize(
         ("value", "expected"),
@@ -440,10 +583,18 @@ class TestRunIdentityAttributes:
         actions = {a["key"]: a for a in collector["processors"]["resource/capture"]["attributes"]}
         expected = {
             "osac.ci.test_ref": "${env:CI_OBSERVE_TEST_REF}",
+            "osac.ci.test_sha": "${env:CI_OBSERVE_TEST_SHA}",
             "osac.ci.test_infra_ref": "${env:CI_OBSERVE_TEST_INFRA_REF}",
+            "osac.ci.test_infra_sha": "${env:CI_OBSERVE_TEST_INFRA_SHA}",
+            "osac.ci.test_infra_workflow_sha": "${env:CI_OBSERVE_TEST_INFRA_WORKFLOW_SHA}",
             "osac.ci.workflow": "${env:CI_OBSERVE_WORKFLOW}",
             "osac.ci.run_attempt": "${env:CI_OBSERVE_RUN_ATTEMPT}",
             "osac.ci.osac_images": "${env:CI_OBSERVE_OSAC_IMAGES}",
+            "osac.ci.osac_image_ids": "${env:CI_OBSERVE_OSAC_IMAGE_IDS}",
+            "osac.ci.osac_image_ids_complete": "${env:CI_OBSERVE_OSAC_IMAGE_IDS_COMPLETE}",
+            "osac.ci.test_suite": "${env:CI_OBSERVE_TEST_SUITE}",
+            "osac.ci.test_filter": "${env:CI_OBSERVE_TEST_FILTER}",
+            "osac.ci.test_marker": "${env:CI_OBSERVE_TEST_MARKER}",
         }
         for key, value in expected.items():
             assert actions[key]["value"] == value, key
@@ -455,10 +606,18 @@ class TestRunIdentityAttributes:
         env = {e["name"]: e["value"] for e in deployment["spec"]["template"]["spec"]["containers"][0]["env"]}
         for name in (
             "CI_OBSERVE_TEST_REF",
+            "CI_OBSERVE_TEST_SHA",
             "CI_OBSERVE_TEST_INFRA_REF",
+            "CI_OBSERVE_TEST_INFRA_SHA",
+            "CI_OBSERVE_TEST_INFRA_WORKFLOW_SHA",
             "CI_OBSERVE_WORKFLOW",
             "CI_OBSERVE_RUN_ATTEMPT",
             "CI_OBSERVE_OSAC_IMAGES",
+            "CI_OBSERVE_OSAC_IMAGE_IDS",
+            "CI_OBSERVE_OSAC_IMAGE_IDS_COMPLETE",
+            "CI_OBSERVE_TEST_SUITE",
+            "CI_OBSERVE_TEST_FILTER",
+            "CI_OBSERVE_TEST_MARKER",
         ):
             assert env[name] == "${" + name + "}", name
 
@@ -704,17 +863,44 @@ class TestWorkflowWiring:
         assert observed["with"]["pr"] == "${{ inputs.pr-number }}"
 
     def test_the_observed_step_passes_both_git_refs(self, workflow: dict) -> None:
-        """Two refs, each true in every flow. test-ref is the osac code
-        under test (the osac PR head in the osac PR flow, where osac's
-        callers pin these workflows and pass their own test-infra-ref:
-        feeding git identity from test-infra-ref alone would stamp the
-        literal "main" there). test-infra-ref is the harness revision (the
-        test-infra PR head in this repo's PR flow; empty on schedules and
-        dispatches, where the action falls back to GITHUB_SHA, the
-        workflow's own commit, which IS the harness revision)."""
+        """Requested refs do not stand in for resolved SHAs: the requested
+        osac ref, the overlay step's resolved commit, the requested
+        test-infra ref, the workflow file SHA and the recorded selection are
+        five separate inputs."""
         observed = step_by_id(steps_of(workflow), "test-observed")
         assert observed["with"]["test-ref"] == "${{ inputs.test-ref }}"
+        assert observed["with"]["test-sha"] == "${{ steps.overlay-tests.outputs.test-sha }}"
         assert observed["with"]["test-infra-ref"] == "${{ inputs.test-infra-ref }}"
+        assert observed["with"]["test-infra-workflow-sha"] == "${{ job.workflow_sha }}"
+        if "BMaaS" in workflow["name"]:
+            assert observed["with"]["test-suite"] == "${{ steps.resolve-test-selection.outputs.test-selection }}"
+        else:
+            assert observed["with"]["test-suite"] == "${{ steps.resolve-test-suite.outputs.test-selection }}"
+        assert observed["with"]["test-filter"] == "${{ inputs.test-filter }}"
+        assert observed["with"]["test-marker"] == "${{ inputs.test-marker }}"
+
+    def test_the_overlay_step_reports_the_resolved_osac_commit(self, workflow: dict) -> None:
+        """The overlay step is the only place that knows which commit of the
+        osac test source actually ran (the requested test-ref can be a
+        moving branch). It writes rev-parse HEAD to its output best-effort:
+        a rev-parse failure leaves the output empty, the action records
+        "unknown", and the test is never gated on telemetry."""
+        overlay = step_by_id(steps_of(workflow), "overlay-tests")
+        assert overlay["name"] == "Overlay tests from osac mono-repo"
+        script = overlay["run"]
+        assert 'git -C "$OSAC_CLONE_DIR" rev-parse HEAD 2>/dev/null || true' in script
+        assert 'echo "test-sha=${overlay_test_sha}" >> "$GITHUB_OUTPUT"' in script
+        # The output is written after a successful checkout, before the
+        # tests/ overlay mutates the workspace.
+        assert script.index("rev-parse HEAD") > script.index("checkout FETCH_HEAD")
+        assert script.index("rev-parse HEAD") < script.index("rm -rf tests/")
+
+    def test_job_workflow_sha_names_the_reusable_workflow_definition(self, workflow: dict) -> None:
+        checkout = next(step for step in steps_of(workflow) if step.get("name") == "Checkout repository")
+        assert "job.workflow_repository" in checkout["with"]["repository"]
+        assert "job.workflow_sha" in checkout["with"]["ref"]
+        observed = step_by_id(steps_of(workflow), "test-observed")
+        assert observed["with"]["test-infra-workflow-sha"] == "${{ job.workflow_sha }}"
 
     def test_exactly_one_test_step_runs_depending_on_the_input(self, workflow: dict) -> None:
         steps = steps_of(workflow)
@@ -764,6 +950,101 @@ class TestWorkflowWiring:
         assert "steps.test.outcome" in result
         assert "steps.test-observed.outcome" in result
         assert "'PASSED'" in result and "'FAILED'" in result
+
+
+@pytest.mark.parametrize("workflow", SUITES, indirect=True)
+class TestRecordedSelection:
+    """The recorded test_suite attribute must name every path pytest
+    collected: the suite fallback AND the references/ addition a marker
+    triggers. The selection is computed in a resolve step that mirrors the
+    test steps' own TEST_ARGS block -- the test command itself stays
+    untouched, telemetry must never change it -- and the differential test
+    below runs both blocks on the same inputs to pin them to identical
+    results."""
+
+    def resolve_step(self, workflow: dict) -> dict:
+        steps = steps_of(workflow)
+        if "BMaaS" in workflow["name"]:
+            return step_by_id(steps, "resolve-test-selection")
+        return step_by_id(steps, "resolve-test-suite")
+
+    def test_the_resolve_step_emits_the_effective_selection(self, workflow: dict) -> None:
+        resolve = self.resolve_step(workflow)
+        script = resolve["run"]
+        assert 'echo "test-selection=${TEST_PATHS}" >> "$GITHUB_OUTPUT"' in script
+        assert 'TEST_PATHS="tests/e2e/"' in script
+        # The marker decides the references/ addition, so the step must
+        # read it through the same data-only env channel as the test steps.
+        assert resolve["env"]["TEST_MARKER"] == "${{ inputs.test-marker }}"
+        assert resolve["env"]["TEST_SUITE"] == "${{ inputs.test-suite }}"
+        if "BMaaS" not in workflow["name"]:
+            # VMaaS and CaaS resolve a suite fallback first; BMaaS runs the
+            # raw input.
+            assert "EFFECTIVE_TEST_SUITE" in script
+        observed = step_by_id(steps_of(workflow), "test-observed")
+        assert observed["with"]["test-suite"] == f"${{{{ steps.{resolve['id']}.outputs.test-selection }}}}"
+
+    @pytest.mark.parametrize(
+        ("suite", "marker"),
+        [
+            ("", ""),
+            ("", "sanity"),
+            ("vmaas", ""),
+            ("vmaas", "not requires_caas and not requires_bmaas"),
+            ("vmaas/regression", "sanity or regression"),
+            ("caas", ""),
+            ("caas", "sanity"),
+            ("caas/sanity", "sanity"),
+            ("caas/regression", "regression"),
+            ("bmaas", ""),
+            ("bmaas/sanity", "not TestBmaasNetworking"),
+            ("bmaas/serial", "sanity"),
+        ],
+    )
+    def test_the_recorded_selection_matches_the_test_command(self, workflow: dict, suite: str, marker: str) -> None:
+        """Runs the resolve step's selection block and the plain test step's
+        TEST_ARGS block on the same (suite, marker) inputs: the recorded
+        value must equal the path arguments pytest received, word for
+        word, including the references/ addition."""
+        resolve_script = self.resolve_step(workflow)["run"]
+        resolve_block = re.search(r'(?ms)^TEST_PATHS="tests/e2e/".*?"\$GITHUB_OUTPUT"$', resolve_script)
+        assert resolve_block, "selection computation not found in the resolve step"
+        run_script = step_by_id(steps_of(workflow), "test")["run"]
+        run_block = re.search(r"(?ms)^TEST_ARGS=.*?(?=^FILTER_ARGS)", run_script)
+        assert run_block, "TEST_ARGS computation not found in the plain test step"
+        is_array = run_block.group(0).lstrip().startswith("TEST_ARGS=(")
+
+        preamble = (
+            f"TEST_SUITE={suite!r}\nEFFECTIVE_TEST_SUITE={suite!r}\nTEST_MARKER={marker!r}\nGITHUB_OUTPUT=/dev/null\n"
+        )
+        resolve_probe = preamble + resolve_block.group(0) + "\nprintf '%s\\n' \"${TEST_PATHS}\"\n"
+        # The plain step invokes pytest with the string form unquoted
+        # (word-split) and the array form quoted, so the effective path
+        # arguments are read the same way here.
+        if is_array:
+            run_probe = preamble + run_block.group(0) + "\nprintf '%s\\n' \"${TEST_ARGS[@]}\"\n"
+        else:
+            run_probe = preamble + run_block.group(0) + "\nprintf '%s\\n' ${TEST_ARGS}\n"
+
+        recorded = subprocess.run(
+            ["bash", "-c", resolve_probe], capture_output=True, text=True, check=True
+        ).stdout.split()
+        ran = subprocess.run(["bash", "-c", run_probe], capture_output=True, text=True, check=True).stdout.split()
+        assert recorded == ran, (suite, marker, recorded, ran)
+
+    def test_the_capture_commands_selection_block_is_identical_to_the_plain_test_step(self, workflow: dict) -> None:
+        """Under ci-observe the action's command: block runs instead of the
+        plain test step, so the differential test above must describe it too.
+        The command's TEST_ARGS block is pinned byte-for-byte to the plain
+        step's: the recorded selection names what pytest ran on both paths,
+        and a drift here would make a labeled run collect a different
+        selection than the plain path without any test noticing."""
+        pattern = r"(?ms)^TEST_ARGS=.*?(?=^FILTER_ARGS)"
+        plain_block = re.search(pattern, step_by_id(steps_of(workflow), "test")["run"])
+        command_block = re.search(pattern, step_by_id(steps_of(workflow), "test-observed")["with"]["command"])
+        assert plain_block, "TEST_ARGS computation not found in the plain test step"
+        assert command_block, "TEST_ARGS computation not found in the capture command"
+        assert command_block.group(0) == plain_block.group(0)
 
 
 @pytest.mark.parametrize("caller", SUITES, indirect=True)

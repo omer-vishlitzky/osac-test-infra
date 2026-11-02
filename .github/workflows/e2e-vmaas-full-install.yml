@@ -225,6 +225,7 @@ jobs:
           persist-credentials: false
 
       - name: Overlay tests from osac mono-repo
+        id: overlay-tests
         env:
           TEST_REF: ${{ inputs.test-ref }}
           TEST_REPOSITORY: ${{ inputs.test-repository }}
@@ -240,6 +241,13 @@ jobs:
           git -C "$OSAC_CLONE_DIR" fetch --depth 1 \
             "https://github.com/${TEST_REPOSITORY}.git" "${TEST_REF}"
           git -C "$OSAC_CLONE_DIR" checkout FETCH_HEAD
+          # The resolved osac commit, for the capture action's test-sha
+          # input: TEST_REF can be a moving branch ("main" on schedules),
+          # so the requested ref alone does not say what ran. Best effort
+          # only -- telemetry must never gate the test: an empty output
+          # makes the action record "unknown", never a guess.
+          overlay_test_sha="$(git -C "$OSAC_CLONE_DIR" rev-parse HEAD 2>/dev/null || true)"
+          echo "test-sha=${overlay_test_sha}" >> "$GITHUB_OUTPUT"
           # Overlay tests/ only. Do not copy pyproject.toml: osac's is named
           # osac-e2e and has no uv.lock, which breaks uv sync --frozen.
           rm -rf tests/
@@ -1170,8 +1178,10 @@ jobs:
           fi
           echo "url=http://${ROUTE_HOST}" >> "$GITHUB_OUTPUT"
       - name: Resolve effective test suite (fallback if tier dir is empty)
+        id: resolve-test-suite
         env:
           TEST_SUITE: ${{ inputs.test-suite }}
+          TEST_MARKER: ${{ inputs.test-marker }}
         run: |
           # VMaaS/CaaS test content hasn't moved into sanity/regression/serial
           # tier subdirectories yet (only .gitkeep scaffolding exists as of
@@ -1201,6 +1211,25 @@ jobs:
             fi
           fi
           echo "EFFECTIVE_TEST_SUITE=${EFFECTIVE_TEST_SUITE}" >> "$GITHUB_ENV"
+          # The recorded test selection: the exact pytest path arguments the
+          # test steps pass, including the references/ addition a marker
+          # triggers for vmaas (references/ holds CaaS and BMaaS tests too,
+          # so a marker needs those reference tests in the same run).
+          # Mirrors the test steps' own TEST_ARGS block -- which stays
+          # untouched: telemetry must never change the test command -- and
+          # monitoring/tests/test_ci_observe_workflow.py pins the two blocks
+          # to identical results so the recorded value cannot drift from
+          # what pytest collected.
+          TEST_PATHS="tests/e2e/"
+          if [ -n "${EFFECTIVE_TEST_SUITE}" ]; then
+            TEST_PATHS="tests/e2e/${EFFECTIVE_TEST_SUITE}/"
+            if [ -n "${TEST_MARKER}" ]; then
+              case "${EFFECTIVE_TEST_SUITE}" in
+                vmaas|vmaas/*) TEST_PATHS="${TEST_PATHS} tests/e2e/references/" ;;
+              esac
+            fi
+          fi
+          echo "test-selection=${TEST_PATHS}" >> "$GITHUB_OUTPUT"
 
       - name: Run E2E tests
         id: test
@@ -1300,15 +1329,14 @@ jobs:
           capture-id: ${{ format('vmaas-{0}-{1}-a{2}', inputs.pr-number != '' && format('pr{0}', inputs.pr-number) || 'main', github.run_id, github.run_attempt) }}
           suite: vmaas
           pr: ${{ inputs.pr-number }}
-          # Run identity: the two git refs, each true in every flow.
-          # test-ref is the osac code under test (the osac PR head in the
-          # osac PR flow; "main" on schedules, a true statement of what
-          # ran). test-infra-ref is the harness revision (the test-infra
-          # PR head in this repo's PR flow; empty on schedules and
-          # dispatches, where the action falls back to GITHUB_SHA, the
-          # workflow's own commit, which IS the harness revision there).
+          # Requested refs stay distinct from immutable resolved SHAs.
           test-ref: ${{ inputs.test-ref }}
+          test-sha: ${{ steps.overlay-tests.outputs.test-sha }}
           test-infra-ref: ${{ inputs.test-infra-ref }}
+          test-infra-workflow-sha: ${{ job.workflow_sha }}
+          test-suite: ${{ steps.resolve-test-suite.outputs.test-selection }}
+          test-filter: ${{ inputs.test-filter }}
+          test-marker: ${{ inputs.test-marker }}
           # The central ingest password reaches the action as a secret, the
           # same data-only channel as every other input.
           otlp-password: ${{ secrets.ci-observe-otlp-password }}

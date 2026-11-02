@@ -13,6 +13,7 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
+import yaml
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "ci_observe_capture.py"
 MANIFEST = Path(__file__).resolve().parents[1] / "config" / "ci-observe" / "cluster.yaml"
@@ -182,28 +183,75 @@ def test_render_manifest_narrows_suite_and_pr_to_safe_charsets(*, capture_module
 def test_render_manifest_resolves_the_run_identity_tokens(*, capture_module: ModuleType) -> None:
     """The run identity values become the gateway env values the
     collector's ${env:...} placeholders read for the osac.ci.test_ref,
-    osac.ci.test_infra_ref, osac.ci.workflow, osac.ci.run_attempt and
-    osac.ci.osac_images resource attributes."""
+    osac.ci.test_sha, osac.ci.test_infra_ref, immutable test-infra SHAs,
+    workflow, osac_images, runtime image IDs and test selection resource
+    attributes."""
+    test_filter = 'not TestBmaasNetworking | "edge" & slash\\path\nsecond line'
     rendered = capture_module.render_manifest(
         capture_id="cap123",
         namespace="osac-e2e-ci",
         cluster_uid="uid-1",
         kubelet_endpoint="https://192.0.2.1:10250",
         test_ref="9f3eeeb2c9a4b6f4e5b7f3a3b4c5d6e7f8a9b0c1",
+        test_sha="5d" * 32,
         test_infra_ref="a902331b0b11c390a56381ad16ebd13914f8d5",
+        test_infra_sha="a" * 40,
+        test_infra_workflow_sha="b" * 40,
         workflow="local",
         run_attempt="2",
         osac_images="fulfillment-service=quay.io/osac/fulfillment@sha256:abc;osac-operator=quay.io/osac/operator:1.2",
+        osac_image_ids="fulfillment-service/grpc-server=quay.io/osac/fulfillment@sha256:abc",
+        osac_image_ids_complete="true",
+        test_suite="tests/e2e/bmaas/sanity/",
+        test_filter=test_filter,
+        test_marker="sanity and not requires_caas",
     )
     assert "${CI_OBSERVE_" not in rendered
     assert 'name: CI_OBSERVE_TEST_REF\n              value: "9f3eeeb2c9a4b6f4e5b7f3a3b4c5d6e7f8a9b0c1"' in rendered
+    # Both SHA lengths the validators accept: 40-byte SHA-1 and 64-byte
+    # SHA-256 object ids.
+    assert f'name: CI_OBSERVE_TEST_SHA\n              value: "{"5d" * 32}"' in rendered
     assert 'name: CI_OBSERVE_TEST_INFRA_REF\n              value: "a902331b0b11c390a56381ad16ebd13914f8d5"' in rendered
+    infra_sha = "a" * 40
+    workflow_sha = "b" * 40
+    assert f'name: CI_OBSERVE_TEST_INFRA_SHA\n              value: "{infra_sha}"' in rendered
+    assert f'name: CI_OBSERVE_TEST_INFRA_WORKFLOW_SHA\n              value: "{workflow_sha}"' in rendered
     assert 'name: CI_OBSERVE_WORKFLOW\n              value: "local"' in rendered
     assert 'name: CI_OBSERVE_RUN_ATTEMPT\n              value: "2"' in rendered
     assert (
         "name: CI_OBSERVE_OSAC_IMAGES\n              value: "
         '"fulfillment-service=quay.io/osac/fulfillment@sha256:abc;osac-operator=quay.io/osac/operator:1.2"'
     ) in rendered
+    assert (
+        "name: CI_OBSERVE_OSAC_IMAGE_IDS\n              value: "
+        '"fulfillment-service/grpc-server=quay.io/osac/fulfillment@sha256:abc"'
+    ) in rendered
+    documents = [document for document in yaml.safe_load_all(rendered) if document]
+    gateway = next(document for document in documents if document.get("kind") == "Deployment")
+    containers = gateway["spec"]["template"]["spec"]["containers"]
+    environment = {entry["name"]: entry["value"] for entry in containers[0]["env"]}
+    assert environment["CI_OBSERVE_TEST_SUITE"] == "tests/e2e/bmaas/sanity/"
+    assert environment["CI_OBSERVE_TEST_FILTER"] == test_filter
+    assert environment["CI_OBSERVE_TEST_MARKER"] == "sanity and not requires_caas"
+    assert environment["CI_OBSERVE_OSAC_IMAGE_IDS_COMPLETE"] == "true"
+
+
+def test_render_manifest_degrades_an_invalid_test_sha_to_unknown_whole(*, capture_module: ModuleType) -> None:
+    """The resolved osac commit is a 40/64 lowercase hex SHA or "unknown":
+    a branch name, an uppercase or short SHA, or anything hostile degrades
+    whole, and never falls back to the requested test_ref -- a moving ref
+    is exactly what test_sha exists to disambiguate."""
+    for hostile in ("main", "a" * 39, "A" * 40, "a" * 41, "a" * 63, "a" * 65, "main\nsha", "repo@main"):
+        rendered = capture_module.render_manifest(
+            capture_id="cap123",
+            namespace="osac-e2e-ci",
+            cluster_uid="uid-1",
+            kubelet_endpoint="https://192.0.2.1:10250",
+            test_ref="main",
+            test_sha=hostile,
+        )
+        assert 'name: CI_OBSERVE_TEST_SHA\n              value: "unknown"' in rendered, hostile
+        assert 'name: CI_OBSERVE_TEST_REF\n              value: "main"' in rendered, hostile
 
 
 def test_render_manifest_coalesces_run_identity_to_non_empty_fallbacks(*, capture_module: ModuleType) -> None:
@@ -217,10 +265,37 @@ def test_render_manifest_coalesces_run_identity_to_non_empty_fallbacks(*, captur
     )
     assert "${CI_OBSERVE_" not in rendered
     assert 'name: CI_OBSERVE_TEST_REF\n              value: "unknown"' in rendered
-    assert 'name: CI_OBSERVE_TEST_INFRA_REF\n              value: "unknown"' in rendered
+    assert 'name: CI_OBSERVE_TEST_SHA\n              value: "unknown"' in rendered
+    assert 'name: CI_OBSERVE_TEST_INFRA_REF\n              value: "unspecified"' in rendered
+    assert 'name: CI_OBSERVE_TEST_INFRA_SHA\n              value: "unknown"' in rendered
+    assert 'name: CI_OBSERVE_TEST_INFRA_WORKFLOW_SHA\n              value: "unknown"' in rendered
     assert 'name: CI_OBSERVE_WORKFLOW\n              value: "unknown"' in rendered
     assert 'name: CI_OBSERVE_RUN_ATTEMPT\n              value: "1"' in rendered
     assert 'name: CI_OBSERVE_OSAC_IMAGES\n              value: "unknown"' in rendered
+    assert 'name: CI_OBSERVE_OSAC_IMAGE_IDS\n              value: "unknown"' in rendered
+    assert 'name: CI_OBSERVE_OSAC_IMAGE_IDS_COMPLETE\n              value: "unknown"' in rendered
+    assert 'name: CI_OBSERVE_TEST_SUITE\n              value: "unknown"' in rendered
+    assert 'name: CI_OBSERVE_TEST_FILTER\n              value: "none"' in rendered
+    assert 'name: CI_OBSERVE_TEST_MARKER\n              value: "none"' in rendered
+
+
+def test_render_manifest_marks_overlong_selection_unknown(*, capture_module: ModuleType) -> None:
+    rendered = capture_module.render_manifest(
+        capture_id="cap123",
+        namespace="osac-e2e-ci",
+        cluster_uid="uid-1",
+        kubelet_endpoint="https://192.0.2.1:10250",
+        test_suite="s" * (capture_module.MAX_TEST_SUITE_LENGTH + 1),
+        test_filter="f" * (capture_module.MAX_TEST_FILTER_LENGTH + 1),
+        test_marker="m" * (capture_module.MAX_TEST_MARKER_LENGTH + 1),
+    )
+    documents = [document for document in yaml.safe_load_all(rendered) if document]
+    gateway = next(document for document in documents if document.get("kind") == "Deployment")
+    containers = gateway["spec"]["template"]["spec"]["containers"]
+    environment = {entry["name"]: entry["value"] for entry in containers[0]["env"]}
+    assert environment["CI_OBSERVE_TEST_SUITE"] == "unknown"
+    assert environment["CI_OBSERVE_TEST_FILTER"] == "unknown"
+    assert environment["CI_OBSERVE_TEST_MARKER"] == "unknown"
 
 
 def test_render_manifest_degrades_unparseable_refs_to_unknown_whole(*, capture_module: ModuleType) -> None:
@@ -228,8 +303,10 @@ def test_render_manifest_degrades_unparseable_refs_to_unknown_whole(*, capture_m
     SHA/branch/tag set degrade the WHOLE ref to "unknown", never a
     stripped remainder (like "featurex") that matches no real ref. The
     workflow name is a display string and keeps the denylist strip:
-    newlines, backslashes, double quotes and the sed-special | and & are
-    dropped rather than corrupting the manifest."""
+    newlines, backslashes, double quotes, the sed-special | and &, and $
+    (an embedded ${CI_OBSERVE_...} token must not survive into a renderer
+    that substitutes tokens) are dropped rather than corrupting the
+    manifest."""
     rendered = capture_module.render_manifest(
         capture_id="cap123",
         namespace="osac-e2e-ci",
@@ -237,28 +314,69 @@ def test_render_manifest_degrades_unparseable_refs_to_unknown_whole(*, capture_m
         kubelet_endpoint="https://192.0.2.1:10250",
         test_ref="feature!(x)",
         test_infra_ref="main\nsha",
-        workflow='E2E "full &| install"',
+        workflow='E2E "full &| install" ${CI_OBSERVE_TEST_REF}',
         run_attempt="attempt-3",
         osac_images="a=b\nc=d",
     )
     assert "${CI_OBSERVE_" not in rendered
     assert 'name: CI_OBSERVE_TEST_REF\n              value: "unknown"' in rendered
     assert 'name: CI_OBSERVE_TEST_INFRA_REF\n              value: "unknown"' in rendered
-    assert 'name: CI_OBSERVE_WORKFLOW\n              value: "E2E full  install"' in rendered
+    assert 'name: CI_OBSERVE_WORKFLOW\n              value: "E2E full  install {CI_OBSERVE_TEST_REF}"' in rendered
     assert 'name: CI_OBSERVE_RUN_ATTEMPT\n              value: "3"' in rendered
     assert 'name: CI_OBSERVE_OSAC_IMAGES\n              value: "a=bc=d"' in rendered
 
 
-def test_test_infra_ref_reads_the_repository_head(
-    *, capture_module: ModuleType, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_test_infra_sha_requires_a_clean_capture_checkout(
+    *, capture_module: ModuleType, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The harness revision for a local capture is the commit of the
-    test-infra checkout the supervisor runs from; outside a repository it
-    degrades to "unknown"."""
-    ref = capture_module._test_infra_ref()
-    assert len(ref) == 40 and all(char in "0123456789abcdef" for char in ref), ref
-    monkeypatch.chdir(tmp_path)
-    assert capture_module._test_infra_ref() == "unknown"
+    """A local SHA is reported only when the supervisor and its configs are
+    tracked at HEAD and match the worktree copies."""
+    calls = []
+
+    def clean_checkout(arguments: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append(arguments)
+        return subprocess.CompletedProcess(arguments, 0, "a" * 40 + "\n", "")
+
+    monkeypatch.setattr(capture_module.subprocess, "run", clean_checkout)
+    assert capture_module._test_infra_sha() == "a" * 40
+    # One tracked-at-HEAD probe per source file, then the worktree diff,
+    # then the SHA itself.
+    assert len(calls) == 5
+    for probe in calls[:3]:
+        assert probe[1:4] == ["-C", str(SCRIPT.parents[2]), "cat-file"]
+        assert probe[4] == "-e"
+        assert probe[5].startswith("HEAD:")
+    assert calls[3][1:4] == ["-C", str(SCRIPT.parents[2]), "diff"]
+    assert calls[4][-2:] == ["--verify", "HEAD"]
+
+
+def test_test_infra_sha_is_unknown_when_a_source_file_is_not_tracked_at_head(
+    *, capture_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """git diff reports no difference for a path HEAD does not contain, so
+    an untracked replacement running instead of the committed file would
+    silently claim a commit that never had it: the tracked-at-HEAD probe is
+    what closes that gap."""
+
+    def untracked_source(arguments: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if arguments[3:5] == ["cat-file", "-e"]:
+            return subprocess.CompletedProcess(arguments, 1, "", "")
+        return subprocess.CompletedProcess(arguments, 0, "a" * 40 + "\n", "")
+
+    monkeypatch.setattr(capture_module.subprocess, "run", untracked_source)
+    assert capture_module._test_infra_sha() == "unknown"
+
+
+def test_test_infra_sha_is_unknown_when_capture_sources_are_dirty(
+    *, capture_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def dirty_checkout(arguments: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        if arguments[3:5] == ["cat-file", "-e"]:
+            return subprocess.CompletedProcess(arguments, 0, "", "")
+        return subprocess.CompletedProcess(arguments, 1, "", "")
+
+    monkeypatch.setattr(capture_module.subprocess, "run", dirty_checkout)
+    assert capture_module._test_infra_sha() == "unknown"
 
 
 def test_osac_images_collapses_the_deployment_lines(
@@ -290,6 +408,208 @@ def test_osac_images_degrades_to_unknown_on_any_failure(
     assert capture_module._osac_images(Path("/fake/kubeconfig"), "osac-e2e-ci") == "unknown"
     monkeypatch.setattr(capture_module, "_kubectl", lambda *args, **kwargs: "\n")
     assert capture_module._osac_images(Path("/fake/kubeconfig"), "osac-e2e-ci") == "unknown"
+
+
+def test_osac_image_ids_include_only_running_osac_deployment_pods(
+    *, capture_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    resources = [
+        {
+            "kind": "Deployment",
+            "metadata": {"name": "fulfillment", "labels": {"app.kubernetes.io/part-of": "osac"}},
+            "spec": {
+                "replicas": 1,
+                "template": {
+                    "spec": {
+                        "containers": [
+                            {"name": "grpc_server"},
+                            {"name": "side_car"},
+                            {"name": "not_started"},
+                            {"name": "invalid"},
+                        ]
+                    }
+                },
+            },
+        },
+        {
+            "kind": "Deployment",
+            "metadata": {"name": "metrics-adapter", "labels": {"app.kubernetes.io/part-of": "other"}},
+        },
+        {
+            "kind": "ReplicaSet",
+            "metadata": {
+                "name": "fulfillment-abc123",
+                "ownerReferences": [{"kind": "Deployment", "name": "fulfillment", "controller": True}],
+            },
+        },
+        {
+            "kind": "ReplicaSet",
+            "metadata": {
+                "name": "metrics-adapter-abc123",
+                "ownerReferences": [{"kind": "Deployment", "name": "metrics-adapter", "controller": True}],
+            },
+        },
+        {
+            "kind": "Pod",
+            "metadata": {
+                "name": "fulfillment-abc123-pod1",
+                "ownerReferences": [{"kind": "ReplicaSet", "name": "fulfillment-abc123", "controller": True}],
+            },
+            "status": {
+                "phase": "Running",
+                "containerStatuses": [
+                    {"name": "grpc_server", "imageID": "quay.io/osac/my_repository@sha256:abc"},
+                    {"name": "side_car", "imageID": "cri-o://sha256:def"},
+                    {"name": "invalid", "imageID": "sha256:bad|suffix"},
+                ],
+            },
+        },
+        {
+            "kind": "Pod",
+            "metadata": {
+                "name": "fulfillment-abc123-pending",
+                "ownerReferences": [{"kind": "ReplicaSet", "name": "fulfillment-abc123", "controller": True}],
+            },
+            "status": {"phase": "Pending", "containerStatuses": [{"name": "grpc-server", "imageID": "pending"}]},
+        },
+        {
+            "kind": "Pod",
+            "metadata": {
+                "name": "metrics-adapter-abc123-pod1",
+                "ownerReferences": [{"kind": "ReplicaSet", "name": "metrics-adapter-abc123", "controller": True}],
+            },
+            "status": {"phase": "Running", "containerStatuses": [{"name": "adapter", "imageID": "other"}]},
+        },
+    ]
+    monkeypatch.setattr(capture_module, "_kubectl", lambda *args, **kwargs: json.dumps({"items": resources}))
+
+    result = capture_module.osac_image_ids(Path("/fake/kubeconfig"), "osac-e2e-ci")
+    assert result.image_ids == (
+        "fulfillment/grpc_server=quay.io/osac/my_repository@sha256:abc;"
+        "fulfillment/invalid=unknown;fulfillment/not_started=unknown;fulfillment/side_car=cri-o://sha256:def"
+    )
+    assert result.complete == "false"
+
+
+def test_osac_image_ids_marks_a_missing_replica(*, capture_module: ModuleType, monkeypatch: pytest.MonkeyPatch) -> None:
+    resources = [
+        {
+            "kind": "Deployment",
+            "metadata": {"name": "osac-api", "labels": {"app.kubernetes.io/part-of": "osac"}},
+            "spec": {"replicas": 2, "template": {"spec": {"containers": [{"name": "api"}]}}},
+        },
+        {
+            "kind": "ReplicaSet",
+            "metadata": {
+                "name": "osac-api-abc123",
+                "ownerReferences": [{"kind": "Deployment", "name": "osac-api", "controller": True}],
+            },
+        },
+        {
+            "kind": "Pod",
+            "metadata": {
+                "name": "osac-api-abc123-pod1",
+                "ownerReferences": [{"kind": "ReplicaSet", "name": "osac-api-abc123", "controller": True}],
+            },
+            "status": {
+                "phase": "Running",
+                "containerStatuses": [{"name": "api", "imageID": "quay.io/osac/api@sha256:abc"}],
+            },
+        },
+    ]
+    monkeypatch.setattr(capture_module, "_kubectl", lambda *args, **kwargs: json.dumps({"items": resources}))
+
+    result = capture_module.osac_image_ids(Path("/fake/kubeconfig"), "osac-e2e-ci")
+    assert result.image_ids == "osac-api/api=quay.io/osac/api@sha256:abc;osac-api/api=unknown"
+    assert result.complete == "false"
+
+
+def test_osac_image_ids_bounds_output_and_uses_unknown_fallback(
+    *, capture_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def failing_kubectl(kubeconfig: Path, *arguments: str, stdin: str | None = None) -> str:
+        raise subprocess.CalledProcessError(1, "kubectl")
+
+    monkeypatch.setattr(capture_module, "_kubectl", failing_kubectl)
+    result = capture_module.osac_image_ids(Path("/fake/kubeconfig"), "osac-e2e-ci")
+    assert result.image_ids == "unknown"
+    assert result.complete == "unknown"
+    monkeypatch.setattr(capture_module, "_kubectl", lambda *args, **kwargs: json.dumps({"items": []}))
+    result = capture_module.osac_image_ids(Path("/fake/kubeconfig"), "osac-e2e-ci")
+    assert result.image_ids == "unknown"
+    assert result.complete == "unknown"
+
+    resources = [
+        {
+            "kind": "Deployment",
+            "metadata": {"name": "osac", "labels": {"app.kubernetes.io/part-of": "osac"}},
+            "spec": {
+                "replicas": 1,
+                "template": {"spec": {"containers": [{"name": f"container-{number:03d}"} for number in range(80)]}},
+            },
+        },
+        {
+            "kind": "ReplicaSet",
+            "metadata": {
+                "name": "osac-abc123",
+                "ownerReferences": [{"kind": "Deployment", "name": "osac", "controller": True}],
+            },
+        },
+        {
+            "kind": "Pod",
+            "metadata": {
+                "name": "osac-abc123-pod",
+                "ownerReferences": [{"kind": "ReplicaSet", "name": "osac-abc123", "controller": True}],
+            },
+            "status": {
+                "phase": "Running",
+                "containerStatuses": [
+                    {"name": f"container-{number:03d}", "imageID": f"sha256:{number:064x}"} for number in range(80)
+                ],
+            },
+        },
+    ]
+    monkeypatch.setattr(capture_module, "MAX_OSAC_IMAGE_IDS_LENGTH", 256)
+    monkeypatch.setattr(capture_module, "_kubectl", lambda *args, **kwargs: json.dumps({"items": resources}))
+    result = capture_module.osac_image_ids(Path("/fake/kubeconfig"), "osac-e2e-ci")
+    assert result.image_ids.endswith(capture_module.IMAGE_IDS_TRUNCATION_MARKER)
+    assert result.complete == "false"
+    assert len(result.image_ids) <= 256
+    assert "\n" not in result.image_ids
+
+
+def test_osac_image_ids_degrade_to_unknown_for_hostile_deployment_names(
+    *, capture_module: ModuleType, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Deployment names are DNS-1123 in a real cluster; a hostile API
+    response with an unsafe name must degrade the whole value to
+    "unknown" rather than being rewritten (or breaking the sed/YAML
+    rendering the value crosses in the CI action)."""
+    resources = [
+        {
+            "kind": "Deployment",
+            "metadata": {"name": 'evil${CI_OBSERVE_TEST_REF}|&"', "labels": {"app.kubernetes.io/part-of": "osac"}},
+            "spec": {"replicas": 1, "template": {"spec": {"containers": [{"name": "api"}]}}},
+        }
+    ]
+    monkeypatch.setattr(capture_module, "_kubectl", lambda *args, **kwargs: json.dumps({"items": resources}))
+    result = capture_module.osac_image_ids(Path("/fake/kubeconfig"), "osac-e2e-ci")
+    assert result.image_ids == "unknown"
+    assert result.complete == "unknown"
+
+
+def test_safe_image_part_keeps_underscores_and_drops_rendering_unsafe_characters(*, capture_module: ModuleType) -> None:
+    """Container names carry underscores; image IDs carry colons, slashes,
+    at-signs and digest runs. Everything that would break the manifest's
+    double-quoted env values or the CI action's sed rendering (newline,
+    quote, backslash, pipe, ampersand, dollar) is dropped."""
+    assert capture_module._safe_image_part("grpc_server") == "grpc_server"
+    assert capture_module._safe_image_part("cri-o://quay.io/osac/x@sha256:abc+def-1") == (
+        "cri-o://quay.io/osac/x@sha256:abc+def-1"
+    )
+    assert capture_module._safe_image_part('bad|&"\\$`\nname') == "badname"
+    assert capture_module._safe_image_part(None) == ""
+    assert capture_module._safe_image_part(42) == ""
 
 
 def test_render_manifest_rejects_unresolved_tokens(*, capture_module: ModuleType, tmp_path: Path) -> None:
