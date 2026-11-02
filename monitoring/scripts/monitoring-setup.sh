@@ -573,6 +573,8 @@ if [[ "${MODE}" == "update-central" ]]; then
     # for a script-only change.
     cp "${MONITORING_REPO_DIR}/scripts/workflow-exporter.py" \
        "${MONITORING_HOME}/scripts/workflow-exporter.py"
+    cp "${MONITORING_REPO_DIR}/scripts/ci_observe_run_evidence.py" \
+       "${MONITORING_HOME}/scripts/ci_observe_run_evidence.py"
     info "Config files + scripts updated."
 
     # The prometheus.yml copy above just brought in the repo's template

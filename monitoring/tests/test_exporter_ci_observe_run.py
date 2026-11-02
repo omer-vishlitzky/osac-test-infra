@@ -20,6 +20,7 @@ import pytest
 
 from helpers import FakeResponse, make_job
 
+MONITORING = Path(__file__).resolve().parents[1]
 RUN_ID = 41310072671
 CAPTURE = f"vmaas-main-{RUN_ID}-a1"
 ARTIFACT_NAME = f"osac-logs-full-install-{RUN_ID}"
@@ -780,3 +781,12 @@ def test_query_shape_resolves_against_the_endpoint_response(evidence, github, wf
                 assert column["selector"] in rows[0], (
                     f"{panel['title']}: column {column['selector']} not in the response"
                 )
+
+
+def test_deployment_ships_the_run_evidence_module():
+    """The exporter imports a sibling module, so the container mount and the
+    setup copy must both include it or the deployed service fails on import."""
+    container = (MONITORING / "quadlet" / "workflow-exporter.container").read_text()
+    setup = (MONITORING / "scripts" / "monitoring-setup.sh").read_text()
+    assert "ci_observe_run_evidence.py:/app/ci_observe_run_evidence.py" in container
+    assert "scripts/ci_observe_run_evidence.py" in setup
