@@ -446,12 +446,13 @@ PR_AUTHORS = ("akshay-n", "bella-ops", "carlos-qe", "dana-net", "eitan-dev", "fi
 WG_TEAMS = ("wg-vmaas", "wg-caas", "wg-bmaas", "wg-infra", "wg-connectivity", "wg-ui")
 
 
-def _pr_story(rng, opened):
+def _pr_story(rng, opened, wgs=None):
     """One pull request's way to the merge, as the lifecycle events the
     backfill derives from GitHub: reviews, pushes, approvals for each
     working group, a rebase that dismissed them, the queue and its
     ejections. Returns (events, graph, numbers)."""
-    wgs = rng.choices((0, 1, 2, 3), weights=(1, 10, 5, 2))[0]
+    drawn = rng.choices((0, 1, 2, 3), weights=(1, 10, 5, 2))[0]
+    wgs = drawn if wgs is None else wgs
     teams = rng.sample(WG_TEAMS, wgs)
     any_wg = wgs == 1 and rng.random() < 0.4
     if any_wg:
@@ -552,9 +553,14 @@ def _seed_prs(path, rng, now, days, pr_runs):
     service = prs.CIObservePRs(db_file=str(path))
     service._init_db()
     with service._db() as conn:
-        for number in sorted(pr_runs):
+        for index, number in enumerate(sorted(pr_runs)):
             opened = now - timedelta(days=rng.uniform(1, days), hours=rng.uniform(0, 20))
-            events, graph, story = _pr_story(rng, opened)
+            if index < 5:
+                # The first pull requests cover every working-group count and
+                # a row stored before the lifecycle, mid-window, so each group
+                # of the page has rows whatever the clock says.
+                opened = now - timedelta(days=days / 2, hours=index)
+            events, graph, story = _pr_story(rng, opened, wgs=index if index < 4 else None)
             merged = story["merged"]
             if merged > now:
                 continue
@@ -569,7 +575,8 @@ def _seed_prs(path, rng, now, days, pr_runs):
             suites = {suite for suite, _, _ in runs}
             # A few rows were stored before the lifecycle existed: the page
             # says "not measured yet" for them.
-            legacy = rng.random() < 0.08
+            # Never a recent one: those were stored with the lifecycle.
+            legacy = index == 4 or (opened < now - timedelta(days=days / 2) and rng.random() < 0.15)
             record = {
                 "repo": "osac", "number": number, "title": f"OSAC-{number}: change {number}",
                 "author": rng.choice(PR_AUTHORS),

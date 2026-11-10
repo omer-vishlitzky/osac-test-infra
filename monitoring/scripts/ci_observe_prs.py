@@ -219,7 +219,10 @@ DERIVATION = {
         "keeps no list of a requirement once it is met, so this is read from who approved for whom, not "
         "from CODEOWNERS. maintainers, the parent of the wg-* teams, adds nothing next to a working group; "
         "alone it is one working group, any of them. A team review requested by hand looks the same as a "
-        "code-owner request once the team reviewed."
+        "code-owner request once the team reviewed. Reading the teams needs a token that may read the "
+        "organization's teams (fine-grained: Members, read-only; classic: read:org). Without that, or when "
+        "GitHub reports no team, the teams GitHub asked for a review on the timeline stand in, Waiting for "
+        "another WG is not measured, and the pull request is read again once the token may read teams."
     ),
     "review_rounds": (
         "A review round is one version of the code that got a human review: a review records the commit it "
@@ -279,6 +282,8 @@ PR_STATE_MESSAGES = (
 # Live lookups are read-only and never touch prs.db. The cache lives on the
 # module because the exporter builds a CIObservePRs per request.
 _LIVE_PR_CACHE = {}
+# When the last "GitHub refused the team names" warning was logged.
+_TEAMS_WARNED_AT = [float("-inf")]
 # The index document, built once for the dozens of panels that ask for it
 # together; see CIObservePRs._cached_index.
 INDEX_CACHE_SECONDS = 15
@@ -684,6 +689,9 @@ QUEUE_MERGE_SLACK = timedelta(minutes=5)
 # Commits this close together went up in one push.
 COMMIT_PUSH_GAP = timedelta(minutes=5)
 
+# The fields a token that may not read the organization's teams is refused.
+TEAM_FIELDS = frozenset({"reviews", "onBehalfOf", "reviewRequests", "requestedReviewer"})
+
 # The team whose approval any working group can give: the parent of the
 # wg-* teams. A pull request that needs only this team needs one working
 # group, any of them; next to a specific working group it adds nothing,
@@ -942,9 +950,10 @@ def lifecycle_events(pr, timeline, reviews, commits, graph, attempts):
             add(at, "draft", actor)
         elif kind == "review_requested":
             team = event.get("requested_team") or {}
-            reviewer = team.get("slug") or team.get("name") or _login(event.get("requested_reviewer"))
+            slug = team.get("slug") or team.get("name") or ""
+            reviewer = slug or _login(event.get("requested_reviewer"))
             if reviewer and not reviewer.endswith("[bot]"):
-                add(at, "review_requested", actor, reviewer)
+                add(at, "review_requested", actor, reviewer, team=bool(slug))
         elif kind == "head_ref_force_pushed":
             moment = parse_iso(at)
             if moment is not None:
@@ -1237,18 +1246,47 @@ def lifecycle_facts(events):
     }
 
 
+def requested_teams(events):
+    """The teams GitHub asked for a review, from the REST timeline: the
+    code-owner requests it makes on opening and on later pushes, plus any
+    team requested by hand."""
+    return sorted({event["detail"] for event in events if event["kind"] == "review_requested" and event.get("team")})
+
+
+def code_owner_teams(events, graph):
+    """(teams, source) of one pull request.
+
+    codeowner: the teams GraphQL reports (who approved for which team, the
+    pending code-owner requests); approvals can then be matched to teams.
+    requested: GraphQL reports none, so the team review requests on the
+    timeline stand in. hidden: GitHub refused this token the team fields,
+    so the review requests stand in until a token that may read teams
+    reads the pull request again."""
+    teams = owner_teams(graph)
+    if teams:
+        return teams, "codeowner"
+    requested = requested_teams(events)
+    if teams is None:
+        return requested, "hidden"
+    return (requested, "requested") if requested else ([], "codeowner")
+
+
 def lifecycle_columns(events, end_at, graph):
     """The pr_events lifecycle columns of one pull request and its
     pr_timeline rows. `graph` is the GraphQL answer, or None: then the size
-    and the code-owner teams are NULL ("not measured")."""
-    segments, facts = lifecycle_from_events(events, end_at, required_teams(graph))
-    teams = owner_teams(graph)
+    is NULL ("not measured") and the teams come from the review requests."""
+    teams, source = code_owner_teams(events, graph)
+    # Matching approvals to teams needs to know who reviews for which team,
+    # which only the GraphQL teams tell.
+    required = required_teams(graph) if source == "codeowner" else None
+    segments, facts = lifecycle_from_events(events, end_at, required)
     size = graph or {}
     columns = {
         "files_changed": size.get("changedFiles"),
         "additions": size.get("additions"),
         "deletions": size.get("deletions"),
-        "owner_teams": json.dumps(teams) if teams is not None else None,
+        "owner_teams": json.dumps(teams),
+        "owner_teams_source": source,
         "wgs_required": wgs_required(teams),
         "review_rounds": facts.get("review_rounds"),
         "approval_count": facts.get("approval_count"),
@@ -1324,6 +1362,7 @@ PR_EVENT_ADDED_COLUMNS = (
     ("additions", "INTEGER"),
     ("deletions", "INTEGER"),
     ("owner_teams", "TEXT"),
+    ("owner_teams_source", "TEXT"),
     ("wgs_required", "INTEGER"),
     ("review_rounds", "INTEGER"),
     ("approval_count", "INTEGER"),
@@ -1406,6 +1445,11 @@ class CIObservePRs:
         # pull requests without it and leaves older rows for the next pass,
         # because refetching them could not upgrade them.
         self._graphql_down = False
+        # Pull requests whose code-owner teams GitHub refused this token in
+        # this pass. Once it happens, rows that only lack their teams are
+        # not read again in the same pass: the answer would be the same.
+        self.teams_refused = 0
+        self._teams_only = set()
         self._legacy_refreshes = 0
         # --refresh-old: refetch every older record in this pass, not a
         # bounded number. Each refetched row counts as stored, so a run
@@ -1591,9 +1635,12 @@ class CIObservePRs:
         except ValueError:
             return None, [{"message": "not JSON"}]
         errors = payload.get("errors") or []
-        if errors:
-            logger.warning("GitHub GraphQL errors: %s", str(errors)[:300])
         data = payload.get("data")
+        if errors:
+            # A refused field is reported once per pass by the caller; a
+            # whole answer that failed is worth a line every time.
+            log = logger.warning if data is None else logger.debug
+            log("GitHub GraphQL errors: %s", str(errors)[:300])
         remaining = ((data or {}).get("rateLimit") or {}).get("remaining")
         if remaining is not None:
             self.graphql_remaining = int(remaining)
@@ -1614,6 +1661,7 @@ class CIObservePRs:
         first = None
         after = None
         refused = []
+        refusals = []
         for _ in range(LIFECYCLE_QUERY_MAX_PAGES):
             data, errors = self._graphql(
                 LIFECYCLE_QUERY, {"owner": ORG, "name": repo, "number": number, "after": after}
@@ -1623,8 +1671,11 @@ class CIObservePRs:
             if pull is None or any(not path for path in paths):
                 if data is None:
                     self._graphql_down = True
+                elif errors:
+                    logger.warning("GitHub GraphQL errors for %s#%s: %s", repo, number, str(errors)[:300])
                 return None
             refused += [part for path in paths for part in path if isinstance(part, str)]
+            refusals = refusals or [error.get("message") or "" for error in errors]
             first = first or pull
             items = pull.get("timelineItems") or {}
             nodes.extend(items.get("nodes") or [])
@@ -1634,7 +1685,20 @@ class CIObservePRs:
             after = page["endCursor"]
         graph = dict(first)
         graph["timeline"] = None if "timelineItems" in refused else nodes
-        graph["teams_unknown"] = bool({"reviews", "onBehalfOf", "reviewRequests", "requestedReviewer"} & set(refused))
+        graph["teams_unknown"] = bool(TEAM_FIELDS & set(refused))
+        if graph["teams_unknown"]:
+            self.teams_refused += 1
+            # Once per pass, and at most hourly in the exporter, whose page
+            # views each read an open pull request this way.
+            if self.teams_refused == 1 and time.monotonic() - _TEAMS_WARNED_AT[0] > 3600:
+                _TEAMS_WARNED_AT[0] = time.monotonic()
+                logger.warning(
+                    "GitHub refused this token the code-owner team names (%s). The working groups of the pull "
+                    "requests read now stay 'not measured'; everything else is stored, and the backfill reads "
+                    "them again once the token can read the organization's teams: a fine-grained token needs "
+                    "the organization permission Members: Read-only, a classic token read:org.",
+                    "; ".join(sorted(set(refusals)))[:200],
+                )
         return graph
 
     def _list_repos(self):
@@ -1677,6 +1741,8 @@ class CIObservePRs:
         self.graphql_calls = 0
         self.graphql_remaining = None
         self._graphql_down = False
+        self.teams_refused = 0
+        self._teams_only = set()
         self._legacy_refreshes = 0
 
         cutoff = now - timedelta(days=days)
@@ -1701,6 +1767,7 @@ class CIObservePRs:
             "rate_limit_remaining": None,
             "graphql_calls": 0,
             "graphql_remaining": None,
+            "teams_refused": 0,
             "stopped_early": "",
             "listing_complete": True,
             "ok": True,
@@ -1735,6 +1802,11 @@ class CIObservePRs:
             stored = 0
             stopped = False
             for pr in pending:
+                if self.teams_refused and (repo, pr["number"]) in self._teams_only:
+                    # Listed only to read its teams, which GitHub has just
+                    # refused this token: the next pass tries again.
+                    repo_summary["prs_skipped"] += 1
+                    continue
                 attempts = self._backfill_one(repo, pr, merge_runs)
                 if attempts is None:
                     repo_summary["prs_failed"] += 1
@@ -1791,6 +1863,7 @@ class CIObservePRs:
         summary["rate_limit_remaining"] = self.rate_limit_remaining
         summary["graphql_calls"] = self.graphql_calls
         summary["graphql_remaining"] = self.graphql_remaining
+        summary["teams_refused"] = self.teams_refused
         # ok says the pass stored everything it listed. Coverage advances
         # only when the listing window was read completely, so a pass that
         # stopped early leaves coverage where it was: the pull requests it
@@ -1800,13 +1873,14 @@ class CIObservePRs:
         self._prune_runs(now - timedelta(days=days))
         logger.info(
             "Pull-request backfill (%s): %d stored, %d already present, %d attempts, %d API calls, "
-            "%d GraphQL calls",
+            "%d GraphQL calls, code-owner teams refused for %d",
             resolved_mode,
             summary["prs_stored"],
             summary["prs_skipped"],
             summary["attempts_stored"],
             summary["api_calls"],
             summary["graphql_calls"],
+            summary["teams_refused"],
         )
         return summary
 
@@ -1985,22 +2059,35 @@ class CIObservePRs:
         return [run for run in runs if run.get("event") == "merge_group"]
 
     def _is_stored(self, repo, number):
-        """Whether the pull request is stored in the current record format.
+        """Whether the pull request is stored in the current record format,
+        with its code-owner teams read.
 
-        A row of an older format counts as stored once this pass has spent
-        its LEGACY_REFRESH_PER_PASS refetches, so the upgrade spreads over a
-        few passes instead of draining the shared token in one."""
+        A row of an older format, or one GitHub would not show the teams
+        of, counts as stored once this pass has spent its
+        LEGACY_REFRESH_PER_PASS refetches, so the upgrade spreads over a few
+        passes instead of draining the shared token in one."""
         with self._db() as conn:
             row = conn.execute(
-                "SELECT COALESCE(record_version, 1) FROM pr_events WHERE repo = ? AND number = ?", (repo, number)
+                "SELECT COALESCE(record_version, 1), COALESCE(owner_teams_source, '') IN ('codeowner', 'requested') "
+                "FROM pr_events WHERE repo = ? AND number = ?",
+                (repo, number),
             ).fetchone()
         if row is None:
             return False
-        if row[0] >= RECORD_VERSION:
+        current = row[0] >= RECORD_VERSION
+        if current and row[1]:
+            # Its teams are final: GitHub's, or the review requests because
+            # GitHub reports none. "hidden", or a row stored before the
+            # source was kept, is read again.
             return True
         if self._graphql_down:
             # Refetching it now would store the same older format again.
             return True
+        if current and self.teams_refused:
+            # Only its teams are missing, and GitHub refused them a moment ago.
+            return True
+        if current:
+            self._teams_only.add((repo, number))
         if not self.refresh_old and self._legacy_refreshes >= LEGACY_REFRESH_PER_PASS:
             return True
         self._legacy_refreshes += 1
@@ -3547,7 +3634,7 @@ def _kpis(rows, attempts):
 # How many working groups had to approve: the filter values and the
 # across-PR groups. "3plus" because a "+" in a query string reads as a space.
 WG_GROUPS = (
-    ("0", "No code owner"),
+    ("0", "No working group"),
     ("1", "1 WG"),
     ("2", "2 WGs"),
     ("3plus", "3+ WGs"),
@@ -3724,7 +3811,11 @@ def _monday(moment):
 def _merge_time_heatmap(rows, now, days):
     """Merged pull requests per week of the merge and time to merge. Every
     week of the window is a row, an empty one too, so the weeks stay evenly
-    spaced."""
+    spaced.
+
+    `week_end` is the Monday after the week: Grafana's heatmap draws a
+    pre-bucketed row over the interval that ENDS at its time, so the week's
+    start would draw every week one week early."""
     first = _monday(now - timedelta(days=days))
     weeks = {}
     week = first
@@ -3743,7 +3834,14 @@ def _merge_time_heatmap(rows, now, days):
             if limit is None or seconds < limit:
                 counts[key] += 1
                 break
-    return [{"week": week, **counts} for week, counts in sorted(weeks.items())]
+    return [
+        {
+            "week": week,
+            "week_end": (datetime.strptime(week, "%Y-%m-%d") + timedelta(days=7)).strftime("%Y-%m-%d"),
+            **counts,
+        }
+        for week, counts in sorted(weeks.items())
+    ]
 
 
 def _scatter(rows):
@@ -3859,7 +3957,12 @@ def facts_document(pr):
         wgs = not_yet
     else:
         count = wgs_required(teams)
-        wgs = f"{count} ({wgs_display(teams)})" if count else "none: no code owner"
+        wgs = f"{count} ({wgs_display(teams)})" if count else "none"
+        source = pr.get("owner_teams_source")
+        if source == "requested":
+            wgs += ", from the team review requests"
+        elif source == "hidden":
+            wgs += ", from the team review requests: GitHub does not show this token who approved for which team"
     if pr.get("files_changed") is None:
         size = not_yet
     else:
@@ -3890,10 +3993,10 @@ def facts_document(pr):
     rows = [
         ("Author", pr.get("author") or "unknown"),
         ("Size", size),
-        ("Working groups that had to approve", wgs),
+        ("Working groups to approve", wgs),
         ("Review rounds", count("review_rounds")),
         ("Approvals", count("approval_count")),
-        ("Re-approved after the code changed", reapproved),
+        ("Re-approved after a change", reapproved),
         ("Approvals dismissed", count("approvals_dismissed")),
         ("Force pushes", str(pr.get("force_push_count")) if pr.get("force_push_count") is not None else not_yet),
         ("Base branch merged in", count("merge_commits")),

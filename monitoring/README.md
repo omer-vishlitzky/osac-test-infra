@@ -148,7 +148,10 @@ them — it doesn't block on them):
 1. **GitHub token** for `org-runner-exporter` and `workflow-exporter`: edit
    `~/.monitoring-server/.env`, set `PRIVATE_GITHUB_TOKEN` to a PAT with
    `admin:org` scope. (The automated CI deploy sources this from Vault
-   instead — see below.)
+   instead — see below.) The Pull requests page also reads each pull
+   request's code-owner teams, so the token must be able to read the
+   organization's teams: `admin:org` or `read:org` on a classic token, the
+   organization permission **Members: Read-only** on a fine-grained one.
 2. **Grafana**: place a real TLS cert/key at
    `~/.monitoring-server/certs/grafana.{crt,key}` (Grafana won't start
    without both), and edit `~/.monitoring-server/.env.grafana` with a

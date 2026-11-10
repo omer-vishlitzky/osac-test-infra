@@ -486,7 +486,7 @@
       "type": "stat",
       "id": 116,
       "title": "Review to approval",
-      "description": "Median time from the first human review to the first approval. Population: pull requests merged in the selected repository, author and working groups. Time: merged in the last $days days (the Window above). Unit: duration.",
+      "description": "Median time from the first human review to the first approval. Zero when the first review is the approval, as it is for most pull requests. Population: pull requests merged in the selected repository, author and working groups. Time: merged in the last $days days (the Window above). Unit: duration.",
       "gridPos": {
         "x": 12,
         "y": 1,
@@ -2749,6 +2749,7 @@
     },
     {
       "type": "xychart",
+      "pluginVersion": "13.2.4",
       "id": 150,
       "title": "Every merged pull request: time to merge",
       "description": "One dot per merged pull request: when it merged, across, and how long it took from opening to merge, up, on a log scale (each line is ten times the one below). The color is how many working groups had to approve it. Hover a dot for the pull request; click it to open it below. Population: merged pull requests in the selected repository, author and working groups. Time: merged in the last $days days (the Window above). Unit: hours.",
@@ -3002,7 +3003,7 @@
               }
             },
             "name": {
-              "fixed": "No code owner"
+              "fixed": "No working group"
             }
           },
           {
@@ -3381,7 +3382,7 @@
       "type": "heatmap",
       "id": 151,
       "title": "Time to merge, week by week",
-      "description": "Each column is a week of merges, each cell the pull requests merged that week whose time from opening to merge falls in that band, the fastest at the bottom; the darker, the more. A column whose cells climb is a week of slower merges. Population: merged pull requests in the selected repository, author and working groups. Time: one column per week of the merge (the Monday), last $days days. Unit: count of pull requests.",
+      "description": "Each column is a week of merges, Monday to Monday, each cell the pull requests merged that week whose time from opening to merge falls in that band, the fastest at the bottom; the darker, the more. A column whose cells climb is a week of slower merges. Population: merged pull requests in the selected repository, author and working groups. Time: one column per week of the merge (the Monday), last $days days. Unit: count of pull requests.",
       "gridPos": {
         "x": 16,
         "y": 19,
@@ -3465,8 +3466,8 @@
           "root_selector": "merge_time_heatmap",
           "columns": [
             {
-              "selector": "week",
-              "text": "week",
+              "selector": "week_end",
+              "text": "week_end",
               "type": "timestamp"
             },
             {
@@ -3507,7 +3508,7 @@
       "type": "barchart",
       "id": 152,
       "title": "Where the time goes, by working groups to approve",
-      "description": "The average time a merged pull request spent in each state, by how many working groups had to approve it. A bar is the average time from opening to merge and its parts add up to it. Waiting for another WG runs from the first working group's approval to the last one's. The label counts the pull requests. Population: merged pull requests read with the lifecycle, in the selected repository, author and working groups. Time: merged in the last $days days (the Window above). Unit: duration.",
+      "description": "The average time a merged pull request spent in each state, by how many working groups had to approve it (the team review requests when the token may not read teams). A bar is the average time from opening to merge and its parts add up to it. Waiting for another WG runs from the first working group's approval to the last one's. The label counts the pull requests. Population: merged pull requests read with the lifecycle, in the selected repository, author and working groups. Time: merged in the last $days days (the Window above). Unit: duration.",
       "gridPos": {
         "x": 0,
         "y": 30,
@@ -4217,7 +4218,7 @@
       "type": "barchart",
       "id": 156,
       "title": "Working groups that had to approve",
-      "description": "How many working groups (code-owner teams) had to approve a pull request, as GitHub reports them. Population: merged pull requests read with the lifecycle, in the selected repository, author and working groups. Time: merged in the last $days days (the Window above). Unit: count of pull requests.",
+      "description": "How many working groups (code-owner teams) had to approve a pull request, as GitHub reports them (the team review requests when the token may not read teams). None: no team owns what it changed. Population: merged pull requests read with the lifecycle, in the selected repository, author and working groups. Time: merged in the last $days days (the Window above). Unit: count of pull requests.",
       "gridPos": {
         "x": 16,
         "y": 39,
@@ -5013,7 +5014,7 @@
               },
               {
                 "id": "custom.width",
-                "value": 70
+                "value": 82
               },
               {
                 "id": "noValue",
@@ -5033,7 +5034,7 @@
               },
               {
                 "id": "custom.width",
-                "value": 95
+                "value": 112
               },
               {
                 "id": "noValue",
@@ -8050,7 +8051,7 @@
         "label": "Working groups to approve",
         "type": "custom",
         "hide": 0,
-        "query": "Any : all,No code owner : 0,1 WG : 1,2 WGs : 2,3+ WGs : 3plus",
+        "query": "Any : all,No working group : 0,1 WG : 1,2 WGs : 2,3+ WGs : 3plus",
         "options": [
           {
             "text": "Any",
@@ -8058,7 +8059,7 @@
             "selected": true
           },
           {
-            "text": "No code owner",
+            "text": "No working group",
             "value": "0",
             "selected": false
           },
@@ -8086,7 +8087,7 @@
         "includeAll": false,
         "multi": false,
         "refresh": 0,
-        "description": "The pull requests that needed this many working groups (code-owner teams) to approve, as GitHub reports them. A pull request stored before the lifecycle existed has no count yet and shows under Any only."
+        "description": "The pull requests that needed this many working groups (code-owner teams) to approve, as GitHub reports them (the team review requests when the token may not read teams). A pull request stored before the lifecycle existed has no count yet and shows under Any only."
       },
       {
         "name": "pr_number",

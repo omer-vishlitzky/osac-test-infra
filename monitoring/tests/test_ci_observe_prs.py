@@ -107,6 +107,29 @@ class FakeAPI:
         return self.github.post(url, body)
 
 
+def refused_teams_response(graph, remaining=4990):
+    """The answer to a token that may not read the organization's teams:
+    every team null, one FORBIDDEN error per team, the rest of the data."""
+    reviews = [{**node, "onBehalfOf": {"nodes": [None for _ in (node.get("onBehalfOf") or {}).get("nodes") or []]}}
+               for node in graph["reviews"]["nodes"]]
+    requests_ = [{**node, "requestedReviewer": None} for node in graph["reviewRequests"]["nodes"]]
+    errors = [
+        {"type": "FORBIDDEN", "message": "Resource not accessible by personal access token",
+         "path": ["repository", "pullRequest", "reviews", "nodes", index, "onBehalfOf", "nodes", 0]}
+        for index, node in enumerate(graph["reviews"]["nodes"]) if (node.get("onBehalfOf") or {}).get("nodes")
+    ] + [
+        {"type": "FORBIDDEN", "message": "Resource not accessible by personal access token",
+         "path": ["repository", "pullRequest", "reviewRequests", "nodes", index, "requestedReviewer"]}
+        for index, _ in enumerate(graph["reviewRequests"]["nodes"])
+    ]
+    pull = {**graph, "reviews": {"nodes": reviews}, "reviewRequests": {"nodes": requests_}}
+    return FakeResponse(payload={
+        "data": {"rateLimit": {"cost": 1, "remaining": remaining}, "repository": {"pullRequest": pull}},
+        "errors": errors or [{"type": "FORBIDDEN", "message": "Resource not accessible by personal access token",
+                              "path": ["repository", "pullRequest", "reviews", "nodes", 0, "onBehalfOf"]}],
+    })
+
+
 def graphql_response(graph, remaining=4990):
     """The GraphQL answer for one pull request, as GitHub wraps it."""
     return FakeResponse(
@@ -2107,6 +2130,17 @@ class TestLifecycle:
         assert (prs.wgs_required([]), prs.wgs_display([])) == (0, "none")
         assert prs.required_teams(load_fixture(LIFECYCLE)["graph"]) == {"wg-caas", "wg-vmaas"}
 
+    def test_the_teams_come_from_github_then_from_the_review_requests(self, prs):
+        events = lifecycle_of(prs)
+        graph = load_fixture(LIFECYCLE)["graph"]
+        assert prs.requested_teams(events) == ["wg-caas", "wg-vmaas"], "team requests, not people"
+        assert prs.code_owner_teams(events, graph) == (["maintainers", "wg-caas", "wg-vmaas"], "codeowner")
+        assert prs.code_owner_teams(events, {**graph, "teams_unknown": True}) == (["wg-caas", "wg-vmaas"], "hidden")
+        assert prs.code_owner_teams(events, None) == (["wg-caas", "wg-vmaas"], "hidden")
+        no_teams = {**graph, "reviews": {"nodes": []}, "reviewRequests": {"nodes": []}}
+        assert prs.code_owner_teams(events, no_teams) == (["wg-caas", "wg-vmaas"], "requested")
+        assert prs.code_owner_teams([], no_teams) == ([], "codeowner"), "no team at all: none"
+
     def test_the_wgs_filter_reads_the_plus_however_it_arrives(self, prs):
         assert [prs.wgs_filter(value) for value in ("", "all", "$__all", "0", "1", "2", "3", "3+", "3plus", "x")] == [
             "", "", "", "0", "1", "2", "3plus", "3plus", "3plus", "",
@@ -2183,9 +2217,9 @@ class TestLifecycleStored:
         }
         facts = {row["fact"]: row["value"] for row in doc["facts"]}
         assert facts["Size"] == "7 files, +240 -31 lines"
-        assert facts["Working groups that had to approve"] == "2 (wg-caas, wg-vmaas)"
+        assert facts["Working groups to approve"] == "2 (wg-caas, wg-vmaas)"
         assert facts["Review rounds"] == "5"
-        assert facts["Re-approved after the code changed"] == "2 (2 after a rebase); the longest took 30m"
+        assert facts["Re-approved after a change"] == "2 (2 after a rebase); the longest took 30m"
         assert facts["Merge queue"] == "2 entries, removed once (failed checks)"
         assert facts["Merge when ready"] == "used"
         assert facts["Last approval to the queue"] == "5m"
@@ -2202,7 +2236,7 @@ class TestLifecycleStored:
         assert doc["lifecycle"] == [] and doc["events"] == []
         facts = {row["fact"]: row["value"] for row in doc["facts"]}
         assert facts["Review rounds"].startswith("not measured yet")
-        assert facts["Working groups that had to approve"].startswith("not measured yet")
+        assert facts["Working groups to approve"].startswith("not measured yet")
         assert any("stored before the lifecycle" in note for note in doc["notes"])
 
     def test_a_failed_graphql_answer_stores_the_older_format_and_retries(self, prs, lifecycle_service,
@@ -2212,28 +2246,68 @@ class TestLifecycleStored:
         assert summary["prs_stored"] == 1
         row = pr_row(lifecycle_service, 104)
         assert row["record_version"] == prs.COUNTS_RECORD_VERSION, "read again by a later pass"
-        assert row["wgs_required"] is None and row["files_changed"] is None, "not measured, not zero"
-        # The REST history still gives the lifecycle, without the queue.
+        assert row["files_changed"] is None, "not measured, not zero"
+        # The REST history still gives the lifecycle, without the queue, and
+        # the working groups from the team review requests.
         assert json.loads(row["lifecycle"])[0]["state"] == "draft"
+        assert (row["wgs_required"], row["owner_teams_source"]) == (2, "hidden")
         lifecycle_github.add_graphql(REPO, 104, graphql_response(load_fixture(LIFECYCLE)["graph"]))
         run_backfill(lifecycle_service)
         row = pr_row(lifecycle_service, 104)
         assert (row["record_version"], row["wgs_required"]) == (prs.RECORD_VERSION, 2)
 
-    def test_a_refused_team_field_leaves_the_working_groups_unknown(self, prs, lifecycle_service,
-                                                                   lifecycle_github):
+    def test_refused_teams_fall_back_to_the_team_review_requests(self, prs, lifecycle_service,
+                                                                 lifecycle_github, caplog):
         graph = load_fixture(LIFECYCLE)["graph"]
-        refused = {**graph, "reviews": {"nodes": [{**node, "onBehalfOf": None} for node in graph["reviews"]["nodes"]]}}
-        lifecycle_github.add_graphql(REPO, 104, FakeResponse(payload={
-            "data": {"rateLimit": {"cost": 1, "remaining": 4000}, "repository": {"pullRequest": refused}},
-            "errors": [{"type": "FORBIDDEN", "message": "Resource not accessible by integration",
-                        "path": ["repository", "pullRequest", "reviews", "nodes", 0, "onBehalfOf"]}],
-        }))
-        run_backfill(lifecycle_service)
+        lifecycle_github.add_graphql(REPO, 104, refused_teams_response(graph))
+        prs._TEAMS_WARNED_AT[0] = float("-inf")
+        with caplog.at_level("WARNING", logger=prs.logger.name):
+            summary = run_backfill(lifecycle_service)
+        assert summary["teams_refused"] == 1
+        refusals = [record for record in caplog.records if "code-owner team names" in record.getMessage()]
+        assert len(refusals) == 1 and "Members: Read-only" in refusals[0].getMessage()
+        assert not [record for record in caplog.records if record.getMessage().startswith("GitHub GraphQL errors")], (
+            "a refused field is one explained line, not the raw errors"
+        )
         row = pr_row(lifecycle_service, 104)
-        assert row["record_version"] == prs.RECORD_VERSION, "a refusal is the token's scope: reading again won't help"
-        assert row["wgs_required"] is None and row["owner_teams"] is None, "unknown, not 'no code owner'"
+        assert row["record_version"] == prs.RECORD_VERSION
+        # The REST timeline's team review requests stand in: wg-vmaas and
+        # wg-caas, the two CODEOWNERS asked for.
+        assert json.loads(row["owner_teams"]) == ["wg-caas", "wg-vmaas"]
+        assert (row["wgs_required"], row["owner_teams_source"]) == (2, "hidden")
+        # Who approved for which team is what GitHub hid: no partial state.
+        assert "partly_approved" not in {segment["state"] for segment in json.loads(row["lifecycle"])}
         assert (row["files_changed"], row["queue_entries"], row["auto_merge"]) == (7, 2, 1), "the rest is kept"
+        facts = {fact["fact"]: fact["value"] for fact in lifecycle_service.get_json(
+            {"number": ["104"], "repo": [REPO]})["facts"]}
+        assert facts["Working groups to approve"].startswith("2 (wg-caas, wg-vmaas), from the team review requests")
+
+        # Still refused: read again once per pass, then left alone.
+        assert run_backfill(lifecycle_service)["prs_stored"] == 1
+        # The token can read teams now: the working groups fill in.
+        lifecycle_github.add_graphql(REPO, 104, graphql_response(graph))
+        assert run_backfill(lifecycle_service)["prs_stored"] == 1
+        row = pr_row(lifecycle_service, 104)
+        assert (row["wgs_required"], row["owner_teams_source"]) == (2, "codeowner")
+        assert "partly_approved" in {segment["state"] for segment in json.loads(row["lifecycle"])}
+        assert run_backfill(lifecycle_service)["prs_stored"] == 0, "complete now: skipped"
+
+    def test_one_refusal_spares_the_other_rows_of_the_pass(self, prs, service, github):
+        for name in ("merged_pr", "ejected_pr", "closed_pr"):
+            created = datetime.fromisoformat(load_fixture(name)["pr"]["created_at"].replace("Z", "+00:00"))
+            github.add(runs_window_path(created, NOW), FakeResponse(
+                payload={"total_count": 7, "workflow_runs": load_fixture("merge_group_runs")["runs"]}))
+        run_backfill(service)
+        with sqlite3.connect(service.db_file) as conn:
+            # Stored before the teams' source was kept.
+            conn.execute("UPDATE pr_events SET owner_teams_source = NULL")
+        for name in ("merged_pr", "ejected_pr", "closed_pr"):
+            fixture = load_fixture(name)
+            github.add_graphql(REPO, fixture["pr"]["number"], refused_teams_response(fixture["graph"]))
+        summary = run_backfill(service)
+        assert (summary["prs_stored"], summary["prs_skipped"], summary["teams_refused"]) == (1, 2, 1), (
+            "the first refusal says the token cannot read teams; the rest wait for a pass that can"
+        )
 
     def test_refused_queue_events_fall_back_to_the_runs(self, prs):
         graph = {**load_fixture(LIFECYCLE)["graph"], "timeline": None}
@@ -2317,7 +2391,7 @@ class TestLifecycleStored:
         assert last.endswith("Approved, not queued")
         assert chart[last] == round((NOW - datetime(2026, 10, 5, 15, 10, tzinfo=UTC)).total_seconds())
         assert doc["events"][-1]["what"] == "Approved"
-        assert {row["fact"]: row["value"] for row in doc["facts"]}["Working groups that had to approve"] == (
+        assert {row["fact"]: row["value"] for row in doc["facts"]}["Working groups to approve"] == (
             "2 (wg-caas, wg-vmaas)"
         )
 
@@ -2364,7 +2438,7 @@ class TestAcrossPullRequests:
         assert doc["scatter_wg0"] == doc["scatter_wg3plus"] == doc["scatter_unknown"] == []
         by_wgs = {row["group"]: row for row in doc["time_by_wgs"]}
         assert by_wgs["2 WGs · 1 PR"]["partly_approved"] == 7800
-        assert by_wgs["No code owner · 0 PRs"]["draft"] is None, "no pull request is not zero"
+        assert by_wgs["No working group · 0 PRs"]["draft"] is None, "no pull request is not zero"
         assert doc["time_by_files"][0]["group"].startswith("up to 2 files")
         assert doc["rounds_histogram"] == [
             {"bucket": "0", "prs": 0}, {"bucket": "1", "prs": 2}, {"bucket": "2", "prs": 0},
@@ -2372,13 +2446,15 @@ class TestAcrossPullRequests:
         ]
         assert [row["prs"] for row in doc["queue_histogram"]] == [0, 0, 2, 1, 0]
         assert doc["wgs_histogram"] == [
-            {"bucket": "No code owner", "prs": 0}, {"bucket": "1 WG", "prs": 2},
+            {"bucket": "No working group", "prs": 0}, {"bucket": "1 WG", "prs": 2},
             {"bucket": "2 WGs", "prs": 1}, {"bucket": "3+ WGs", "prs": 0},
         ]
         weeks = [row["week"] for row in doc["merge_time_heatmap"]]
         assert weeks == sorted(weeks) and len(weeks) == 5, "every week of the window, the empty ones too"
         merged_week = next(row for row in doc["merge_time_heatmap"] if row["week"] == "2026-10-05")
         assert merged_week["h4_24"] == 1, "#104 took 8 hours"
+        # Grafana draws a heatmap row over the interval ending at its time.
+        assert merged_week["week_end"] == "2026-10-12"
         slowest = doc["lifecycles"]
         assert slowest[0]["pull_request"].startswith("#104 ")
         assert slowest[0]["partly_approved_1"] == 7200 and slowest[0]["partly_approved_2"] == 600

@@ -503,8 +503,11 @@ def test_every_merged_pull_request_is_a_dot_colored_by_working_groups() -> None:
     assert chart["options"]["mapping"] == "manual"
     assert [item["frame"]["matcher"] for item in series] == [{"id": "byIndex", "options": index} for index in range(5)]
     assert [item["name"]["fixed"] for item in series] == [
-        "No code owner", "1 WG", "2 WGs", "3 or more WGs", "Not measured yet",
+        "No working group", "1 WG", "2 WGs", "3 or more WGs", "Not measured yet",
     ]
+    # Without a pluginVersion of 11.1 or later Grafana migrates the options
+    # as the old XY chart's, and the series lose their fields: "No data".
+    assert float(chart["pluginVersion"].rsplit(".", 1)[0]) >= 11.1
     assert {item["x"]["matcher"]["options"] for item in series} == {"merged_at"}
     assert {target["columns"][0]["type"] for target in chart["targets"]} == {"timestamp"}, "a time axis"
     assert {item["y"]["matcher"]["options"] for item in series} == {"hours"}
@@ -524,7 +527,9 @@ def test_time_to_merge_per_week_is_a_heatmap_of_bands() -> None:
     assert chart["options"]["calculate"] is False
     target = chart["targets"][0]
     assert target["root_selector"] == "merge_time_heatmap"
-    assert target["columns"][0] == {"selector": "week", "text": "week", "type": "timestamp"}
+    # A pre-bucketed heatmap row is drawn over the interval that ends at
+    # its time: the column is the week's end.
+    assert target["columns"][0] == {"selector": "week_end", "text": "week_end", "type": "timestamp"}
     assert [column["selector"] for column in target["columns"][1:]] == [
         "under_1h", "h1_4", "h4_24", "d1_3", "d3_7", "d7_plus",
     ]
