@@ -2,7 +2,11 @@
 # vcluster-run-setup.sh -- set up one OSAC E2E run inside a vcluster on a
 # shared outer OpenShift cluster.
 #
-# v0 scope: a single run, no run-ID prefixing of shared-service objects.
+# Every shared-service object the run touches is named after the run: the
+# KafkaUsers, their Strimzi secrets, the Keycloak realm and the AAP service
+# account all start with the run name, so two runs on one outer cluster do
+# not collide. scripts/vcluster-run-teardown.sh removes exactly these
+# objects again.
 #
 # The script:
 #   1. checks every precondition against the outer cluster and fails loudly;
@@ -12,41 +16,55 @@
 #   4. installs cert-manager inside the vcluster and copies the shared CI
 #      certificate authority into it, so the osac chart can issue the
 #      database client certificates itself;
-#   5. creates the fulfillment and metering KafkaUsers in the outer
-#      cluster's Kafka, waits for Strimzi to generate their secrets, and
-#      copies them into the vcluster (the fulfillment connection secret into
-#      osac, the metering secrets into an osac-kafka namespace the pods'
-#      initContainers read by local API);
-#   6. copies the outer-cluster secrets the OSAC chart expects to find in the
-#      vcluster's osac namespace;
-#   7. prints the `make install-osac` command that installs OSAC into the
-#      vcluster, plus the path of the vcluster kubeconfig.
+#   5. creates the run's KafkaUsers in the outer cluster's Kafka with
+#      run-prefixed names and ACL prefixes, waits for Strimzi to generate
+#      their secrets, and copies them into the vcluster (the fulfillment
+#      connection secret into osac, the metering secrets into an osac-kafka
+#      namespace the pods' initContainers read by local API);
+#   6. imports the run's Keycloak realm from the monorepo's realm.json
+#      through the outer Keycloak's admin API (realm renamed to the run,
+#      placeholders resolved, top-level id dropped), sets the fixture users'
+#      passwords, and writes the controller and UI client credentials into
+#      the vcluster;
+#   7. creates an AAP service account with cluster-admin in the vcluster
+#      and stores its one-year token as a secret in the vcluster, so the
+#      shared AAP can launch the run's job pods inside the vcluster;
+#   8. copies the AAP admin password and the shared CA bundle into the
+#      vcluster;
+#   9. writes the per-run values overlay for `make install-osac` and prints
+#      the command, plus the path of the vcluster kubeconfig.
 #
 # Usage:
-#   KUBECONFIG=/path/to/outer-kubeconfig ./scripts/vcluster-run-setup.sh RUN_NAME [options]
+#   KUBECONFIG=/path/to/outer-kubeconfig \
+#       ./scripts/vcluster-run-setup.sh RUN_NAME --realm-json PATH [options]
 #
 # Options:
+#   --realm-json PATH           realm.json from the PR's osac monorepo
+#                               checkout (required): the run imports the
+#                               PR's realm, so a PR that changes realm.json
+#                               is tested like any other change
 #   --recreate                  replace an existing vcluster release
 #   --output-dir PATH           where to write the run's files
 #                               (default: <repo>/.vcluster-runs/RUN_NAME)
+#   --keycloak-url URL          outer Keycloak base URL (default:
+#                               https://keycloak.keycloak.svc.cluster.local,
+#                               verified with the CI certificate authority)
 #   --aap-instance NAME         shared AAP instance name (default: osac-aap)
 #   --aap-namespace NAMESPACE   namespace of the shared AAP instance
 #                               (default: osac)
-#   --aap-controller-url URL    external AAP controller URL; by default the
-#                               script reads the AAP route named
-#                               <aap-instance> in <aap-namespace>
 #   -h, --help                  show this help
 #
 # Environment:
 #   KUBECONFIG                  kubeconfig of the outer cluster (required)
 #
-# The run name becomes the vcluster name and its namespace vc-<run name> in
-# the outer cluster. Keep it at most 12 characters, lowercase letters and
-# digits: generated names add prefixes to it and must stay within the
-# 63-character DNS label limit.
+# The run name becomes the vcluster name, its namespace vc-<run name> in the
+# outer cluster, and the prefix of every shared-service object the run
+# touches. Keep it at most 12 characters, lowercase letters and digits:
+# generated names add prefixes to it and must stay within the 63-character
+# DNS label limit.
 #
-# See docs/vcluster-run-setup.md for the end-to-end flow and the POC-derived
-# troubleshooting notes.
+# See docs/vcluster-run-setup.md for the end-to-end flow, the run-name
+# table, and the POC-derived troubleshooting notes.
 set -euo pipefail
 
 ###############################################################################
@@ -63,16 +81,33 @@ VCLUSTER_CHART_VERSION="0.36.1"
 VCLUSTER_CHART_REPO="https://charts.loft.sh"
 VCLUSTER_CHART_NAME="vcluster"
 
-# One year in seconds: the 8760h token duration the POC validated.
+# One year in seconds: the 8760h token duration the POC validated. The same
+# duration is used for the AAP service account token, expressed in Go
+# duration syntax for `kubectl create token`.
 VCLUSTER_TOKEN_EXPIRATION_SECONDS=31536000
+AAP_TOKEN_DURATION=8760h
 
 # Outer-cluster namespaces, fixed by `make install-infra PLATFORM=openshift
 # PROFILE=vmaas-ci NS=osac` in the osac monorepo:
 CERT_MANAGER_NAMESPACE="cert-manager" # shared CI certificate authority
-OSAC_SHARED_NAMESPACE="osac"          # controller credentials and the CA bundle
+OSAC_SHARED_NAMESPACE="osac"          # the CA bundle
 KAFKA_NAMESPACE="osac-kafka"          # Strimzi Kafka cluster osac-kafka
+KEYCLOAK_NAMESPACE="keycloak"         # the shared Keycloak and its admin
+                                      # credentials secret
 OUTER_DNS_NAMESPACE="openshift-dns"
 OUTER_DNS_SERVICE="dns-default"
+
+# The Keycloak admin credentials the realm import uses, created by the
+# osac-infra chart (charts/osac-infra/templates/keycloak/resources.yaml).
+KEYCLOAK_ADMIN_CREDENTIALS_SECRET="keycloak-admin-credentials"
+
+# Keycloak's in-cluster service URL. The service certificate's dnsNames
+# include this name and it is signed by the CI certificate authority, so
+# curl verifies it with the copied default-ca ca.crt. The keycloak zone is
+# NOT forwarded into the vcluster, so OSAC itself must keep using the route
+# URL (https://keycloak-keycloak.<domain>); only this script, which runs on
+# the outer cluster's machine, uses the service URL.
+KEYCLOAK_URL_DEFAULT="https://keycloak.keycloak.svc.cluster.local"
 
 # Destination namespace inside the vcluster. The printed make command uses
 # NS=osac, so this is not configurable.
@@ -82,25 +117,27 @@ VCLUSTER_OSAC_NAMESPACE="osac"
 # through the LOCAL API of whatever cluster OSAC runs in: their
 # initContainers read Secrets from metering.kafka.clusterNamespace, which
 # defaults to osac-kafka (osac-metering/charts/osac-metering/templates/
-# _helpers.tpl, osac-metering.kafkaSecretsInitContainer). The vcluster-ci
-# profile sets metering.kafka.strimziResources=false, so the run setup
+# _helpers.tpl, osac-metering.kafkaSecretsInitContainer). The run setup
 # creates the users in the outer cluster and mirrors their secrets into an
-# osac-kafka namespace inside the vcluster, under their natural names.
+# osac-kafka namespace inside the vcluster, under their run-prefixed names.
+# On current osac main the chart still looks the secrets up under their
+# fixed names (osac-metering, osac-metering-echo-adapter); deriving them
+# from global.instanceId lands with the parallel chart work (see the
+# overlay below).
 VCLUSTER_KAFKA_NAMESPACE="osac-kafka"
-METERING_KAFKA_USERS=("osac-metering" "osac-metering-echo-adapter")
 
-# Kafka user and connection secret, copied verbatim from the osac chart
-# contract (osac-installer/charts/osac/templates/_helpers.tpl:
-# osac.fulfillmentKafkaUserName = fulfillment-service,
-# osac.fulfillmentKafkaSecretName = fulfillment-service-kafka,
-# osac.fulfillmentKafkaBrokers = osac-kafka-kafka-bootstrap.osac-kafka.svc:9093).
-KAFKA_USER_NAME="fulfillment-service"
-KAFKA_CONNECTION_SECRET="fulfillment-service-kafka"
+# Kafka brokers, unchanged by the run prefixing: the shared Strimzi cluster
+# itself is not per-run (copied verbatim from the osac chart contract,
+# osac-installer/charts/osac/templates/_helpers.tpl:
+# osac.fulfillmentKafkaBrokers).
 KAFKA_BROKERS="osac-kafka-kafka-bootstrap.osac-kafka.svc:9093"
 
 # Default shared AAP instance, matching aap.aap.instance.name in
-# osac-installer values (vmaas-ci/instance.yaml). Overridable because the
-# outer cluster's AAP placement is not pinned by any chart yet.
+# osac-installer values (vmaas-ci/instance.yaml). The osac-aap chart names
+# the admin-password secret <instance name>-admin-password even with
+# aap.aap.instance.enabled=false, so the run copies the outer cluster's
+# secret under that name. Overridable because the outer cluster's AAP
+# placement is not pinned by any chart yet.
 AAP_INSTANCE_DEFAULT="osac-aap"
 AAP_NAMESPACE_DEFAULT="osac"
 
@@ -114,41 +151,70 @@ OUTER_DOMAIN=""
 ###############################################################################
 
 RUN_NAME=""
+REALM_JSON_SOURCE=""
 RECREATE="false"
 OUTPUT_DIR=""
+KEYCLOAK_URL="${KEYCLOAK_URL_DEFAULT}"
 AAP_INSTANCE="${AAP_INSTANCE_DEFAULT}"
 AAP_NAMESPACE="${AAP_NAMESPACE_DEFAULT}"
-AAP_CONTROLLER_URL=""
+
+# Run-derived names, set in main once RUN_NAME is validated. v0 used fixed
+# chart names; v1 prefixes everything with the run so concurrent runs do
+# not collide.
+KAFKA_USER_NAME=""            # <run>-fulfillment-service
+KAFKA_CONNECTION_SECRET=""    # <run>-fulfillment-service-kafka
+METERING_KAFKA_USERS=()
+EVENT_TOPIC_PREFIX=""         # <run>.events.
+SYSTEM_GROUP_PREFIX=""        # <run>.system.
+HEARTBEAT_TOPIC_PREFIX=""     # <run>.metering.heartbeat.
+DLQ_TOPIC_PREFIX=""           # <run>.metering.dlq.
+INFERENCE_TOPIC=""            # <run>.metering.inference
+INFERENCE_DLQ_TOPIC=""        # <run>.metering.inference.dlq
 
 HOST_NAMESPACE=""
 VCLUSTER_KUBECONFIG=""
 VALUES_FILE=""
+INSTANCE_VALUES_FILE=""
+KEYCLOAK_CA_FILE=""
 
-# Temp directory for secret payloads; removed on exit.
+# Keycloak admin credentials, read from the outer cluster.
+KEYCLOAK_ADMIN_USERNAME=""
+KEYCLOAK_ADMIN_PASSWORD=""
+KEYCLOAK_DEFAULT_USER_PASSWORD=""
+
+# Temp directory for secret payloads; removed on exit. The rendered realm
+# JSON with its resolved client secrets lives here on purpose, never in the
+# run's output directory.
 WORK_DIR="$(mktemp -d)"
 trap 'rm -rf "${WORK_DIR}"' EXIT
 
 usage() {
     cat <<'EOF'
 Usage:
-  KUBECONFIG=/path/to/outer-kubeconfig ./scripts/vcluster-run-setup.sh RUN_NAME [options]
+  KUBECONFIG=/path/to/outer-kubeconfig \
+      ./scripts/vcluster-run-setup.sh RUN_NAME --realm-json PATH [options]
 
 Options:
+  --realm-json PATH           realm.json from the PR's osac monorepo
+                              checkout (required): the run imports the
+                              PR's realm, so a PR that changes realm.json
+                              is tested like any other change
   --recreate                  replace an existing vcluster release
   --output-dir PATH           where to write the run's files
                               (default: <repo>/.vcluster-runs/RUN_NAME)
+  --keycloak-url URL          outer Keycloak base URL (default:
+                              https://keycloak.keycloak.svc.cluster.local,
+                              verified with the CI certificate authority)
   --aap-instance NAME         shared AAP instance name (default: osac-aap)
   --aap-namespace NAMESPACE   namespace of the shared AAP instance
                               (default: osac)
-  --aap-controller-url URL    external AAP controller URL; by default the
-                              script reads the AAP route named
-                              <aap-instance> in <aap-namespace>
   -h, --help                  show this help
 
-The run name becomes the vcluster name and its namespace vc-<run name> in
-the outer cluster. Keep it at most 12 characters, lowercase letters and
-digits: generated names add prefixes to it and must stay within the
-63-character DNS label limit.
+The run name becomes the vcluster name, its namespace vc-<run name> in the
+outer cluster, and the prefix of every shared-service object the run
+touches. Keep it at most 12 characters, lowercase letters and digits:
+generated names add prefixes to it and must stay within the 63-character
+DNS label limit.
 EOF
 }
 
@@ -267,31 +333,56 @@ check_kafka_cluster() {
         || die "Strimzi Kafka cluster osac-kafka is missing in namespace ${KAFKA_NAMESPACE}. The KafkaUsers this script creates would never become ready."
 }
 
-# Resolve the shared AAP controller URL from its OpenShift route, unless the
-# caller passed one. The AAP operator names the platform gateway route after
-# the AnsibleAutomationPlatform CR.
-resolve_aap_controller_url() {
-    if [[ -n "${AAP_CONTROLLER_URL}" ]]; then
-        case "${AAP_CONTROLLER_URL}" in
-            https://*) ;;
-            http://*) die "--aap-controller-url must use https://." ;;
-            *) AAP_CONTROLLER_URL="https://${AAP_CONTROLLER_URL}" ;;
-        esac
-        return
-    fi
-    local route_host
-    route_host="$(kubectl --namespace "${AAP_NAMESPACE}" get route "${AAP_INSTANCE}" -o jsonpath='{.spec.host}')" \
-        || die "Cannot read route ${AAP_INSTANCE} in namespace ${AAP_NAMESPACE}. Pass --aap-controller-url, or fix --aap-instance/--aap-namespace."
-    [[ -n "${route_host}" ]] \
-        || die "Route ${AAP_INSTANCE} in namespace ${AAP_NAMESPACE} has no host. Pass --aap-controller-url."
-    AAP_CONTROLLER_URL="https://${route_host}"
-    echo "Shared AAP controller URL is ${AAP_CONTROLLER_URL} (route ${AAP_INSTANCE} in ${AAP_NAMESPACE})."
+read_keycloak_admin_credentials() {
+    KEYCLOAK_ADMIN_USERNAME="$(read_secret_key "${KEYCLOAK_NAMESPACE}" \
+        "${KEYCLOAK_ADMIN_CREDENTIALS_SECRET}" admin-username | base64 -d)"
+    [[ -n "${KEYCLOAK_ADMIN_USERNAME}" ]] \
+        || die "Key admin-username of secret ${KEYCLOAK_ADMIN_CREDENTIALS_SECRET} in ${KEYCLOAK_NAMESPACE} is empty."
+    KEYCLOAK_ADMIN_PASSWORD="$(read_secret_key "${KEYCLOAK_NAMESPACE}" \
+        "${KEYCLOAK_ADMIN_CREDENTIALS_SECRET}" admin-password | base64 -d)"
+    [[ -n "${KEYCLOAK_ADMIN_PASSWORD}" ]] \
+        || die "Key admin-password of secret ${KEYCLOAK_ADMIN_CREDENTIALS_SECRET} in ${KEYCLOAK_NAMESPACE} is empty."
+    KEYCLOAK_DEFAULT_USER_PASSWORD="$(read_secret_key "${KEYCLOAK_NAMESPACE}" \
+        "${KEYCLOAK_ADMIN_CREDENTIALS_SECRET}" default-user-password | base64 -d)"
+    [[ -n "${KEYCLOAK_DEFAULT_USER_PASSWORD}" ]] \
+        || die "Key default-user-password of secret ${KEYCLOAK_ADMIN_CREDENTIALS_SECRET} in ${KEYCLOAK_NAMESPACE} is empty."
+}
+
+# Copy the CI CA certificate out of the outer cluster once; both the curl
+# calls to Keycloak and the vcluster's cert-manager use it.
+fetch_keycloak_ca() {
+    KEYCLOAK_CA_FILE="${WORK_DIR}/default-ca.ca.crt"
+    read_secret_key "${CERT_MANAGER_NAMESPACE}" default-ca ca.crt | base64 -d >"${KEYCLOAK_CA_FILE}"
+    [[ -s "${KEYCLOAK_CA_FILE}" ]] \
+        || die "Key ca.crt of secret default-ca in ${CERT_MANAGER_NAMESPACE} is empty."
+}
+
+check_keycloak_reachable() {
+    # The service URL's certificate is signed by the CI CA and carries the
+    # service DNS name, so this both proves reachability and proves the CA
+    # copy is the one that signed the running Keycloak's certificate.
+    keycloak_curl -s --fail-with-body -o /dev/null \
+        "${KEYCLOAK_URL}/realms/master" \
+        || die "Cannot reach the outer Keycloak at ${KEYCLOAK_URL} with the CI certificate authority. Is the Keycloak base URL right (see --keycloak-url)?"
+    echo "Outer Keycloak at ${KEYCLOAK_URL} is reachable."
+}
+
+check_realm_json_source() {
+    [[ -n "${REALM_JSON_SOURCE}" ]] \
+        || die "--realm-json is required: point it at the PR's osac-installer/charts/osac-infra/files/realm.json."
+    [[ -f "${REALM_JSON_SOURCE}" ]] \
+        || die "Realm source ${REALM_JSON_SOURCE} is not a file. Point --realm-json at the PR's osac-installer/charts/osac-infra/files/realm.json."
+    python3 -c "import json,sys; json.load(open(sys.argv[1]))" "${REALM_JSON_SOURCE}" \
+        || die "Realm source ${REALM_JSON_SOURCE} is not valid JSON."
 }
 
 check_all_preconditions() {
     require_command kubectl
     require_command helm
     require_command vcluster
+    require_command curl
+    require_command python3
+    require_command openssl
 
     [[ -n "${KUBECONFIG:-}" ]] \
         || die "KUBECONFIG is not set. Point it at the outer cluster's kubeconfig."
@@ -302,6 +393,7 @@ check_all_preconditions() {
     kubectl get --raw /readyz \
         || die "Cannot reach the outer cluster with KUBECONFIG=${KUBECONFIG}."
 
+    check_realm_json_source
     check_release_absent
     read_namespace_uid_range
     read_outer_dns_ip
@@ -316,22 +408,24 @@ check_all_preconditions() {
     # osac-installer/charts/osac-infra/templates/ca-issuer.yaml.
     check_secret_keys "${CERT_MANAGER_NAMESPACE}" default-ca tls.crt tls.key ca.crt
 
-    # AAP admin password, created by the AAP operator for instance
-    # ${AAP_INSTANCE} (the osac-aap chart reads <instance>-admin-password,
-    # key password, in its bootstrap and create-token jobs).
-    check_secret_keys "${AAP_NAMESPACE}" "${AAP_INSTANCE}-admin-password" password
+    # The Keycloak admin credentials the realm import and the fixture-user
+    # password reset use (mirroring what the osac-infra chart feeds its own
+    # resolve-realm-secrets and keycloak-set-passwords hooks).
+    check_secret_keys "${KEYCLOAK_NAMESPACE}" "${KEYCLOAK_ADMIN_CREDENTIALS_SECRET}" \
+        admin-username admin-password default-user-password
 
-    # Keycloak client credentials for the fulfillment controller, created by
-    # the osac-infra create-controller-credentials hook in osacNamespace
-    # (osac-installer/charts/osac-infra/files/hooks/create-controller-credentials.sh).
-    check_secret_keys "${OSAC_SHARED_NAMESPACE}" fulfillment-controller-credentials client-id client-secret
-    check_secret_keys "${OSAC_SHARED_NAMESPACE}" osac-ui-backend-credentials client-id client-secret
+    # AAP admin password, created by the AAP operator for instance
+    # ${AAP_INSTANCE}; the osac-aap chart reads <instance>-admin-password,
+    # key password, in its bootstrap and create-token jobs.
+    check_secret_keys "${AAP_NAMESPACE}" "${AAP_INSTANCE}-admin-password" password
 
     # Shared CA bundle, written by trust-manager into osacNamespace
     # (osac-installer/charts/osac-infra/files/hooks/apply-ca-bundle.sh).
     check_configmap_keys "${OSAC_SHARED_NAMESPACE}" ca-bundle bundle.pem
 
-    resolve_aap_controller_url
+    read_keycloak_admin_credentials
+    fetch_keycloak_ca
+    check_keycloak_reachable
 }
 
 ###############################################################################
@@ -410,23 +504,25 @@ create_vcluster_namespaces() {
 # Shared-service credentials
 ###############################################################################
 
-# Create the KafkaUsers in the outer cluster, the Strimzi objects the osac
-# and osac-metering charts normally create in-cluster. Copied verbatim from:
+# Create the run's KafkaUsers in the outer cluster, the Strimzi objects the
+# osac and osac-metering charts normally create in-cluster. The ACL shapes
+# are copied from the monorepo's chart templates, with every topic, group
+# and user name prefixed by the run:
 #   - osac-installer/charts/osac/templates/fulfillment-kafka-user.yaml
 #   - osac-metering/charts/osac-metering/templates/kafka-user.yaml
 #   - osac-metering/charts/osac-metering/templates/echo-adapter-kafka-user.yaml
 # as rendered with the charts' default kafka.clusterName/clusterNamespace
-# (osac-kafka / osac-kafka). The vcluster-ci profile sets
-# metering.kafka.strimziResources=false and kafka.enabled=false, so the
-# charts will not create them. v0 keeps the charts' fixed user names and ACL
-# prefixes; run-ID prefixing comes later.
+# (osac-kafka / osac-kafka). On current osac main the fulfillment topic ACL
+# already follows global.eventTopicPrefix; the consumer-group and metering
+# prefixes are chart constants there, and the services' own prefixes follow
+# with the parallel instanceId work.
 create_kafka_users() {
-    kubectl --namespace "${KAFKA_NAMESPACE}" apply -f - <<'EOF'
+    kubectl --namespace "${KAFKA_NAMESPACE}" apply -f - <<EOF
 apiVersion: kafka.strimzi.io/v1
 kind: KafkaUser
 metadata:
-  name: fulfillment-service
-  namespace: osac-kafka
+  name: ${KAFKA_USER_NAME}
+  namespace: ${KAFKA_NAMESPACE}
   labels:
     strimzi.io/cluster: osac-kafka
 spec:
@@ -437,7 +533,7 @@ spec:
     acls:
       - resource:
           type: topic
-          name: osac.events.
+          name: ${EVENT_TOPIC_PREFIX}
           patternType: prefix
         operations:
           - Create
@@ -448,7 +544,7 @@ spec:
         host: "*"
       - resource:
           type: group
-          name: osac.system.
+          name: ${SYSTEM_GROUP_PREFIX}
           patternType: prefix
         operations:
           - Read
@@ -465,8 +561,8 @@ spec:
 apiVersion: kafka.strimzi.io/v1
 kind: KafkaUser
 metadata:
-  name: osac-metering
-  namespace: osac-kafka
+  name: ${METERING_KAFKA_USERS[0]}
+  namespace: ${KAFKA_NAMESPACE}
   labels:
     strimzi.io/cluster: osac-kafka
 spec:
@@ -477,7 +573,7 @@ spec:
     acls:
       - resource:
           type: topic
-          name: osac.events.
+          name: ${EVENT_TOPIC_PREFIX}
           patternType: prefix
         operations:
           - Read
@@ -485,7 +581,7 @@ spec:
         host: "*"
       - resource:
           type: topic
-          name: osac.metering.heartbeat.
+          name: ${HEARTBEAT_TOPIC_PREFIX}
           patternType: prefix
         operations:
           - Create
@@ -496,7 +592,7 @@ spec:
         host: "*"
       - resource:
           type: topic
-          name: osac.metering.dlq.
+          name: ${DLQ_TOPIC_PREFIX}
           patternType: prefix
         operations:
           - Create
@@ -507,8 +603,8 @@ spec:
 apiVersion: kafka.strimzi.io/v1
 kind: KafkaUser
 metadata:
-  name: osac-metering-echo-adapter
-  namespace: osac-kafka
+  name: ${METERING_KAFKA_USERS[1]}
+  namespace: ${KAFKA_NAMESPACE}
   labels:
     strimzi.io/cluster: osac-kafka
 spec:
@@ -519,7 +615,7 @@ spec:
     acls:
       - resource:
           type: topic
-          name: osac.metering.heartbeat.
+          name: ${HEARTBEAT_TOPIC_PREFIX}
           patternType: prefix
         operations:
           - Read
@@ -527,7 +623,7 @@ spec:
         host: "*"
       - resource:
           type: topic
-          name: osac.metering.inference
+          name: ${INFERENCE_TOPIC}
           patternType: literal
         operations:
           - Read
@@ -535,7 +631,7 @@ spec:
         host: "*"
       - resource:
           type: topic
-          name: osac.metering.dlq.
+          name: ${DLQ_TOPIC_PREFIX}
           patternType: prefix
         operations:
           - Write
@@ -543,7 +639,7 @@ spec:
         host: "*"
       - resource:
           type: topic
-          name: osac.metering.inference.dlq
+          name: ${INFERENCE_DLQ_TOPIC}
           patternType: literal
         operations:
           - Write
@@ -551,7 +647,7 @@ spec:
         host: "*"
       - resource:
           type: group
-          name: osac-metering-echo-adapter
+          name: ${METERING_KAFKA_USERS[1]}
           patternType: literal
         operations:
           - Read
@@ -601,8 +697,9 @@ create_kafka_connection_secret() {
 }
 
 # Copy the metering KafkaUsers' Strimzi secrets into the vcluster's
-# osac-kafka namespace under their natural names, so the metering pods'
-# initContainers find them unchanged.
+# osac-kafka namespace under their run-prefixed names, so the metering
+# pods' initContainers find them once the chart derives those names from
+# global.instanceId (parallel osac work; see the overlay).
 copy_metering_kafka_secrets() {
     local kafka_user
     for kafka_user in "${METERING_KAFKA_USERS[@]}"; do
@@ -667,6 +764,20 @@ copy_secret_files() {
     echo "Created secret ${destination_secret} in vcluster namespace ${VCLUSTER_OSAC_NAMESPACE}."
 }
 
+# Create a secret in the vcluster's osac namespace from literal key=value
+# pairs. The password values reach kubectl through the arguments, not the
+# environment or a here-string, so they never appear in a process listing
+# beyond the short-lived kubectl invocation itself.
+create_vcluster_secret_literals() {
+    local destination_secret="$1"
+    shift
+    kubectl --kubeconfig "${VCLUSTER_KUBECONFIG}" --namespace "${VCLUSTER_OSAC_NAMESPACE}" \
+        create secret generic "${destination_secret}" "$@" \
+        --dry-run=client -o yaml \
+        | kubectl --kubeconfig "${VCLUSTER_KUBECONFIG}" apply -f -
+    echo "Created secret ${destination_secret} in vcluster namespace ${VCLUSTER_OSAC_NAMESPACE}."
+}
+
 # Copy a secret from the outer cluster into a vcluster namespace, key for
 # key, keeping every data key (used for Strimzi secrets, whose key set the
 # chart-defined consumers read by name).
@@ -713,23 +824,365 @@ copy_ca_bundle() {
 }
 
 copy_outer_secrets_into_vcluster() {
-    # AAP admin password for the osac-aap subchart's external-instance mode
-    # (bootstrap and create-token read the admin-password secret when
-    # aap.aap.instance.enabled is false). Kept under its outer-cluster name.
+    # AAP admin password for the osac-aap subchart's jobs. The chart derives
+    # the secret name from aap.aap.instance.name even with the instance
+    # disabled (external mode), so the copy keeps the outer instance's name
+    # and the vcluster-ci profile's aap.aap.instance.name must match it.
     copy_secret_files "${AAP_NAMESPACE}" "${AAP_INSTANCE}-admin-password" "${AAP_INSTANCE}-admin-password" password
-
-    # Keycloak client credentials for the fulfillment controller, referenced
-    # by service.auth.controllerCredentials and service.idp.credentials.
-    copy_secret_files "${OSAC_SHARED_NAMESPACE}" fulfillment-controller-credentials fulfillment-controller-credentials client-id client-secret
-
-    # Backend API credentials for the UI, created by the osac-infra chart's
-    # create-ui-backend-credentials hook in the outer cluster; the UI pod in
-    # the vcluster mounts them and stays in CreateContainerConfigError
-    # without them.
-    copy_secret_files "${OSAC_SHARED_NAMESPACE}" osac-ui-backend-credentials osac-ui-backend-credentials client-id client-secret
 
     # Shared CA bundle, referenced by service.certs.caBundle.configMap.
     copy_ca_bundle
+}
+
+###############################################################################
+# Keycloak realm
+###############################################################################
+
+# Every curl to the outer Keycloak verifies TLS with the CI certificate
+# authority the setup copied out of the outer cluster.
+keycloak_curl() {
+    curl --cacert "${KEYCLOAK_CA_FILE}" "$@"
+}
+
+# Escape a string for use inside a JSON string literal: full JSON string
+# escaping (control characters, backslash, quotes) via python3's json.dumps,
+# minus the surrounding quotes. Copied verbatim from
+# osac-installer/charts/osac-infra/files/hooks/resolve-realm-secrets.sh.
+json_escape_string() {
+    python3 -c "import json,sys; print(json.dumps(sys.argv[1])[1:-1])" "$1"
+}
+
+# Escape a string for use in a sed s### replacement: backslash, ampersand
+# and the # delimiter. Copied verbatim from the same hook.
+escape_sed_replacement() {
+    printf '%s' "$1" | sed -e 's/[\&#]/\\&/g'
+}
+
+# Get a fresh admin access token from the outer Keycloak's master realm,
+# the same grant the osac-infra keycloak-set-passwords hook uses.
+keycloak_admin_token() {
+    keycloak_curl -s --fail-with-body -X POST \
+        "${KEYCLOAK_URL}/realms/master/protocol/openid-connect/token" \
+        -H 'Content-Type: application/x-www-form-urlencoded' \
+        -d 'grant_type=password' \
+        -d 'client_id=admin-cli' \
+        --data-urlencode "username=${KEYCLOAK_ADMIN_USERNAME}" \
+        --data-urlencode "password=${KEYCLOAK_ADMIN_PASSWORD}" \
+        | python3 -c "import json,sys; print(json.load(sys.stdin)['access_token'])"
+}
+
+# Render the run's realm JSON: copy the PR's realm.json with the realm
+# renamed to the run and the top-level id dropped, then resolve the seven
+# placeholders. The rename and id drop go through python3's json module so
+# only the top-level realm name changes; every other occurrence of "osac"
+# (client ids, role names, groups) stays as the PR defined it. The id is
+# dropped because Keycloak assigns its own: an id that already belongs to
+# another realm on the same server is rejected on import.
+render_realm_json() {
+    python3 - "${REALM_JSON_SOURCE}" "${WORK_DIR}/realm-renamed.json" "${RUN_NAME}" <<'PYEOF'
+import json
+import sys
+
+source_path, destination_path, run_name = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(source_path) as source:
+    realm = json.load(source)
+realm["realm"] = run_name
+realm.pop("id", None)
+with open(destination_path, "w") as destination:
+    json.dump(realm, destination)
+    destination.write("\n")
+PYEOF
+
+    # Per-run client secrets for the four confidential clients realm.json
+    # defines (osac-controller, osac-admin, osac-ui-backend,
+    # osac-csi-driver), generated exactly like the osac-infra chart's
+    # resolve-realm-secrets hook generates its keycloak-client-secrets:
+    # openssl rand -base64 18 output cannot contain the sed-significant
+    # characters (#, &, backslash), which is why the hook substitutes those
+    # raw while the user-supplied values below get both escaping passes.
+    local controller_secret admin_secret csi_driver_secret ui_backend_secret
+    controller_secret="$(openssl rand -base64 18)"
+    admin_secret="$(openssl rand -base64 18)"
+    csi_driver_secret="$(openssl rand -base64 18)"
+    ui_backend_secret="$(openssl rand -base64 18)"
+
+    # The realm admin user's credentials come from the outer cluster's
+    # keycloak-admin-credentials secret, exactly what the osac-infra chart
+    # feeds its own resolve-realm-secrets hook. They are user-supplied Helm
+    # values upstream and can contain anything, so they get the same two
+    # escaping passes as there: full JSON string escaping first (the raw
+    # value lands inside a JSON string), then sed replacement escaping.
+    sed \
+        -e "s#__OSAC_CONTROLLER_CLIENT_SECRET__#${controller_secret}#" \
+        -e "s#__OSAC_ADMIN_CLIENT_SECRET__#${admin_secret}#" \
+        -e "s#__OSAC_CSI_DRIVER_CLIENT_SECRET__#${csi_driver_secret}#" \
+        -e "s#__OSAC_UI_BACKEND_CLIENT_SECRET__#${ui_backend_secret}#" \
+        -e "s#__OSAC_REALM_ADMIN_USERNAME__#$(escape_sed_replacement "$(json_escape_string "${KEYCLOAK_ADMIN_USERNAME}")")#" \
+        -e "s#__OSAC_REALM_ADMIN_PASSWORD__#$(escape_sed_replacement "$(json_escape_string "${KEYCLOAK_ADMIN_PASSWORD}")")#" \
+        -e "s#__OSAC_UI_URL__#$(escape_sed_replacement "https://osac-ui-${RUN_NAME}.${OUTER_DOMAIN}")#g" \
+        "${WORK_DIR}/realm-renamed.json" >"${WORK_DIR}/realm.json"
+
+    # A placeholder the sed above did not resolve means the PR's realm.json
+    # and this script disagree about the contract; the imported realm would
+    # carry the literal marker as a secret or URL.
+    if grep -n '__OSAC_[A-Z_]*__' "${WORK_DIR}/realm.json"; then
+        die "Rendered realm ${WORK_DIR}/realm.json still contains placeholders; the PR's realm.json defines one this script does not resolve."
+    fi
+
+    # Keep the controller and UI backend secrets for the vcluster copies;
+    # the other two have no consumer in a vcluster run but must still be
+    # resolved inside the realm.
+    printf '%s' "${controller_secret}" >"${WORK_DIR}/controller-client-secret"
+    printf '%s' "${ui_backend_secret}" >"${WORK_DIR}/ui-backend-client-secret"
+    echo "Rendered realm ${RUN_NAME} from ${REALM_JSON_SOURCE}."
+}
+
+# Import the rendered realm through the outer Keycloak's admin API.
+import_keycloak_realm() {
+    local token
+    token="$(keycloak_admin_token)"
+    # Keycloak answers 201 with an empty body; any error body surfaces
+    # because of --fail-with-body.
+    keycloak_curl -s --fail-with-body -X POST "${KEYCLOAK_URL}/admin/realms" \
+        -H "Authorization: Bearer ${token}" \
+        -H 'Content-Type: application/json' \
+        --data-binary "@${WORK_DIR}/realm.json" >/dev/null
+    echo "Imported realm ${RUN_NAME} into the outer Keycloak."
+}
+
+# Wait until the imported realm answers its public discovery endpoint, the
+# same readiness gate the osac-infra keycloak-set-passwords hook uses. The
+# realm must be reachable at the issuer URL the OSAC services will use.
+# --fail makes a 404 (realm not yet served) count as not ready.
+wait_for_keycloak_realm() {
+    local attempt
+    for attempt in $(seq 1 60); do
+        if keycloak_curl -s --fail -o /dev/null "${KEYCLOAK_URL}/realms/${RUN_NAME}"; then
+            echo "Realm ${RUN_NAME} is ready."
+            return 0
+        fi
+        echo "  Waiting for realm ${RUN_NAME} to become ready (attempt ${attempt}/60, 300s total)..."
+        sleep 5
+    done
+    die "Realm ${RUN_NAME} did not become ready within 300s. Check the outer Keycloak's logs."
+}
+
+# Set one realm user's password through the admin API. The payload is built
+# with python3, not string interpolation, so the password can safely
+# contain quotes, backslashes or other JSON-significant characters (the
+# same construction as the keycloak-set-passwords hook's set_password).
+set_realm_user_password() {
+    local username="$1" password="$2"
+    local token user_id payload
+    token="$(keycloak_admin_token)"
+    # exact=true is what makes this precise where the hook's lookup is not:
+    # without it Keycloak matches substrings, so tenant1_admin would also
+    # answer for tenant1.
+    user_id="$(keycloak_curl -s --fail-with-body -G \
+        "${KEYCLOAK_URL}/admin/realms/${RUN_NAME}/users" \
+        -H "Authorization: Bearer ${token}" \
+        --data-urlencode "username=${username}" \
+        --data-urlencode "exact=true" \
+        | python3 -c "import json,sys; users=json.load(sys.stdin); print(users[0]['id'] if users else '')")"
+    [[ -n "${user_id}" ]] \
+        || die "User ${username} is missing from realm ${RUN_NAME}. The realm import did not bring the fixture users."
+    payload="$(python3 -c "import json,sys; print(json.dumps({'type': 'password', 'value': sys.argv[1], 'temporary': False}))" "${password}")"
+    keycloak_curl -s --fail-with-body -X PUT \
+        "${KEYCLOAK_URL}/admin/realms/${RUN_NAME}/users/${user_id}/reset-password" \
+        -H "Authorization: Bearer ${token}" \
+        -H 'Content-Type: application/json' \
+        -d "${payload}" >/dev/null
+    echo "Set password for user ${username} in realm ${RUN_NAME}."
+}
+
+# Set every fixture user's password to the outer cluster's
+# default-user-password, mirroring the osac-infra keycloak-set-passwords
+# hook: the realm import brings the users without credentials, and the e2e
+# suite logs in as them by password (OSAC_JWT_PASSWORD). The user list is
+# derived from the rendered realm, not hardcoded, so a PR that adds a
+# fixture user to realm.json gets its password set too. Service-account
+# users are skipped: they authenticate by client secret, not password.
+set_fixture_user_passwords() {
+    local username
+    while IFS= read -r username; do
+        set_realm_user_password "${username}" "${KEYCLOAK_DEFAULT_USER_PASSWORD}"
+    done < <(python3 - "${WORK_DIR}/realm.json" <<'PYEOF'
+import json
+import sys
+
+with open(sys.argv[1]) as source:
+    realm = json.load(source)
+for user in realm.get("users", []):
+    username = user.get("username", "")
+    if username and not username.startswith("service-account-"):
+        print(username)
+PYEOF
+    )
+}
+
+# Write the per-run Keycloak client credentials into the vcluster, in the
+# shape the osac-infra chart's create-controller-credentials and
+# create-ui-backend-credentials hooks create in a normal install: keys
+# client-id and client-secret. Unlike v0, which copied the outer realm's
+# shared credentials, each run's realm has its own client secrets.
+write_keycloak_credentials_into_vcluster() {
+    local controller_secret ui_backend_secret
+    controller_secret="$(cat "${WORK_DIR}/controller-client-secret")"
+    ui_backend_secret="$(cat "${WORK_DIR}/ui-backend-client-secret")"
+
+    create_vcluster_secret_literals "${RUN_NAME}-fulfillment-controller-credentials" \
+        --from-literal="client-id=osac-controller" \
+        --from-literal="client-secret=${controller_secret}"
+    create_vcluster_secret_literals "${RUN_NAME}-osac-ui-backend-credentials" \
+        --from-literal="client-id=osac-ui-backend" \
+        --from-literal="client-secret=${ui_backend_secret}"
+}
+
+###############################################################################
+# AAP service account
+###############################################################################
+
+# Create the service account the shared AAP uses to launch this run's job
+# pods inside the vcluster, bind it to cluster-admin there, and store a
+# one-year token as the secret the osac chart's aap.vcluster.tokenSecret
+# names. The AAP controller reaches the vcluster API by the service DNS
+# name in aap.vcluster.apiServerUrl (POC-verified).
+create_aap_service_account() {
+    kubectl --kubeconfig "${VCLUSTER_KUBECONFIG}" --namespace "${VCLUSTER_OSAC_NAMESPACE}" \
+        create serviceaccount "${RUN_NAME}-aap" \
+        --dry-run=client -o yaml \
+        | kubectl --kubeconfig "${VCLUSTER_KUBECONFIG}" apply -f -
+
+    kubectl --kubeconfig "${VCLUSTER_KUBECONFIG}" \
+        create clusterrolebinding "${RUN_NAME}-aap" \
+        --clusterrole=cluster-admin \
+        --serviceaccount="${VCLUSTER_OSAC_NAMESPACE}:${RUN_NAME}-aap" \
+        --dry-run=client -o yaml \
+        | kubectl --kubeconfig "${VCLUSTER_KUBECONFIG}" apply -f -
+
+    local aap_token
+    aap_token="$(kubectl --kubeconfig "${VCLUSTER_KUBECONFIG}" \
+        --namespace "${VCLUSTER_OSAC_NAMESPACE}" create token "${RUN_NAME}-aap" \
+        --duration "${AAP_TOKEN_DURATION}")"
+    [[ -n "${aap_token}" ]] \
+        || die "Could not mint a token for service account ${RUN_NAME}-aap in the vcluster."
+
+    create_vcluster_secret_literals "${RUN_NAME}-aap-vcluster-token" \
+        --from-literal="token=${aap_token}"
+}
+
+###############################################################################
+# Per-run values overlay
+###############################################################################
+
+# Write the per-run values overlay the printed `make install-osac` command
+# passes to the osac chart. It carries only what is named after the run;
+# everything every vcluster run shares stays in the vcluster-ci profile.
+#
+# Dependency: global.instanceId and aap.vcluster.* land with the parallel
+# osac chart work; until they do, the umbrella schema (which rejects
+# unknown keys) refuses this overlay. The database secret names
+# (<run>-db-config, <run>-db-client-cert, <run>-db-metering-config,
+# <run>-db-metering-client-cert) follow the same work: the chart derives
+# them today from the fixed prefix "osac" and will derive them from
+# global.instanceId. Do not set aap.organization or aap.templatePrefix
+# here: the chart derives both from global.instanceId.
+write_instance_values() {
+    cat >"${INSTANCE_VALUES_FILE}" <<EOF
+# Per-run values overlay for the osac chart, generated by
+# scripts/vcluster-run-setup.sh for run ${RUN_NAME}. Pass it to
+# 'make install-osac' through EXTRA_HELM_ARGS="--values <this file>".
+#
+# Dependencies (parallel osac work, not on main yet): global.instanceId,
+# aap.vcluster.*, and the instanceId-derived database secret and metering
+# Kafka secret names this overlay references. The umbrella schema rejects
+# unknown keys, so installing with this overlay requires that work.
+global:
+  instanceId: ${RUN_NAME}
+  eventTopicPrefix: "${EVENT_TOPIC_PREFIX}"
+service:
+  auth:
+    issuerUrl: https://keycloak-keycloak.${OUTER_DOMAIN}/realms/${RUN_NAME}
+    controllerCredentials:
+      - secret:
+          name: ${RUN_NAME}-fulfillment-controller-credentials
+          items:
+            - key: client-id
+              param: client-id
+            - key: client-secret
+              param: client-secret
+  idp:
+    credentials:
+      - secret:
+          name: ${RUN_NAME}-fulfillment-controller-credentials
+          items:
+            - key: client-id
+              param: client-id
+            - key: client-secret
+              param: client-secret
+  database:
+    connection:
+      - secret:
+          name: ${RUN_NAME}-db-config
+          items:
+            - key: url
+              param: url
+      - secret:
+          name: ${RUN_NAME}-db-client-cert
+          items:
+            - key: tls.crt
+              param: sslcert
+            - key: tls.key
+              param: sslkey
+            - key: ca.crt
+              param: sslrootcert
+  kafka:
+    connection:
+      - secret:
+          name: ${KAFKA_CONNECTION_SECRET}
+          items:
+            - key: brokers
+              param: brokers
+            - key: user
+              param: user
+            - key: password
+              param: password
+  vault:
+    namespace: ${RUN_NAME}
+    keycloakIssuerUrl: https://keycloak-keycloak.${OUTER_DOMAIN}/realms/${RUN_NAME}
+metering:
+  database:
+    connection:
+      - secret:
+          name: ${RUN_NAME}-db-metering-config
+          items:
+            - key: url
+              param: url
+      - secret:
+          name: ${RUN_NAME}-db-metering-client-cert
+          items:
+            - key: tls.crt
+              param: sslcert
+            - key: tls.key
+              param: sslkey
+            - key: ca.crt
+              param: sslrootcert
+ui:
+  auth:
+    oidcIssuerURL: https://keycloak-keycloak.${OUTER_DOMAIN}/realms/${RUN_NAME}
+    serviceAccount:
+      credentialsSecret: ${RUN_NAME}-osac-ui-backend-credentials
+operator:
+  aap:
+    templatePrefix: ${RUN_NAME}
+aap:
+  vcluster:
+    apiServerUrl: https://${RUN_NAME}.${HOST_NAMESPACE}.svc.cluster.local
+    tokenSecret:
+      name: ${RUN_NAME}-aap-vcluster-token
+      key: token
+EOF
+    echo "Wrote per-run values overlay to ${INSTANCE_VALUES_FILE}."
 }
 
 ###############################################################################
@@ -737,31 +1190,21 @@ copy_outer_secrets_into_vcluster() {
 ###############################################################################
 
 print_next_steps() {
-    # The same settings `make install-osac` derives and passes for a normal
+    # The same settings 'make install-osac' derives and passes for a normal
     # install (osac-installer/Makefile, install-osac target): DOMAIN from
     # oc get ingresses.config/cluster, then service.externalHostname,
     # service.internalHostname and ui.externalHostname. The vcluster has no
     # OpenShift ingress config for the Makefile to read, so CLUSTER_DOMAIN
     # (the Makefile override landing with the osac chart package) carries
     # the domain and the route hostnames are passed through EXTRA_HELM_ARGS,
-    # with the OSAC namespace as the hostname prefix exactly as the Makefile
-    # does.
-    #
-    # The AAP settings: the umbrella aliases the osac-aap dependency as
-    # `aap`, so the subchart's top-level controllerUrl is aap.controllerUrl
-    # (aap.aap.controllerUrl lands in a block nothing reads). In external
-    # mode the chart reads the admin password from
-    # aap.bootstrap.adminPasswordSecret.name, whose default is the fixed
-    # osac-aap-admin-password; the run setup copies the secret under
-    # <aap-instance>-admin-password, so the name must always be passed
-    # explicitly.
+    # run-prefixed so concurrent runs do not collide once the run routes are
+    # published. The issuer URLs and credential references live in the
+    # overlay instead.
     local extra_helm_args
-    extra_helm_args="--set service.externalHostname=fulfillment-api-${VCLUSTER_OSAC_NAMESPACE}.${OUTER_DOMAIN}"
-    extra_helm_args="${extra_helm_args} --set service.internalHostname=fulfillment-internal-api-${VCLUSTER_OSAC_NAMESPACE}.${OUTER_DOMAIN}"
-    extra_helm_args="${extra_helm_args} --set ui.auth.oidcIssuerURL=https://keycloak-keycloak.${OUTER_DOMAIN}/realms/osac"
-    extra_helm_args="${extra_helm_args} --set ui.externalHostname=osac-ui-${VCLUSTER_OSAC_NAMESPACE}.${OUTER_DOMAIN}"
-    extra_helm_args="${extra_helm_args} --set aap.controllerUrl=${AAP_CONTROLLER_URL}"
-    extra_helm_args="${extra_helm_args} --set aap.bootstrap.adminPasswordSecret.name=${AAP_INSTANCE}-admin-password"
+    extra_helm_args="--values ${INSTANCE_VALUES_FILE}"
+    extra_helm_args="${extra_helm_args} --set service.externalHostname=fulfillment-api-${RUN_NAME}.${OUTER_DOMAIN}"
+    extra_helm_args="${extra_helm_args} --set service.internalHostname=fulfillment-internal-api-${RUN_NAME}.${OUTER_DOMAIN}"
+    extra_helm_args="${extra_helm_args} --set ui.externalHostname=osac-ui-${RUN_NAME}.${OUTER_DOMAIN}"
 
     echo
     echo "Run setup complete."
@@ -778,9 +1221,15 @@ print_next_steps() {
     echo "  make install-osac PLATFORM=openshift PROFILE=vcluster-ci NS=osac \\"
     echo "      EXTRA_HELM_ARGS='${extra_helm_args}'"
     echo
-    echo "PROFILE=vcluster-ci, the chart's vcluster support and the"
-    echo "CLUSTER_DOMAIN Makefile override land with the osac chart work"
-    echo "package; until then they do not exist."
+    echo "Run the suite with the run's realm and routes:"
+    echo "  OSAC_KEYCLOAK_REALM=${RUN_NAME}"
+    echo
+    echo "PROFILE=vcluster-ci, the chart's vcluster support, the"
+    echo "CLUSTER_DOMAIN Makefile override, global.instanceId and"
+    echo "aap.vcluster.* land with the parallel osac chart work; until then"
+    echo "they do not exist and the umbrella schema rejects the overlay's"
+    echo "unknown keys. Tear the run down with"
+    echo "scripts/vcluster-run-teardown.sh ${RUN_NAME}."
 }
 
 ###############################################################################
@@ -791,6 +1240,11 @@ main() {
     local positional_args=()
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --realm-json)
+                [[ $# -ge 2 ]] || die "--realm-json needs a value."
+                REALM_JSON_SOURCE="$2"
+                shift 2
+                ;;
             --recreate)
                 RECREATE="true"
                 shift
@@ -798,6 +1252,11 @@ main() {
             --output-dir)
                 [[ $# -ge 2 ]] || die "--output-dir needs a value."
                 OUTPUT_DIR="$2"
+                shift 2
+                ;;
+            --keycloak-url)
+                [[ $# -ge 2 ]] || die "--keycloak-url needs a value."
+                KEYCLOAK_URL="$2"
                 shift 2
                 ;;
             --aap-instance)
@@ -808,11 +1267,6 @@ main() {
             --aap-namespace)
                 [[ $# -ge 2 ]] || die "--aap-namespace needs a value."
                 AAP_NAMESPACE="$2"
-                shift 2
-                ;;
-            --aap-controller-url)
-                [[ $# -ge 2 ]] || die "--aap-controller-url needs a value."
-                AAP_CONTROLLER_URL="$2"
                 shift 2
                 ;;
             -h|--help)
@@ -830,15 +1284,27 @@ main() {
     done
 
     [[ ${#positional_args[@]} -eq 1 ]] \
-        || die "Exactly one run name is required. Usage: $0 RUN_NAME [--recreate] [options]."
+        || die "Exactly one run name is required. Usage: $0 RUN_NAME --realm-json PATH [--recreate] [options]."
     RUN_NAME="${positional_args[0]}"
     [[ "${RUN_NAME}" =~ ^[a-z0-9]([-a-z0-9]{0,10}[a-z0-9])?$ ]] \
         || die "Run name '${RUN_NAME}' must be a DNS label of lowercase letters, digits and '-', at most 12 characters."
+
+    # Every shared-service object this run touches, named after the run.
+    KAFKA_USER_NAME="${RUN_NAME}-fulfillment-service"
+    KAFKA_CONNECTION_SECRET="${RUN_NAME}-fulfillment-service-kafka"
+    METERING_KAFKA_USERS=("${RUN_NAME}-osac-metering" "${RUN_NAME}-osac-metering-echo-adapter")
+    EVENT_TOPIC_PREFIX="${RUN_NAME}.events."
+    SYSTEM_GROUP_PREFIX="${RUN_NAME}.system."
+    HEARTBEAT_TOPIC_PREFIX="${RUN_NAME}.metering.heartbeat."
+    DLQ_TOPIC_PREFIX="${RUN_NAME}.metering.dlq."
+    INFERENCE_TOPIC="${RUN_NAME}.metering.inference"
+    INFERENCE_DLQ_TOPIC="${RUN_NAME}.metering.inference.dlq"
 
     HOST_NAMESPACE="vc-${RUN_NAME}"
     OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/.vcluster-runs/${RUN_NAME}}"
     VCLUSTER_KUBECONFIG="${OUTPUT_DIR}/kubeconfig"
     VALUES_FILE="${OUTPUT_DIR}/vcluster-values.yaml"
+    INSTANCE_VALUES_FILE="${OUTPUT_DIR}/instance-values.yaml"
 
     check_all_preconditions
     mkdir -p "${OUTPUT_DIR}"
@@ -851,7 +1317,14 @@ main() {
     create_kafka_users
     create_kafka_connection_secret
     copy_metering_kafka_secrets
+    render_realm_json
+    import_keycloak_realm
+    wait_for_keycloak_realm
+    set_fixture_user_passwords
+    write_keycloak_credentials_into_vcluster
+    create_aap_service_account
     copy_outer_secrets_into_vcluster
+    write_instance_values
     print_next_steps
 }
 
