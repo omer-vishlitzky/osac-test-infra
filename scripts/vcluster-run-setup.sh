@@ -996,7 +996,27 @@ source_path, destination_path, run_name = sys.argv[1], sys.argv[2], sys.argv[3]
 with open(source_path) as source:
     realm = json.load(source)
 realm["realm"] = run_name
-realm.pop("id", None)
+
+
+def strip_ids(value):
+    """Drop every embedded "id" field.
+
+    Keycloak entity ids are globally unique across realms, and the outer
+    Keycloak already imported this same file as the shared realm: keeping
+    the exported ids makes the import fail with "Duplicate resource
+    error". Keycloak assigns fresh ids for anything the payload leaves
+    out, and realm JSON references things by name, not by id.
+    """
+    if isinstance(value, dict):
+        value.pop("id", None)
+        for item in value.values():
+            strip_ids(item)
+    elif isinstance(value, list):
+        for item in value:
+            strip_ids(item)
+
+
+strip_ids(realm)
 with open(destination_path, "w") as destination:
     json.dump(realm, destination)
     destination.write("\n")
