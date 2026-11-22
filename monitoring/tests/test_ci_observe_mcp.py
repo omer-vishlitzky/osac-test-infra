@@ -331,15 +331,18 @@ def pr_row(number, merged_days_ago=None, opened_days_ago=40, closed_days_ago=Non
             "closed_at": moment(closed_days_ago) if closed_days_ago is not None else None}
 
 
-def test_the_pull_requests_of_a_past_window_are_its_own(config, web):
+def test_the_pull_requests_of_a_past_window_are_its_own(config, web, monkeypatch):
     # Window: the 7 days ending 10 days ago. #1 merged after it, #2 and #3 inside, #4 before it,
     # #5 was closed inside it (the index windows a closed one by its close).
     rows = [pr_row(1, merged_days_ago=5), pr_row(2, merged_days_ago=11), pr_row(3, merged_days_ago=16),
             pr_row(4, merged_days_ago=18), pr_row(5, closed_days_ago=12, state="closed")]
-    # The index is asked back to the window's start: 17 days and the part of today gone by.
-    end = days_ago(10)
+    # One fixed clock for the rows, the expected URL and the tool: UTC
+    # midnight passing between them would round the fetch to another day.
+    clock = datetime.now(timezone.utc)
+    monkeypatch.setattr(mcp, "datetime", type("Fixed", (type(clock),), {"now": staticmethod(lambda tz=None: clock)}))
+    end = (clock - timedelta(days=10)).strftime("%Y-%m-%d")
     start = datetime.strptime(end, "%Y-%m-%d").replace(tzinfo=timezone.utc) - timedelta(days=7)
-    fetch = math.ceil((datetime.now(timezone.utc) - start).total_seconds() / 86400)
+    fetch = math.ceil((clock - start).total_seconds() / 86400)
     web.add(f"http://exporter/api/ci-observe/prs?days={fetch}&repo=osac", {"prs": rows, "about": [{}], "notes": []})
     answer = tool_call(config, "pull_requests", {"repo": "osac", "days": 7, "state": "all", "end": end})
     assert [row["number"] for row in answer["rows"]] == [2, 5, 3]
@@ -563,11 +566,14 @@ def test_the_full_login_ends_in_a_working_token(server, config, monkeypatch):
     # every port of the host receives.
     assert answer.getheader("Set-Cookie") is None
 
-    # 3. The client exchanges the code with its verifier.
+    # 3. The client exchanges the code with its verifier (RFC 6749 4.1.3:
+    # the exchange carries the client's own id and redirect URI).
     answer, payload = request(server, "POST", "/token",
                               body=urllib.parse.urlencode({"grant_type": "authorization_code",
                                                            "code": code,
-                                                           "code_verifier": verifier}),
+                                                           "code_verifier": verifier,
+                                                           "client_id": client_id,
+                                                           "redirect_uri": "http://localhost:41111/callback"}),
                               headers={"Content-Type": "application/x-www-form-urlencoded"})
     assert answer.status == 200
     token = json.loads(payload)["access_token"]
@@ -914,6 +920,91 @@ def test_codes_in_flight_are_bounded(monkeypatch):
     assert mcp.mint_code("dev", "c", "http://localhost/cb", "client", 1000.0) is None
     # An expired code makes room.
     assert mcp.mint_code("dev", "c", "http://localhost/cb", "client", 1000.0 + mcp.CODE_SECONDS + 1)
+
+
+def test_a_content_length_of_thousands_of_digits_is_refused_not_crashed(server):
+    # isdigit() passes it; int() refuses it. The answer must be a status,
+    # not a dropped connection.
+    answer = raw(server, b"POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Length: "
+                    + b"9" * 5000 + b"\r\n\r\n")
+    assert answer.startswith(b"HTTP/1.1 400")
+
+
+def test_non_ascii_tokens_clients_and_verifiers_are_refused_not_crashed(server, config, monkeypatch):
+    """A header is latin-1: a non-ASCII bearer token, client id or code
+    verifier would make the digest comparisons raise TypeError. Each is
+    answered, and the verifier one is a mismatch, not a crash (the code
+    is spent either way: PKCE codes are one use)."""
+    answer, payload = request(server, "POST", "/mcp", headers={"Authorization": "Bearer dev.1800000000.\xe9"})
+    assert answer.status == 401
+
+    _, document = register(server, "http://localhost/cb")
+    answer, payload = authorize(server, "c1.W10.\xe9" * 3, "http://localhost/cb")
+    assert answer.status == 400 and json.loads(payload)["error"] == "invalid_client"
+
+    monkeypatch.setattr(mcp, "github_login", lambda config, code: "dev")
+    monkeypatch.setattr(mcp, "grafana_admission", lambda config, login: "")
+    client_id, code = full_login(server, monkeypatch)
+    answer, document = exchange(server, grant_type="authorization_code", code=code,
+                                code_verifier="v" * 42 + "\xe9", client_id=client_id,
+                                redirect_uri="http://localhost:41111/callback")
+    assert answer.status == 400 and document["error"] == "invalid_grant"
+
+
+def test_a_deeply_nested_body_is_refused_not_crashed(server, config):
+    answer, payload = request(server, "POST", "/register", body="[" * 500000,
+                              headers={"Content-Type": "application/json"})
+    assert answer.status == 400 and json.loads(payload)["error"] == "invalid_client_metadata"
+    token = mcp.mint_token(config.session_secret, "dev", time.time())
+    answer, payload = request(server, "POST", "/mcp", body="[" * 500000,
+                              headers={"Content-Type": "application/json",
+                                       "Authorization": f"Bearer {token}"})
+    assert answer.status == 400 and json.loads(payload)["error"]["code"] == -32700
+
+
+def test_a_github_network_blip_mid_login_is_an_error_not_a_crash(server, monkeypatch):
+    """The reviewer's case: GitHub times out while exchanging the code; the
+    nonce is spent, but the answer names GitHub instead of dropping the
+    connection."""
+    monkeypatch.setattr(mcp, "github_login",
+                        lambda config, code: (_ for _ in ()).throw(
+                            mcp.AuthError("GitHub could not be reached to exchange the login code: timeout")))
+    _, document = register(server, "http://localhost:41111/callback")
+    answer, _ = authorize(server, document["client_id"], "http://localhost:41111/callback")
+    nonce = urllib.parse.parse_qs(urllib.parse.urlparse(answer.getheader("Location")).query)["state"][0]
+    answer, payload = request(server, "GET", f"/oauth/callback?code=gh&state={urllib.parse.quote(nonce)}")
+    assert answer.status == 400
+    assert "GitHub could not be reached" in json.loads(payload)["error"]
+
+
+def test_a_redirect_with_a_bare_fragment_delimiter_is_refused():
+    # The parser drops an empty fragment; the code would be appended after
+    # "#" where the loopback server never sees it.
+    assert mcp.loopback_redirect("http://localhost/cb#") is None
+
+
+def test_the_token_and_client_signature_domains_are_apart(config):
+    token = mcp.mint_token(config.session_secret, "client", time.time())
+    prefix, payload, signature = token.split(".")
+    forged = f"c1.{payload}.{signature}"
+    assert mcp.read_client_id(config.session_secret, forged) is None
+
+
+def test_the_token_exchange_requires_its_client_and_redirect(server, monkeypatch):
+    """RFC 6749 4.1.3: a public client names itself with its id, and every
+    authorization of ours carried a redirect URI; omission is a refusal,
+    not a pass."""
+    verifier = "v" * 43
+    client_id, code = full_login(server, monkeypatch, verifier=verifier)
+    answer, document = exchange(server, grant_type="authorization_code", code=code, code_verifier=verifier)
+    assert answer.status == 400 and document["error"] == "invalid_grant"
+
+
+def test_a_grafana_null_authlabels_is_a_local_account_not_a_broken_answer(config, web):
+    # Grafana 13 answers null for a user with no provider entry.
+    web.add("https://grafana/api/org/users",
+            [{"login": "ops", "isDisabled": False, "authLabels": None}])
+    assert "does not sign in with GitHub" in mcp.grafana_admission(config, "ops")
 
 
 def test_the_callback_log_line_leaves_out_the_login_code(caplog, server, monkeypatch):

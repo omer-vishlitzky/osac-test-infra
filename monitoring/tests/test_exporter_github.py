@@ -341,8 +341,8 @@ class TestBackfill:
                    runs_page(make_run(id=1, conclusion="failure"), make_run(id=2, event="dynamic"),
                              make_run(id=3), make_run(id=4), make_run(id=5, name="AI diagnostic"),
                              next_url=f"{wfe.API_URL}/p2"))
-        github.add(R("osac/actions/runs/1/jobs?filter=latest&per_page=30"), FakeResponse(payload=self.failed_jobs()))
-        github.add(R("osac/actions/runs/5/jobs?filter=latest&per_page=30"), FakeResponse(payload={"jobs": []}))
+        github.add(R("osac/actions/runs/1/attempts/1/jobs?per_page=30"), FakeResponse(payload=self.failed_jobs()))
+        github.add(R("osac/actions/runs/5/attempts/1/jobs?per_page=30"), FakeResponse(payload={"jobs": []}))
         github.add("/p2", FakeResponse(500, text="later page broke"))
         seen, new = exporter._backfill_page("osac", f"{wfe.API_URL}/p1")
         assert (seen, new) == (4, 2)
@@ -372,9 +372,9 @@ class TestBackfill:
                              next_url=f"{wfe.API_URL}/more"))
         github.add("/more", runs_page(make_run(id=3)))
         github.add(route(mid, until), runs_page(make_run(id=4), make_run(id=1, conclusion="failure")))
-        github.add(f"/repos/{wfe.ORG}/osac/actions/runs/1/jobs?filter=latest&per_page=30",
+        github.add(f"/repos/{wfe.ORG}/osac/actions/runs/1/attempts/1/jobs?per_page=30",
                    FakeResponse(payload={"jobs": []}))
-        github.add(f"/repos/{wfe.ORG}/osac/actions/runs/3/jobs?filter=latest&per_page=30",
+        github.add(f"/repos/{wfe.ORG}/osac/actions/runs/3/attempts/1/jobs?per_page=30",
                    FakeResponse(payload=self.failed_jobs()))
         seen, new = exporter._backfill_range("osac", since, until)
         assert (seen, new) == (4, 2)
@@ -442,7 +442,7 @@ class TestReconcile:
                  f"&created={iso(since)}..{iso(until)}")
         github.add(route, runs_page(make_run(id=1), make_run(id=2), make_run(id=3, conclusion="failure")))
         for run_id in (2, 3):
-            github.add(f"/repos/{wfe.ORG}/osac/actions/runs/{run_id}/jobs?filter=latest&per_page=30",
+            github.add(f"/repos/{wfe.ORG}/osac/actions/runs/{run_id}/attempts/1/jobs?per_page=30",
                        FakeResponse(payload={"jobs": []}))
         assert exporter._backfill_range("osac", since, until, wait=False) == (3, 2)
         got = {r["id"]: r["conclusion"] for r in rows(exporter, "SELECT id, conclusion FROM jobs")}
@@ -512,7 +512,7 @@ class TestAttemptSweep:
         rerun = make_run(id=1, created_at="2026-11-10T10:00:00Z", run_attempt=2, conclusion="success",
                          updated_at="2026-11-20T09:00:00Z")
         github.add(self.route(wfe, self.DAY), runs_page(rerun, make_run(id=2, created_at="2026-11-10T11:00:00Z")))
-        github.add(R("osac/actions/runs/1/jobs?filter=latest&per_page=30"),
+        github.add(R("osac/actions/runs/1/attempts/2/jobs?per_page=30"),
                    FakeResponse(payload={"jobs": [make_gh_job("e2e", "success")]}))
         before = wfe.gap_check_attempts_refreshed.labels(org=wfe.ORG, repo="osac")._value.get()
         assert exporter._sweep_attempts(["osac"], [self.DAY], self.NOW) == 1
@@ -555,7 +555,7 @@ class TestInitialLoad:
         github.add(R("osac/actions/runs?status=completed&per_page=100"),
                    runs_page(make_run(id=1, conclusion="failure"), make_run(id=2, event="dynamic"),
                              make_run(id=3)))
-        github.add(R("osac/actions/runs/1/jobs?filter=latest&per_page=30"), FakeResponse(payload={"jobs": [
+        github.add(R("osac/actions/runs/1/attempts/1/jobs?per_page=30"), FakeResponse(payload={"jobs": [
             make_gh_job("e2e", "failure", [make_step("Checkout", "failure")])]}))
         github.add(R("broken/actions/runs?status=completed&per_page=100"), RuntimeError("boom"))
         exporter.initial_load()
@@ -614,7 +614,7 @@ class TestGapCheck:
         github.add(self.list_route(wfe, "osac", "2026-11-20"),
                    runs_page(make_run(id=1, created_at="2026-11-20T10:00:00Z"),
                              make_run(id=2, created_at="2026-11-20T11:00:00Z")))
-        github.add(f"/repos/{wfe.ORG}/osac/actions/runs/2/jobs?filter=latest&per_page=30",
+        github.add(f"/repos/{wfe.ORG}/osac/actions/runs/2/attempts/1/jobs?per_page=30",
                    FakeResponse(payload={"jobs": []}))
         assert exporter._gap_check_if_due(["osac"], now=self.NOW) == 0
         matching = [row for row in self.day_rows(exporter) if row["day"] == "2026-11-20"]
@@ -634,7 +634,7 @@ class TestGapCheck:
                    runs_page(make_run(id=1, created_at="2026-11-20T10:00:00Z"),
                              make_run(id=2, event="dynamic"),
                              make_run(id=3, created_at="2026-11-21T00:00:00Z")))
-        github.add(f"/repos/{wfe.ORG}/osac/actions/runs/3/jobs?filter=latest&per_page=30",
+        github.add(f"/repos/{wfe.ORG}/osac/actions/runs/3/attempts/1/jobs?per_page=30",
                    FakeResponse(payload={"jobs": []}))
         assert exporter._gap_check_if_due(["osac"], now=self.NOW) == 0
         matching = [row for row in self.day_rows(exporter) if row["day"] == "2026-11-20"][0]
@@ -670,7 +670,7 @@ class TestGapCheck:
         github.add(self.list_route(wfe, "osac", "2026-11-19"),
                    runs_page(make_run(id=1, created_at="2026-11-19T10:00:00Z"),
                              make_run(id=5, created_at="2026-11-19T11:00:00Z")))
-        github.add(f"/repos/{wfe.ORG}/osac/actions/runs/5/jobs?filter=latest&per_page=30",
+        github.add(f"/repos/{wfe.ORG}/osac/actions/runs/5/attempts/1/jobs?per_page=30",
                    FakeResponse(payload={"jobs": []}))
         clock = [0.0]
         monkeypatch.setattr(wfe.time, "monotonic", lambda: clock[0])
@@ -697,7 +697,7 @@ class TestGapCheck:
         github.add(self.list_route(wfe, "osac", "2026-11-20"),
                    runs_page(make_run(id=1, created_at="2026-11-20T10:00:00Z"),
                              make_run(id=2, created_at="2026-11-20T11:00:00Z")))
-        github.add(f"/repos/{wfe.ORG}/osac/actions/runs/2/jobs?filter=latest&per_page=30",
+        github.add(f"/repos/{wfe.ORG}/osac/actions/runs/2/attempts/1/jobs?per_page=30",
                    FakeResponse(500, text="jobs listing broke"))
         assert exporter._gap_check_if_due(["osac"], now=self.NOW) == 0
         matching = [row for row in self.day_rows(exporter) if row["day"] == "2026-11-20"][0]

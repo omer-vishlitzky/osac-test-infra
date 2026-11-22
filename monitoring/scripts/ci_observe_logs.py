@@ -18,6 +18,14 @@ per label set:
                            bmaas, from the artifact name)
     kind                   "error" for an error line, "summary" for the
                            gather script's failure-summary context
+    bucket                 the UTC day of the line's stamp: Loki refuses
+                           an entry more than max_chunk_age/2 (84 h here)
+                           behind its stream's newest one, so without the
+                           bucket one stream per (repo, suite, kind)
+                           would lose every run of a backfill older than
+                           that; with it a stream's entries are at most a
+                           day apart, and thirty buckets a month per
+                           (repo, suite, kind) stay bounded
 Every line also carries structured metadata, which LogQL filters on after
 the selector without an index entry per value:
     run_id, attempt        the run the bundle belongs to
@@ -188,8 +196,12 @@ def line_message(line):
 
 def parse_line_time(line, fallback, earliest=None, latest=None):
     """The line's own timestamp when it falls in [earliest, latest], else
-    `fallback` (the run's end): a stamp outside the run would put the line
-    where no query over the run looks, or be refused by Loki."""
+    `fallback` (the run's end, itself held to `latest`): a stamp outside
+    the run would put the line where no query over the run looks, or be
+    refused by Loki. The fallback is clamped too, so a run whose stored
+    end is ahead of the local clock cannot stamp lines into the future."""
+    if latest is not None and fallback > latest:
+        fallback = latest
     match = LINE_TIME_RE.match(line) or JSON_TIME_RE.search(line[:200])
     if not match:
         return fallback
@@ -285,7 +297,7 @@ def runs_in_window(days, now, failures_only):
     conn = sqlite3.connect(f"file:{EXPORTER_DB}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     since = (now - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    conclusion = "AND conclusion = 'failure'" if failures_only else "AND conclusion IN ('success', 'failure')"
+    conclusion = "AND conclusion IN ('success', 'failure')"
     try:
         rows = conn.execute(
             "SELECT run_id, repo, workflow, event, trigger, failed_step, conclusion, created_at, updated_at,"
@@ -312,6 +324,12 @@ def runs_in_window(days, now, failures_only):
         held = latest.get(key)
         if held is None or (int(run["attempt"]), run["finished_at"]) > (int(held["attempt"]), held["finished_at"]):
             latest[key] = run
+    # --failures-only keeps the failed results after the latest attempt is
+    # picked: filtering in the SQL would make a run whose re-run passed
+    # look like its attempt-1 failure, and its newest bundle would be
+    # recorded under that old attempt.
+    if failures_only:
+        return [run for run in latest.values() if run["conclusion"] == "failure"]
     return sorted(latest.values(), key=lambda run: run["finished_at"], reverse=True)
 
 
@@ -406,6 +424,18 @@ def read_bundle(archive, run, now=None):
             if error_line:
                 metadata["signature"] = signature
             moment = parse_line_time(line, finished, earliest, latest)
+            # The day of the line's own stamp, clamped inside the run: a
+            # stream's entries are at most a day apart, however far apart
+            # the runs that wrote them are. Loki refuses an entry more
+            # than max_chunk_age/2 (84 h here) behind its stream's newest
+            # one, so one stream per (repo, suite, kind) would lose every
+            # run older than that to a 400 while a backfill works through
+            # the backlog newest first -- and a rejected run's lines and
+            # signatures are never retried. Thirty buckets a month per
+            # (repo, suite, kind) is bounded; queries select
+            # {source="artifact"} and filter after the selector, so the
+            # bucket changes nothing for them.
+            labels["bucket"] = moment.strftime("%Y-%m-%d")
             streams.setdefault(tuple(sorted(labels.items())), []).append(
                 (int(moment.timestamp() * 1e9), line, metadata))
     return streams, signatures, counts
@@ -419,8 +449,9 @@ class LokiRefused(RuntimeError):
 class LokiRejected(EvidenceError):
     """Loki answered 400 to this run's own lines (their content, not the
     service): the run's fact, recorded with Loki's reason; the pass goes
-    on. The lines it accepted before stay; the run is not pushed again
-    unless forced, so nothing is stored twice."""
+    on. The lines it accepted before stay; the run's signatures are
+    recorded whatever Loki said; the lines are not pushed again unless
+    forced, so nothing is stored twice."""
 
 
 def push_streams(streams, session):
@@ -569,8 +600,12 @@ def main(argv=None):
                     push_streams(streams, session)
                 except LokiRejected as error:
                     # Recorded before the next run, so a later pass does not
-                    # push the lines Loki already took a second time.
+                    # push the lines Loki already took a second time. The
+                    # signatures are bundle facts, not Loki's, so they are
+                    # recorded (and counted by the pages) whatever Loki said
+                    # about the lines.
                     record_run(state, run, "rejected", str(error), counts, now)
+                    record_signatures(state, run, signatures)
                     state.commit()
                     raise
             if not args.dry_run:

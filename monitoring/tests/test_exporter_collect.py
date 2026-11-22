@@ -39,7 +39,7 @@ class TestProcessCompletedRun:
 
     def test_records_failure_and_metrics(self, exporter, wfe, github, R):
         wf = "E2E metrics test"
-        github.add(R("osac/actions/runs/100/jobs?filter=latest&per_page=30"), FakeResponse(payload={"jobs": [
+        github.add(R("osac/actions/runs/100/attempts/1/jobs?per_page=30"), FakeResponse(payload={"jobs": [
             make_gh_job("e2e", "failure", [make_step("Run E2E tests", "failure")])]}))
         run = make_run(name=wf, conclusion="failure")
         before = counter(wfe.failed_step_total, org=wfe.ORG, workflow=wf, step="Run E2E tests")
@@ -52,7 +52,7 @@ class TestProcessCompletedRun:
         assert not exporter._process_completed_run("osac", run)
 
     def test_upsert_race_returns_false(self, exporter, github, R, monkeypatch):
-        github.add(R("osac/actions/runs/100/jobs?filter=latest&per_page=30"), FakeResponse(payload={"jobs": []}))
+        github.add(R("osac/actions/runs/100/attempts/1/jobs?per_page=30"), FakeResponse(payload={"jobs": []}))
         monkeypatch.setattr(exporter, "_upsert_job", lambda record: False)
         assert not exporter._process_completed_run("osac", make_run(run_started_at=None))
 
@@ -83,7 +83,7 @@ class TestCollect:
              exporter._make_job_record(in_progress[0], repo)], True))
         github.add(R("osac/actions/runs?status=completed&per_page=50"),
                    FakeResponse(payload={"workflow_runs": [make_run(id=10, name="Unit tests")]}))
-        github.add(R("osac/actions/runs/10/jobs?filter=latest&per_page=30"), FakeResponse(payload={"jobs": []}))
+        github.add(R("osac/actions/runs/10/attempts/1/jobs?per_page=30"), FakeResponse(payload={"jobs": []}))
         # A repo whose count raises: the exception path must not publish
         # by-category gauges from the surviving repos either -- an
         # undercount that looks like a real drop is not an answer.
@@ -98,7 +98,7 @@ class TestCollect:
             {"id": 23, "repo": "osac"},
         ]
         github.add(R("osac/actions/runs/20"), FakeResponse(payload=make_run(id=20, name="Long E2E")))
-        github.add(R("osac/actions/runs/20/jobs?filter=latest&per_page=30"), FakeResponse(payload={"jobs": []}))
+        github.add(R("osac/actions/runs/20/attempts/1/jobs?per_page=30"), FakeResponse(payload={"jobs": []}))
         github.add(R("osac/actions/runs/21"), FakeResponse(payload=make_run(id=21, status="in_progress")))
         github.add(R("osac/actions/runs/22"), RuntimeError("boom"))
         # "broken" answers a real failure on its counts (not an omitted

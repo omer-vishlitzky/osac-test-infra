@@ -290,15 +290,23 @@ enable_units() {
 # missing). Saying so here beats a container restarting every 30 seconds
 # against an empty .env. Used by --central and --update-central alike.
 start_mcp_if_configured() {
-    local mcp_missing="" key
+    local mcp_missing="" key value
     for key in MCP_GITHUB_CLIENT_ID MCP_GITHUB_CLIENT_SECRET MCP_GRAFANA_URL \
                MCP_GRAFANA_SERVICE_TOKEN MCP_SESSION_SECRET MCP_EXTERNAL_URL; do
-        grep -q "^${key}=" "${MONITORING_HOME}/.env" 2>/dev/null || mcp_missing="${mcp_missing} ${key}"
+        # The effective value, not the assignment's presence: "KEY=" or
+        # 'KEY=""' or spaces would start a server that refuses to run and
+        # restarts against the empty value every 30 seconds. Read with
+        # cut, never by sourcing the file (it holds secrets).
+        value="$(grep "^${key}=" "${MONITORING_HOME}/.env" 2>/dev/null | head -1 | cut -d= -f2-)"
+        value="${value%\"}" ; value="${value#\"}"   # strip one pair of quotes
+        if [[ -z "${value// /}" ]]; then
+            mcp_missing="${mcp_missing} ${key}"
+        fi
     done
     if [[ -n "${mcp_missing}" ]]; then
         echo "  WARNING: ci-observe-mcp.service is NOT started:${mcp_missing}" >&2
-        echo "           missing from ${MONITORING_HOME}/.env. Add them (see the module" >&2
-        echo "           docstring of monitoring/scripts/ci_observe_mcp.py), then run:" >&2
+        echo "           missing or empty in ${MONITORING_HOME}/.env. Add them (see" >&2
+        echo "           the module docstring of monitoring/scripts/ci_observe_mcp.py), then run:" >&2
         echo "           systemctl --user restart ci-observe-mcp.service" >&2
         systemctl --user stop ci-observe-mcp.service 2>/dev/null || true
     else

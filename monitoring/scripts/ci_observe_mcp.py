@@ -192,7 +192,10 @@ def _sign(secret: str, payload: str) -> str:
 def mint_token(secret: str, login: str, now: float) -> str:
     expires = int(now + TOKEN_SECONDS)
     payload = f"{login}.{expires}"
-    return f"{payload}.{_sign(secret, payload)}"
+    # The "token." prefix keeps the token's signature domain apart from
+    # the client id's ("client."): a login literally named "client" would
+    # otherwise sign a string read_client_id accepts.
+    return f"{payload}.{_sign(secret, 'token.' + payload)}"
 
 
 def read_token(secret: str, token: str, now: float) -> str | None:
@@ -205,7 +208,10 @@ def read_token(secret: str, token: str, now: float) -> str | None:
     login, expires, signature = parts
     if not login or not expires.isdigit():
         return None
-    if not hmac.compare_digest(signature, _sign(secret, f"{login}.{expires}")):
+    # The comparison runs on bytes: a non-ASCII signature (a header is
+    # latin-1) would make compare_digest raise TypeError instead of
+    # refusing the token.
+    if not hmac.compare_digest(signature.encode(), _sign(secret, "token." + f"{login}.{expires}").encode()):
         return None
     if int(expires) < now:
         return None
@@ -237,6 +243,10 @@ def loopback_redirect(uri: object) -> urllib.parse.SplitResult | None:
     if parsed.scheme != "http" or parsed.hostname not in ("localhost", "127.0.0.1"):
         return None
     if parsed.username is not None or parsed.password is not None or parsed.fragment:
+        return None
+    # A bare "#" is an empty fragment the parser drops; the code would be
+    # appended after it, where the loopback server never sees it.
+    if uri.rstrip().endswith("#"):
         return None
     if parsed.netloc.lower() != parsed.hostname + (f":{port}" if port is not None else ""):
         return None
@@ -272,7 +282,9 @@ def read_client_id(secret: str, client_id: str) -> list[str] | None:
     if len(parts) != 3 or parts[0] != CLIENT_ID_PREFIX:
         return None
     _, payload, signature = parts
-    if not hmac.compare_digest(signature, _sign(secret, "client." + payload)):
+    # Bytes: a non-ASCII signature would make compare_digest raise
+    # TypeError instead of refusing the client id.
+    if not hmac.compare_digest(signature.encode(), _sign(secret, "client." + payload).encode()):
         return None
     try:
         uris = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
@@ -292,33 +304,46 @@ class AuthError(Exception):
 
 def github_login(config: Config, code: str) -> str:
     """The GitHub login behind an OAuth code."""
-    answer = requests.post(
-        "https://github.com/login/oauth/access_token",
-        data={
-            "client_id": config.github_client_id,
-            "client_secret": config.github_client_secret,
-            "code": code,
-            "redirect_uri": f"{config.external_url}/oauth/callback",
-        },
-        headers={"Accept": "application/json"},
-        timeout=15,
-    )
-    if not answer.ok:
-        raise AuthError(f"GitHub would not exchange the login code: HTTP {answer.status_code}")
-    body = answer.json()
+    try:
+        answer = requests.post(
+            "https://github.com/login/oauth/access_token",
+            data={
+                "client_id": config.github_client_id,
+                "client_secret": config.github_client_secret,
+                "code": code,
+                "redirect_uri": f"{config.external_url}/oauth/callback",
+            },
+            headers={"Accept": "application/json"},
+            timeout=15,
+        )
+        if not answer.ok:
+            raise AuthError(f"GitHub would not exchange the login code: HTTP {answer.status_code}")
+        body = answer.json()
+    except requests.exceptions.RequestException as error:
+        # A network blip mid-login is an error naming GitHub, never a
+        # traceback that drops the connection; the login restarts from
+        # /authorize either way.
+        raise AuthError(f"GitHub could not be reached to exchange the login code: {error}") from error
+    except ValueError:
+        raise AuthError("GitHub answered its token exchange with something other than JSON") from None
     access_token = body.get("access_token")
     if not access_token:
         detail = body.get("error") or "no error named"
         description = body.get("error_description") or ""
         raise AuthError(f"GitHub refused the login code: {detail}. {description}".strip())
-    access_token = requests.get(
-        f"{config.github_api_url}/user",
-        headers={"Authorization": f"Bearer {access_token}", "Accept": "application/vnd.github+json"},
-        timeout=15,
-    )
-    if not access_token.ok:
-        raise AuthError(f"GitHub would not say who logged in: HTTP {access_token.status_code}")
-    login = access_token.json().get("login")
+    try:
+        who = requests.get(
+            f"{config.github_api_url}/user",
+            headers={"Authorization": f"Bearer {access_token}", "Accept": "application/vnd.github+json"},
+            timeout=15,
+        )
+        if not who.ok:
+            raise AuthError(f"GitHub would not say who logged in: HTTP {who.status_code}")
+        login = who.json().get("login")
+    except requests.exceptions.RequestException as error:
+        raise AuthError(f"GitHub could not be reached to say who logged in: {error}") from error
+    except ValueError:
+        raise AuthError("GitHub answered its user lookup with something other than JSON") from None
     if not login:
         raise AuthError("GitHub named no login")
     return login
@@ -346,6 +371,11 @@ def grafana_admission(config: Config, login: str) -> str:
         raise AuthError("Grafana's org user list does not say whether users are disabled (no isDisabled);"
                         " check MCP_GRAFANA_URL points at Grafana 10 or newer")
     labels = user.get("authLabels")
+    # Grafana 13 leaves authLabels null for a user with no provider entry:
+    # a present null is "signs in some other way" (the 403 below), not a
+    # broken answer; a missing key or a non-list still is.
+    if labels is None and "authLabels" in user:
+        labels = []
     if not isinstance(labels, list):
         raise AuthError("Grafana's org user list does not say how users sign in (no authLabels);"
                         " check MCP_GRAFANA_URL points at Grafana 10 or newer")
@@ -1316,7 +1346,11 @@ class McpHandler(BaseHTTPRequestHandler):
             return b""
         if not raw.isdigit():
             self._refuse(HTTPStatus.BAD_REQUEST, "Content-Length is not a number")
-        length = int(raw)
+        try:
+            length = int(raw)
+        except ValueError:
+            # isdigit() passes a 5000-digit number; int() refuses it.
+            self._refuse(HTTPStatus.BAD_REQUEST, "Content-Length is not a length")
         if length > MAX_BODY_BYTES:
             self._refuse(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, f"a request body is at most {MAX_BODY_BYTES} bytes")
         return self.rfile.read(length) if length else b""
@@ -1349,7 +1383,9 @@ class McpHandler(BaseHTTPRequestHandler):
     def _register(self) -> None:
         try:
             request = json.loads(self._body() or b"{}")
-        except ValueError:
+        except (ValueError, RecursionError):
+            # RecursionError: a body of nested brackets is valid JSON shape
+            # but unbounded depth.
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_client_metadata"})
             return
         redirect_uris = request.get("redirect_uris") if isinstance(request, dict) else None
@@ -1471,17 +1507,20 @@ class McpHandler(BaseHTTPRequestHandler):
                                                      "error_description": "the code is unknown or"
                                                      " older than two minutes"})
             return
-        if not secrets.compare_digest(_sha256_b64(verifier), entry["challenge"]):
+        # Bytes: a non-ASCII challenge (stored from a query string) would
+        # make compare_digest raise TypeError instead of refusing.
+        if not secrets.compare_digest(_sha256_b64(verifier).encode(), entry["challenge"].encode()):
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_grant",
                                                      "error_description": "the code verifier"
                                                      " does not match"})
             return
-        # RFC 6749 4.1.3: the exchange is the authorization's own client and
-        # redirect URI; a client that sends them must send those.
+        # RFC 6749 4.1.3: the exchange is the authorization's own client
+        # and redirect URI. Both are required here -- the client is public
+        # (no secret to authenticate it), so its id is the only thing that
+        # names it, and every authorization of ours carried a redirect URI.
         sent_client = (form.get("client_id") or [""])[0]
         sent_redirect = (form.get("redirect_uri") or [""])[0]
-        if (sent_client and sent_client != entry["client_id"]) or \
-                (sent_redirect and sent_redirect != entry["redirect_uri"]):
+        if sent_client != entry["client_id"] or sent_redirect != entry["redirect_uri"]:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_grant",
                                                      "error_description": "the code was issued to another"
                                                      " client or redirect URI"})
@@ -1514,7 +1553,9 @@ class McpHandler(BaseHTTPRequestHandler):
             return
         try:
             payload = json.loads(raw or b"")
-        except ValueError:
+        except (ValueError, RecursionError):
+            # RecursionError: a body of nested brackets is valid JSON shape
+            # but unbounded depth.
             self._send_json(HTTPStatus.BAD_REQUEST, {"jsonrpc": "2.0", "id": None,
                                                      "error": {"code": -32700, "message": "no JSON"}})
             return

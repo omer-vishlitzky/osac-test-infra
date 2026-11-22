@@ -955,7 +955,7 @@ def test_the_seeded_test_that_gets_slower_says_so(seeded):
 # -- the error signatures of the artifact-log rollup ----------------------------------------
 
 
-def index_bundles(stores, runs, signatures):
+def index_bundles(stores, runs, signatures, attempt="1", state="indexed"):
     """The rollup's tables: each (run id, outcome) indexed, with the given
     signatures [(signature, phase)] for it."""
     with sqlite3.connect(stores.trends_db) as conn:
@@ -970,7 +970,7 @@ def index_bundles(stores, runs, signatures):
                      " lines INTEGER NOT NULL, PRIMARY KEY (run_id, suite, kind, signature))")
         for run_id, outcome in runs:
             conn.execute("INSERT INTO artifact_logs (run_id, suite, repo, state, ingested_at, attempt)"
-                         " VALUES (?, 'vmaas', 'osac', 'indexed', ?, '1')", (run_id, iso(NOW)))
+                         " VALUES (?, 'vmaas', 'osac', ?, ?, ?)", (run_id, state, iso(NOW), attempt))
             for signature, phase in signatures(run_id, outcome):
                 conn.execute("INSERT INTO artifact_log_signatures VALUES (?, 'vmaas', 'pod', ?, ?, ?, 3)",
                              (run_id, signature, outcome, phase))
@@ -1046,6 +1046,37 @@ def test_each_signature_links_its_runs_lines_by_metadata_over_their_time(stores)
     assert row["logs_query"] == f'{{source="artifact"}} | run_id=~"{run_id}"'
     assert row["logs_from"] == iso(NOW - timedelta(hours=7))
     assert row["logs_to"] > row["logs_from"]
+
+
+def test_a_reruns_older_attempt_does_not_count_under_its_newer_result(stores):
+    """A run that failed, was indexed, and then passed on a re-run: until
+    the rollup reads the new bundle, the run has no indexed bundle at its
+    latest attempt -- its old failure signatures must not count in the
+    passing pool, and the coverage note must say it is not covered."""
+    with sqlite3.connect(stores.jobs_db) as conn:
+        for attempt, conclusion, failed in ((1, "failure", "Install OSAC"), (2, "success", "")):
+            conn.execute(
+                "INSERT INTO jobs (run_id, repo, workflow, category, status, conclusion, event, created_at,"
+                " updated_at, run_attempt) VALUES ('777', 'osac', 'E2E VMaaS Full Install', 'e2e', 'completed',"
+                " ?, 'schedule', ?, ?, ?)",
+                (conclusion, iso(NOW - timedelta(hours=4)), iso(NOW - timedelta(hours=2) if attempt == 2
+                                                                else NOW - timedelta(hours=3)), attempt))
+    index_bundles(stores, [("777", "failure")], lambda run_id, outcome: [("cert-manager cannot get lease", "install")],
+                  attempt="1")
+    rows = get(stores.api(), "failures", days="7")["signatures"]
+    assert rows == [], "the older attempt's signatures are not this result's"
+    notes = get(stores.api(), "failures", days="7")["notes"]
+    assert any("cover 0 of 0 failed and 0 of 1 passing" in note for note in notes)
+
+
+def test_a_bundle_loki_rejected_lines_for_still_counts_its_signatures(stores):
+    """A rejected bundle was read: its signatures are bundle facts, and
+    the ranking counts them even though the lines are not in Loki."""
+    failed = stores.run(NOW - timedelta(hours=1), conclusion="failure", failed="Install OSAC")
+    index_bundles(stores, [(failed, "failure")], lambda run_id, outcome: [("an error", "install")],
+                  state="rejected")
+    rows = get(stores.api(), "failures", days="7")["signatures"]
+    assert [row["signature"] for row in rows] == ["an error"]
 
 
 # -- windows the stores do not wholly hold --------------------------------------------------

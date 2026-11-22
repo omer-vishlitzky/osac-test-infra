@@ -475,14 +475,20 @@ class Stores:
 
     def artifact_signatures(self, units):
         """The artifact-log rollup's record of the given suite runs: (indexed,
-        rows). `units` maps each (run id, suite) of the window to its result
-        ("passed" or "failed"); a merge-queue run holds three bundles, one per
-        suite, so a run is counted per suite. indexed is the set of those
-        units whose bundle the rollup read; rows are [(signature, kind,
-        phase, run id, suite, lines)] of the indexed units. ([], []) when
-        the rollup has indexed nothing yet (its tables are absent, or the
-        store does not exist); None when the store or a table cannot be
-        read: a read failure is not "no signatures"."""
+        rows). `units` maps each (run id, suite) of the window to
+        (result, attempt) -- "passed" or "failed", and the attempt the
+        result belongs to; a merge-queue run holds three bundles, one per
+        suite, so a run is counted per suite. A bundle counts as indexed
+        only when the rollup read it at the unit's own attempt: a re-run
+        changes the result, and the older attempt's signatures must not be
+        counted under the newer result (until the next rollup pass reads
+        the new bundle, the run counts as not indexed). A bundle Loki
+        rejected lines for is indexed too: its signatures are bundle
+        facts. rows are [(signature, kind, phase, run id, suite, lines)]
+        of the indexed units. ([], []) when the rollup has indexed nothing
+        yet (its tables are absent, or the store does not exist); None
+        when the store or a table cannot be read: a read failure is not
+        "no signatures"."""
         if not units:
             return set(), []
         if not self.trends_db or not os.path.exists(self.trends_db):
@@ -503,19 +509,19 @@ class Stores:
                 chunk = run_ids[start:start + 400]
                 marks = ",".join("?" * len(chunk))
                 for row in conn.execute(
-                        f"SELECT run_id, suite FROM artifact_logs WHERE state = 'indexed' AND run_id IN ({marks})",
-                        chunk):
+                        "SELECT run_id, suite, attempt FROM artifact_logs"
+                        f" WHERE state IN ('indexed', 'rejected') AND run_id IN ({marks})", chunk):
                     unit = (str(row["run_id"]), row["suite"])
-                    if unit in units:
+                    if unit in units and units[unit][1] == ((row["attempt"] or "") or "1"):
                         indexed.add(unit)
                 for row in conn.execute(
                         "SELECT signature, kind, phase, run_id, suite, lines FROM artifact_log_signatures"
                         f" WHERE run_id IN ({marks})", chunk):
                     unit = (str(row["run_id"]), row["suite"])
-                    if unit in indexed or unit in units:
+                    if unit in indexed:
                         rows.append((row["signature"], row["kind"], row["phase"] or "", unit[0], unit[1],
                                      row["lines"]))
-            return indexed, [row for row in rows if (row[3], row[4]) in indexed]
+            return indexed, rows
         except sqlite3.Error as error:
             logger.error("the artifact log signature table could not be read: %s", error)
             return None
@@ -1331,20 +1337,33 @@ class CIObserveInsights:
         units = {}
         facts = {}
         for fact in finished:
+            if fact["result"] not in ("passed", "failed"):
+                continue
             unit = (str(fact["run_id"]), fact["suite"])
-            if fact["result"] in ("passed", "failed"):
-                units[unit] = fact["result"]
+            # A re-run leaves a suite row per attempt behind; the unit's
+            # result and attempt are the latest one's, or the older
+            # attempt's signatures would count under the newer result.
+            held = facts.get(unit)
+            if held is None or (fact["attempt"] or 1, fact["created_at"] or "") > \
+                    (held["attempt"] or 1, held["created_at"] or ""):
                 facts[unit] = fact
+        for unit, fact in facts.items():
+            units[unit] = (fact["result"], str(fact["attempt"] or 1))
         read = self.stores.artifact_signatures(units)
         if read is None:
             return [], ["the artifact log signature table could not be read, so the error signatures"
                         " of this window are unknown"]
         indexed, stored = read
-        if not indexed:
+        if not indexed and not units:
             return [], ["the artifact log rollup has indexed no bundle of this window yet, so no error"
                         " signatures are known (ci-observe-logs.timer)"]
-        total = {result: sum(1 for value in units.values() if value == result) for result in ("failed", "passed")}
-        covered = {result: sum(1 for unit in indexed if units[unit] == result) for result in ("failed", "passed")}
+        # With runs but none indexed at its own attempt -- the rollup never
+        # ran, has not reached these runs yet, or read their bundles at an
+        # older attempt of a re-run -- the coverage note below says so,
+        # which is the honest answer; "no signatures are known" alone would
+        # hide the runs it failed to cover.
+        total = {result: sum(1 for value in units.values() if value[0] == result) for result in ("failed", "passed")}
+        covered = {result: sum(1 for unit in indexed if units[unit][0] == result) for result in ("failed", "passed")}
         notes = []
         if covered != total:
             notes.append(f"the error signatures cover {covered['failed']} of {total['failed']} failed and"
@@ -1358,8 +1377,8 @@ class CIObserveInsights:
             entry = grouped.setdefault((signature, kind), {"failed": set(), "passed": set(), "lines": 0,
                                                            "phases": defaultdict(int)})
             unit = (run_id, suite)
-            entry[units[unit]].add(unit)
-            if units[unit] == "failed":
+            entry[units[unit][0]].add(unit)
+            if units[unit][0] == "failed":
                 entry["lines"] += lines
                 entry["phases"][phase or "other"] += 1
         rows = []

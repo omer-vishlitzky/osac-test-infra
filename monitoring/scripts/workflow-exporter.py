@@ -3189,7 +3189,8 @@ class WorkflowExporter:
 
                 record = self._make_job_record(run, repo)
                 conclusion = run.get("conclusion") or "unknown"
-                jobs = self._fetch_run_jobs(repo, run_id)
+                # The listed attempt (see _process_completed_run).
+                jobs = self._fetch_run_jobs(repo, run_id, run.get("run_attempt") or 1)
                 if jobs is None:
                     logger.warning(
                         "Skipping run %s (%s): job-details fetch failed, will retry next pass",
@@ -3278,7 +3279,8 @@ class WorkflowExporter:
                 continue
             record = self._make_job_record(run, repo)
             conclusion = run.get("conclusion") or "unknown"
-            jobs = self._fetch_run_jobs(repo, run_id)
+            # The listed attempt (see _process_completed_run).
+            jobs = self._fetch_run_jobs(repo, run_id, run.get("run_attempt") or 1)
             if jobs is None:
                 logger.warning(
                     "Skipping run %s (%s): job-details fetch failed, will retry next pass",
@@ -3521,8 +3523,17 @@ class WorkflowExporter:
                 attempt = stored.get(run["id"])
                 if attempt is None or (run.get("run_attempt") or 1) <= attempt:
                     continue
-                if self._process_completed_run(repo, run):
-                    refreshed += 1
+                outcome = self._process_completed_run(repo, run)
+                if outcome is None:
+                    # The fetch failed: the day is not swept clean, or the
+                    # re-run would keep its old attempt until the day comes
+                    # around again (~a day at three sweeps an hour).
+                    logger.error("Attempt sweep of %s %s: the job details of run %s could not"
+                                 " be read; the day stays to sweep again", repo, day, run["id"])
+                    self._record_sweep(repo, day, stamp, len(runs), refreshed,
+                                       f"job details of run {run['id']} could not be read")
+                    break
+                refreshed += int(outcome)
             if refreshed:
                 gap_check_attempts_refreshed.labels(org=ORG, repo=repo).inc(refreshed)
                 logger.info("Attempt sweep of %s %s stored %d re-run(s) again", repo, day, refreshed)
@@ -3695,7 +3706,8 @@ class WorkflowExporter:
                     conclusion = run.get("conclusion") or "unknown"
 
                     # Fetch job-level data for failed steps and step durations
-                    jobs = self._fetch_run_jobs(repo, run_id)
+                    # (the listed attempt; see _process_completed_run).
+                    jobs = self._fetch_run_jobs(repo, run_id, run.get("run_attempt") or 1)
                     if jobs is None:
                         logger.warning(
                             "Skipping run %s (%s): job-details fetch failed, will retry next pass",
@@ -3731,7 +3743,11 @@ class WorkflowExporter:
     def _process_completed_run(self, repo, run):
         """Fetch job-level detail for one completed run and upsert it,
         incrementing the completed/duration/failed-step metrics on
-        success. Returns True if the row was actually (newly) upserted.
+        success. Returns True if the row was actually (newly) upserted,
+        False if there was nothing to do (an ignored event, or a stored
+        row already current), and None when the job-details fetch itself
+        failed -- "try again later", which a caller sweeping a whole day
+        must not record as a clean sweep.
 
         Shared by collect()'s two independent ways of finding a candidate
         run -- _recent_completed's polling loop, and the dropped-from-
@@ -3752,13 +3768,16 @@ class WorkflowExporter:
         # The stable name, not the run name: a flow run is named after its
         # commit or comment, which would give every run its own label set.
         workflow_name = record["workflow"]
-        jobs = self._fetch_run_jobs(repo, run_id)
+        # The listed attempt, not the latest: a re-run completing between
+        # the listing and this fetch would otherwise pair the listed
+        # attempt's record with a newer attempt's jobs and failure reason.
+        jobs = self._fetch_run_jobs(repo, run_id, run.get("run_attempt") or 1)
         if jobs is None:
             logger.warning(
                 "Skipping run %s (%s): job-details fetch failed, will retry next pass",
                 run_id, repo,
             )
-            return False
+            return None
         failed = []
         self._refine_pipeline_category(record, jobs)
         if jobs:

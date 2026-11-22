@@ -361,7 +361,7 @@ def test_a_completed_flow_run_is_stored_with_a_row_and_counts_per_suite(exporter
         job("caas / e2e-caas-full-install / e2e", "failure"),
         job("bmaas / e2e-bmaas-full-install / e2e", "cancelled"),
     ]
-    github.add(R("osac/actions/runs/1/jobs?filter=latest&per_page=30"), FakeResponse(payload={"jobs": jobs}))
+    github.add(R("osac/actions/runs/1/attempts/1/jobs?per_page=30"), FakeResponse(payload={"jobs": jobs}))
     run = flow_run() | {"status": "completed", "conclusion": "failure"}
 
     def count(workflow, conclusion):
@@ -392,7 +392,7 @@ def test_a_backfilled_flow_run_stores_its_suite_rows_too(exporter, wfe, github, 
     # The same rows whichever way the run is found: the backfill of a time range, a page of runs, the first load.
     jobs = [job("decide / Decide"), job("vmaas / e2e-vmaas-full-install / e2e")]
     run = flow_run() | {"status": "completed", "conclusion": "success"}
-    github.add(R("osac/actions/runs/1/jobs?filter=latest&per_page=30"), FakeResponse(payload={"jobs": jobs}))
+    github.add(R("osac/actions/runs/1/attempts/1/jobs?per_page=30"), FakeResponse(payload={"jobs": jobs}))
     github.add(R("osac/actions/runs?page=1"), FakeResponse(payload={"workflow_runs": [run]}))
     exporter._backfill_page("osac", f"{wfe.API_URL}/repos/{wfe.ORG}/osac/actions/runs?page=1")
     assert sorted(r["workflow"] for r in rows(exporter, "SELECT workflow FROM jobs")) == [
@@ -400,7 +400,7 @@ def test_a_backfilled_flow_run_stores_its_suite_rows_too(exporter, wfe, github, 
 
 
 def test_a_run_with_no_suite_result_is_one_automation_row(exporter, github, R):
-    github.add(R("osac/actions/runs/1/jobs?filter=latest&per_page=30"),
+    github.add(R("osac/actions/runs/1/attempts/1/jobs?per_page=30"),
                FakeResponse(payload={"jobs": [make_gh_job("decide / Decide")]}))
     run = flow_run() | {"status": "completed", "conclusion": "success"}
     assert exporter._process_completed_run("osac", run)

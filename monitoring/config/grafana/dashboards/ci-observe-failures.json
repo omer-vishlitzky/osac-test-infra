@@ -2318,13 +2318,7 @@
      ],
      "countRows": false,
      "fields": ""
-    },
-    "sortBy": [
-     {
-      "displayName": "Failed minus passing",
-      "desc": true
-     }
-    ]
+    }
    },
    "targets": [
     {

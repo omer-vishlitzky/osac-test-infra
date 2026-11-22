@@ -67,9 +67,11 @@ def test_a_failed_run_is_pushed_with_few_labels_and_its_run_as_metadata():
                       "failure-summary.txt": SUMMARY})
     streams, signatures, counts = logs.read_bundle(archive, run(), NOW)
     labels = {key for group in streams for key, _ in group}
-    # One stream per repository, suite and kind: the run and the signature
-    # would make one per run and signature.
-    assert labels == {"source", "repo", "suite", "kind"}
+    # One stream per repository, suite, kind and stamp-day: the run and the
+    # signature would make one per run and signature, and a stream shared
+    # by every run of a suite would lose backfill entries older than
+    # Loki's out-of-order window to a 400.
+    assert labels == {"source", "repo", "suite", "kind", "bucket"}
     by_kind = {dict(group)["kind"]: values for group, values in streams.items()}
     assert set(by_kind) == {"error", "summary"}
     errors = by_kind["error"]
@@ -78,6 +80,37 @@ def test_a_failed_run_is_pushed_with_few_labels_and_its_run_as_metadata():
     assert all("signature" not in value[2] for value in by_kind["summary"])
     assert counts["error_lines"] == 3 and counts["files"] == 3
     assert {signature for signature, _ in signatures} == {value[2]["signature"] for value in errors}
+
+
+def test_lines_of_different_days_land_in_different_streams():
+    """A stream's entries must stay within Loki's out-of-order window
+    (max_chunk_age/2, 84 h here) of its newest entry: a backfill works
+    through the backlog newest first, so lines days apart must not share
+    a stream. The bucket is the stamp's own UTC day, so a run that spans
+    midnight splits its lines across two streams."""
+    across = run(created=datetime(2026, 11, 19, 23, 30, tzinfo=UTC),
+                 finished=datetime(2026, 11, 20, 0, 30, tzinfo=UTC))
+    lines = "\n".join([
+        "2026-11-19T23:45:00Z error: before midnight",
+        "2026-11-20T00:15:00Z error: after midnight",
+    ])
+    streams, _, _ = logs.read_bundle(bundle({"x.log": lines}), across, NOW)
+    buckets = {dict(group)["bucket"]: [value[0] for value in values] for group, values in streams.items()}
+    assert set(buckets) == {"2026-11-19", "2026-11-20"}
+    for stamps in buckets.values():
+        assert (max(stamps) - min(stamps)) / 1e9 <= 86400, "one stream spans more than a day"
+
+
+def test_runs_days_apart_never_share_a_stream():
+    first = logs.read_bundle(bundle({"x.log": "2026-11-19T10:00:00Z error: newer run\n"}),
+                             run(run_id="1", created=datetime(2026, 11, 19, 9, tzinfo=UTC),
+                                 finished=datetime(2026, 11, 19, 11, tzinfo=UTC)), NOW)
+    second = logs.read_bundle(bundle({"x.log": "2026-11-16T10:00:00Z error: older run\n"}),
+                              run(run_id="2", created=datetime(2026, 11, 16, 9, tzinfo=UTC),
+                                  finished=datetime(2026, 11, 16, 11, tzinfo=UTC)), NOW)
+    streams = {**first[0], **second[0]}
+    assert len(streams) == 2
+    assert {dict(group)["bucket"] for group in streams} == {"2026-11-19", "2026-11-16"}
 
 
 def test_a_passing_run_pushes_nothing_and_still_counts_its_signatures():
@@ -109,6 +142,17 @@ def test_a_run_that_just_ended_never_stamps_a_line_in_the_future():
     streams, _, _ = logs.read_bundle(bundle({"x.log": lines}), just, NOW)
     [values] = streams.values()
     assert values[0][0] <= int(NOW.timestamp() * 1e9)
+
+
+def test_a_run_ended_ahead_of_the_local_clock_clamps_its_unstamped_lines():
+    """The fallback stamp is the run's end, held to `latest` (now): a run
+    whose stored end is ahead of the local clock must not stamp its
+    unstamped lines into the future, where the run-page query cannot see
+    them."""
+    ahead = run(finished=NOW + timedelta(minutes=90))
+    streams, _, _ = logs.read_bundle(bundle({"x.log": "error: no stamp\n"}), ahead, NOW)
+    [values] = streams.values()
+    assert values[0][0] == int(NOW.timestamp() * 1e9)
 
 
 def test_oversized_files_and_lines_are_skipped_and_counted():
@@ -273,6 +317,19 @@ def test_only_the_latest_attempt_of_a_suite_is_read(world):
     world.bundles = {"601": {"aap-jobs/install.log": INSTALL_LOG}}
     logs.main(["--days", "30"])
     assert world.looked_up == [("601", "2")]
+
+
+def test_failures_only_selects_the_latest_attempt_before_filtering(world):
+    """A run whose re-run passed is not a failure: filtering the SQL first
+    would keep its attempt-1 failure row, read the newest bundle under
+    that old attempt, and count its signatures toward a failure that no
+    longer happened."""
+    world.run(1, "601", "failure", attempt=1, ended_hours_ago=3, workflow="E2E vmaas (merge queue)")
+    world.run(2, "601", "success", attempt=2, ended_hours_ago=1, workflow="E2E vmaas (merge queue)")
+    world.bundles = {"601": {"aap-jobs/install.log": INSTALL_LOG}}
+    assert logs.main(["--days", "30", "--failures-only"]) == 0
+    assert world.looked_up == []
+    assert world.state() == {}
 
 
 def test_a_missing_bundle_is_retried_while_young_then_unavailable(world):

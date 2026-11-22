@@ -44,6 +44,16 @@ jobs:
             prom/prometheus:v3.4.1 \
             check rules /etc/prometheus/alert-rules.yml
 
+      # The unit tests in monitoring/tests/alert-rules.test.yml: without
+      # this step they run only where promtool happens to be on PATH (the
+      # pytest wrapper skips itself), which is nowhere in CI.
+      - name: promtool test rules
+        run: |
+          docker run --rm --entrypoint promtool \
+            -v "$PWD/monitoring:/m:ro" \
+            prom/prometheus:v3.4.1 \
+            test rules /m/tests/alert-rules.test.yml
+
       - name: Validate Grafana dashboard JSON
         run: |
           set -euo pipefail

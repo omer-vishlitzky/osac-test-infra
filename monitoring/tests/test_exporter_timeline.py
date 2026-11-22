@@ -35,7 +35,7 @@ def stored(exporter, run_id):
 
 
 def test_a_completed_e2e_run_stores_its_timeline(wfe, exporter, github):
-    github.add(f"/repos/{wfe.ORG}/osac/actions/runs/100/jobs?filter=latest&per_page=30",
+    github.add(f"/repos/{wfe.ORG}/osac/actions/runs/100/attempts/1/jobs?per_page=30",
                FakeResponse(payload={"jobs": [gh_job(), gh_job(name="changes-gate", steps=[])]}))
     assert exporter._process_completed_run("osac", make_run(id=100, name="E2E VMaaS Full Install"))
     timeline = json.loads(stored(exporter, 100)["timeline_json"])
@@ -49,7 +49,7 @@ def test_a_completed_e2e_run_stores_its_timeline(wfe, exporter, github):
 
 
 def test_a_non_e2e_run_stores_no_timeline(wfe, exporter, github):
-    github.add(f"/repos/{wfe.ORG}/osac/actions/runs/101/jobs?filter=latest&per_page=30",
+    github.add(f"/repos/{wfe.ORG}/osac/actions/runs/101/attempts/1/jobs?per_page=30",
                FakeResponse(payload={"jobs": [gh_job()]}))
     assert exporter._process_completed_run("osac", make_run(id=101, name="Pre-commit", event="push"))
     assert stored(exporter, 101)["timeline_json"] == ""
