@@ -10,31 +10,36 @@
 #
 # The script:
 #   1. checks every precondition against the outer cluster and fails loudly;
-#   2. renders scripts/vcluster-values.yaml.template with the discovered
+#   2. reads the run's suite from the run name's suite letter (v, b or c);
+#   3. renders scripts/vcluster-values.yaml.template with the discovered
 #      parameters and installs the vcluster Helm release (version pinned);
-#   3. mints a long-lived admin kubeconfig for the vcluster;
-#   4. installs cert-manager inside the vcluster and copies the shared CI
+#   4. mints a long-lived admin kubeconfig for the vcluster;
+#   5. installs cert-manager inside the vcluster and copies the shared CI
 #      certificate authority into it, so the osac chart can issue the
 #      database client certificates itself;
-#   5. creates the run's KafkaUsers in the outer cluster's Kafka with
+#   6. creates the run's KafkaUsers in the outer cluster's Kafka with
 #      run-prefixed names and ACL prefixes, waits for Strimzi to generate
 #      their secrets, and copies them into the vcluster (the fulfillment
 #      connection secret into osac, the metering secrets into an osac-kafka
 #      namespace the pods' initContainers read by local API);
-#   6. imports the run's Keycloak realm from the monorepo's realm.json
+#   7. imports the run's Keycloak realm from the monorepo's realm.json
 #      through the outer Keycloak's admin API (realm renamed to the run,
 #      placeholders resolved, top-level id dropped), sets the fixture users'
 #      passwords, grants the controller client's service account the
 #      realm-management roles and registration policies the fulfillment
 #      service needs, and writes the controller and UI client credentials
 #      into the vcluster;
-#   7. creates an AAP service account with cluster-admin in the vcluster
+#   8. creates an AAP service account with cluster-admin in the vcluster
 #      and stores its one-year token as a secret in the vcluster, so the
 #      shared AAP can launch the run's job pods inside the vcluster;
-#   8. copies the AAP admin password and the shared CA bundle into the
+#   9. copies the AAP admin password and the shared CA bundle into the
 #      vcluster;
-#   9. writes the per-run values overlay for `make install-osac` and prints
-#      the command, plus the path of the vcluster kubeconfig.
+#  10. creates the orders namespace on the outer cluster when absent
+#      (OSAC-8054: remote-mode ClusterOrders need their namespace there);
+#  11. writes the per-run values overlay for `make install-osac` -- the
+#      run's ID plus the suite's service toggles from the run name's suite
+#      letter -- and prints the command, plus the path of the vcluster
+#      kubeconfig.
 #
 # Usage:
 #   KUBECONFIG=/path/to/outer-kubeconfig \
@@ -66,7 +71,10 @@
 # outer cluster, and the prefix of every shared-service object the run
 # touches. Keep it at most 12 characters, lowercase letters and digits:
 # generated names add prefixes to it and must stay within the 63-character
-# DNS label limit.
+# DNS label limit. The last letter before the trailing attempt digits is
+# the suite letter: v for VMaaS, b for BMaaS, c for CaaS (pr2100v1,
+# pr2100b2, nightlyc1); it selects the suite's service toggles in the
+# per-run values overlay.
 #
 # See docs/vcluster-run-setup.md for the end-to-end flow, the run-name
 # table, and the POC-derived troubleshooting notes.
@@ -118,6 +126,18 @@ KEYCLOAK_URL_DEFAULT="https://keycloak.keycloak.svc.cluster.local"
 # NS=osac, so this is not configurable.
 VCLUSTER_OSAC_NAMESPACE="osac"
 
+# The ClusterOrder namespace on the OUTER cluster (OSAC-8054): in remote
+# mode the operator's baremetalworker reconciler creates the InfraEnv and
+# its pull secret in the ClusterOrder's namespace through the outer
+# kubeconfig and lists Agents there. ClusterOrders live in the release
+# namespace, so the outer cluster needs a namespace of the same name.
+ORDERS_NAMESPACE="osac"
+
+# The run-identity label every object a run creates in the outer cluster
+# carries (the design's convention); it marks the orders namespace the run
+# created, so the teardown deletes exactly that one.
+INSTANCE_LABEL_KEY="osac.openshift.io/instance"
+
 # The metering chart's Deployments fetch their Kafka SASL credentials
 # through the LOCAL API of whatever cluster OSAC runs in: their
 # initContainers read Secrets from metering.kafka.clusterNamespace, which
@@ -163,6 +183,10 @@ KEYCLOAK_URL="${KEYCLOAK_URL_DEFAULT}"
 AAP_INSTANCE="${AAP_INSTANCE_DEFAULT}"
 AAP_NAMESPACE="${AAP_NAMESPACE_DEFAULT}"
 AAP_CONTROLLER_URL=""
+
+# The run's suite, read from the run name's suite letter: vmaas, bmaas or
+# caas. Selects the suite's service toggles in the per-run overlay.
+SUITE=""
 
 # Run-derived names, set in main once RUN_NAME is validated. v0 used fixed
 # chart names; v1 prefixes everything with the run so concurrent runs do
@@ -223,7 +247,10 @@ The run name becomes the vcluster name, its namespace vc-<run name> in the
 outer cluster, and the prefix of every shared-service object the run
 touches. Keep it at most 12 characters, lowercase letters and digits:
 generated names add prefixes to it and must stay within the 63-character
-DNS label limit.
+DNS label limit. The last letter before the trailing attempt digits is
+the suite letter: v for VMaaS, b for BMaaS, c for CaaS (pr2100v1,
+pr2100b2, nightlyc1); it selects the suite's service toggles in the
+per-run values overlay.
 EOF
 }
 
@@ -236,6 +263,30 @@ require_command() {
     local command_name="$1"
     command -v "${command_name}" >/dev/null 2>&1 \
         || die "${command_name} is not installed or not in PATH; install it and rerun."
+}
+
+# Read the run's suite from the run name's suite letter. The design's run
+# ID convention is <entry><suite letter><attempt>: pr2100v1, pr2100b2,
+# nightlyc1. Everything after the last letter (attempt digits, dashes) is
+# stripped; what remains must end in the suite letter. A name that does
+# not carry one fails loudly: the suite selects the overlay's service
+# toggles, and guessing would install the wrong one.
+suite_from_run_name() {
+    local base="${RUN_NAME}"
+    while [[ "${base}" =~ [0-9-]$ ]]; do
+        base="${base%?}"
+    done
+    [[ -n "${base}" ]] \
+        || die "Run name '${RUN_NAME}' carries no suite letter: expected v (VMaaS), b (BMaaS) or c (CaaS) as the last letter before the attempt digits."
+    case "${base: -1}" in
+        v) SUITE="vmaas" ;;
+        b) SUITE="bmaas" ;;
+        c) SUITE="caas" ;;
+        *)
+            die "Run name '${RUN_NAME}' does not carry a suite letter: its last letter is '${base: -1}', expected v (VMaaS), b (BMaaS) or c (CaaS)."
+            ;;
+    esac
+    echo "Run ${RUN_NAME} runs the ${SUITE} suite."
 }
 
 ###############################################################################
@@ -318,6 +369,33 @@ read_namespace_uid_range() {
     [[ "${VCLUSTER_UID}" =~ ^[0-9]+$ ]] \
         || die "Cannot parse a numeric UID from annotation value '${annotation}'."
     echo "Using UID ${VCLUSTER_UID} from namespace ${HOST_NAMESPACE} range ${annotation}."
+}
+
+# Create the orders namespace on the outer cluster when absent (OSAC-8054).
+# In remote mode the operator's baremetalworker reconciler creates the
+# InfraEnv and its pull secret in the ClusterOrder's namespace on the outer
+# cluster and lists Agents there; nothing else creates that namespace, and
+# the first order would fail at InfraEnv creation with namespace-not-found.
+# The name matches the release namespace the printed make command installs
+# into (NS=osac). Created here only when absent: the outer cluster's own
+# osac namespace (the shared AAP and the CA bundle live there) must keep
+# its labels and must never be deleted by a run's teardown. The instance
+# label marks the namespace this run created; the teardown deletes the
+# namespace only when the label carries this run's name.
+ensure_orders_namespace() {
+    if kubectl get namespace "${ORDERS_NAMESPACE}" -o name | grep -q .; then
+        echo "Namespace ${ORDERS_NAMESPACE} already exists on the outer cluster; the run reuses it for its ClusterOrders."
+        return
+    fi
+    kubectl apply -f - <<EOF
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${ORDERS_NAMESPACE}
+  labels:
+    ${INSTANCE_LABEL_KEY}: ${RUN_NAME}
+EOF
+    echo "Created namespace ${ORDERS_NAMESPACE} on the outer cluster for the run's ClusterOrders."
 }
 
 read_outer_dns_ip() {
@@ -1279,32 +1357,29 @@ create_aap_service_account() {
 ###############################################################################
 
 # Write the per-run values overlay the printed `make install-osac` command
-# passes to the osac chart. It carries only what is named after the run;
-# everything every vcluster run shares stays in the vcluster-ci profile.
+# passes to the osac chart. It carries only what is named after the run and
+# the run's suite; everything every vcluster run shares stays in the
+# vcluster-ci profile. The suite keys mirror the blocks documented in the
+# profile (osac-installer/values/vcluster-ci/instance.yaml, "Suite
+# selection"); keep the two in sync.
 #
-# Dependency: global.instanceId and aap.vcluster.* land with the parallel
-# osac chart work; until they do, the umbrella schema (which rejects
-# unknown keys) refuses this overlay. The database secret names
-# (<run>-db-config, <run>-db-client-cert, <run>-db-metering-config,
-# <run>-db-metering-client-cert) follow the same work: the chart derives
-# them today from the fixed prefix "osac" and will derive them from
-# global.instanceId. Do not set aap.organization or aap.templatePrefix
-# here: the chart derives both from global.instanceId.
+# The database secret names (<run>-db-config, <run>-db-client-cert,
+# <run>-db-metering-config, <run>-db-metering-client-cert) are derived by
+# the chart from global.instanceId. Do not set aap.organization or
+# aap.templatePrefix here: the chart derives both from global.instanceId.
 write_instance_values() {
     cat >"${INSTANCE_VALUES_FILE}" <<EOF
 # Per-run values overlay for the osac chart, generated by
-# scripts/vcluster-run-setup.sh for run ${RUN_NAME}. Pass it to
-# 'make install-osac' through EXTRA_HELM_ARGS="--values <this file>".
-#
-# Dependencies: global.instanceId, aap.vcluster.*, the external-AAP values
-# and the instanceId-derived database secret and metering Kafka secret
-# names this overlay references exist on the unified osac branch
-# vcluster-e2e (PR osac#2566), not on osac main. The umbrella schema
-# rejects unknown keys, so installing with this overlay requires that
-# branch.
+# scripts/vcluster-run-setup.sh for run ${RUN_NAME} (suite: ${SUITE}).
+# Pass it to 'make install-osac' through EXTRA_HELM_ARGS="--values <this
+# file>". The suite keys mirror the suite blocks documented in
+# osac-installer/values/vcluster-ci/instance.yaml.
 global:
   instanceId: ${RUN_NAME}
   eventTopicPrefix: "${EVENT_TOPIC_PREFIX}"
+EOF
+    write_suite_global_values
+    cat >>"${INSTANCE_VALUES_FILE}" <<EOF
 service:
   auth:
     issuerUrl: https://keycloak-keycloak.${OUTER_DOMAIN}/realms/${RUN_NAME}
@@ -1387,6 +1462,13 @@ operator:
       secretName: ${RUN_NAME}-fulfillment-controller-credentials
   aap:
     templatePrefix: ${RUN_NAME}
+    # The shared AAP by its outer route: the chart's in-cluster default
+    # (http://osac-aap/api/controller) does not resolve inside a vcluster,
+    # and the operator's client wants the /api/controller path.
+    url: ${AAP_CONTROLLER_URL}/api/controller
+EOF
+    write_suite_operator_values
+    cat >>"${INSTANCE_VALUES_FILE}" <<EOF
 aap:
   vcluster:
     apiServerUrl: https://${RUN_NAME}.${HOST_NAMESPACE}.svc.cluster.local
@@ -1394,7 +1476,133 @@ aap:
       name: ${RUN_NAME}-aap-vcluster-token
       key: token
 EOF
+    write_suite_aap_values
+    write_suite_tail_values
     echo "Wrote per-run values overlay to ${INSTANCE_VALUES_FILE}."
+}
+
+# The suite's keys under global: services and, for BMaaS, the cleared
+# Kubernetes Manager (BMaaS has no VM overlay networking and its
+# SecurityGroups keep their ICMP rules; see values/bmaas-ci).
+write_suite_global_values() {
+    case "${SUITE}" in
+        vmaas)
+            cat >>"${INSTANCE_VALUES_FILE}" <<EOF
+  services:
+    vmaas:
+      enabled: true
+EOF
+            ;;
+        bmaas)
+            cat >>"${INSTANCE_VALUES_FILE}" <<EOF
+  services:
+    vmaas:
+      enabled: false
+    bmaas:
+      enabled: true
+  networking:
+    k8sManager: ""
+EOF
+            ;;
+        caas)
+            # vmaas stays enabled: CaaS registers its RHCOS DiskImage
+            # through the VMaaS-owned DiskImages API, but provisions no
+            # VMs. agentless_net is the logical fabric manager CaaS BMI
+            # validation needs (see values/caas-ci).
+            cat >>"${INSTANCE_VALUES_FILE}" <<EOF
+  services:
+    caas:
+      enabled: true
+    bmaas:
+      enabled: true
+    vmaas:
+      enabled: true
+  networking:
+    fabricManager: agentless_net
+EOF
+            ;;
+    esac
+}
+
+# The suite's keys under operator:. CaaS disables the ComputeInstance
+# controller (vmaas is on for the DiskImages API only) and trusts the
+# outer cluster's ingress CA for MCE's Assisted Service ignition URL,
+# read through the remote kubeconfig.
+write_suite_operator_values() {
+    if [[ "${SUITE}" == "caas" ]]; then
+        cat >>"${INSTANCE_VALUES_FILE}" <<'EOF'
+  controllers:
+    computeInstance: false
+  ignition:
+    trustIngressCA: true
+EOF
+    fi
+}
+
+# The suite's keys under aap: the cluster fulfillment instance group the
+# bmaas-ci and caas-ci profiles enable. CaaS also passes the hosted
+# cluster settings: SingleReplica availability (one hosted cluster per
+# test, on shared machines) and the base domain -- the chart's default
+# derives it from the cluster's ingress lookup, which a vcluster has no
+# API for, and hosted clusters live in the outer cluster.
+write_suite_aap_values() {
+    if [[ "${SUITE}" == "bmaas" ]]; then
+        cat >>"${INSTANCE_VALUES_FILE}" <<'EOF'
+  instanceGroups:
+    clusterFulfillment:
+      enabled: true
+EOF
+    elif [[ "${SUITE}" == "caas" ]]; then
+        cat >>"${INSTANCE_VALUES_FILE}" <<EOF
+  instanceGroups:
+    clusterFulfillment:
+      enabled: true
+      config:
+        HOSTED_CLUSTER_CONTROLLER_AVAILABILITY_POLICY: SingleReplica
+        HOSTED_CLUSTER_INFRASTRUCTURE_AVAILABILITY_POLICY: SingleReplica
+        HOSTED_CLUSTER_BASE_DOMAIN: hosted.${OUTER_DOMAIN#apps.}
+EOF
+    fi
+}
+
+# The suite's top-level blocks: the BMF operator wiring for the b and c
+# suites (CaaS runs the BMF operator too, for its bare-metal workers) and
+# the cluster versions CaaS orders reference.
+write_suite_tail_values() {
+    if [[ "${SUITE}" != "bmaas" && "${SUITE}" != "caas" ]]; then
+        return
+    fi
+    cat >>"${INSTANCE_VALUES_FILE}" <<EOF
+bmf:
+  metal3:
+    enabled: true
+    namespace: ${RUN_NAME}-hosts
+  env:
+    # The BMF operator reaches the shared AAP by its outer route, like the
+    # osac-operator above, and launches this run's job templates: the
+    # run's AAP organization prefixes their names.
+    aapUrl: ${AAP_CONTROLLER_URL}/api/controller
+    aapInsecureSkipVerify: "true"
+    aapTemplatePrefix: ${RUN_NAME}
+  secretAPI:
+    issuerUrl: https://keycloak-keycloak.${OUTER_DOMAIN}/realms/${RUN_NAME}
+    credentialsSecret: ${RUN_NAME}-fulfillment-controller-credentials
+EOF
+    if [[ "${SUITE}" == "caas" ]]; then
+        cat >>"${INSTANCE_VALUES_FILE}" <<'EOF'
+clusterVersions:
+  enabled: true
+  versions:
+  - version: "4.20.0"
+    image: "quay.io/openshift-release-dev/ocp-release:4.20.0-multi"
+  - version: "4.22.0"
+    image: "quay.io/openshift-release-dev/ocp-release:4.22.0-multi"
+    default: true
+    diskImage:
+      name: rhcos-4-22
+      sourceRef: oci://quay.io/osac-project/rhcos:4.22.0
+EOF
+    fi
 }
 
 ###############################################################################
@@ -1447,6 +1655,9 @@ print_next_steps() {
     echo "Run the suite with the run's realm and routes:"
     echo "  OSAC_KEYCLOAK_REALM=${RUN_NAME}"
     echo
+    echo "The overlay selects the ${SUITE} suite from the run name's suite"
+    echo "letter; the suite keys it sets are documented in the vcluster-ci"
+    echo "profile (osac-installer/values/vcluster-ci/instance.yaml)."
     echo "PROFILE=vcluster-ci, the chart's vcluster support and the"
     echo "CLUSTER_DOMAIN Makefile override land with the osac chart work"
     echo "(the unified osac branch vcluster-e2e, PR osac#2566), which also"
@@ -1518,6 +1729,7 @@ main() {
     RUN_NAME="${positional_args[0]}"
     [[ "${RUN_NAME}" =~ ^[a-z0-9]([-a-z0-9]{0,10}[a-z0-9])?$ ]] \
         || die "Run name '${RUN_NAME}' must be a DNS label of lowercase letters, digits and '-', at most 12 characters."
+    suite_from_run_name
 
     # Every shared-service object this run touches, named after the run.
     KAFKA_USER_NAME="${RUN_NAME}-fulfillment-service"
@@ -1537,6 +1749,7 @@ main() {
     INSTANCE_VALUES_FILE="${OUTPUT_DIR}/instance-values.yaml"
 
     check_all_preconditions
+    ensure_orders_namespace
     mkdir -p "${OUTPUT_DIR}"
     render_values
     install_vcluster

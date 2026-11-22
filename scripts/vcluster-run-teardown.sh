@@ -7,9 +7,13 @@
 #      chart's cluster-scoped RBAC is removed by helm itself);
 #   2. namespace vc-<run>, which held the vcluster's pods and copied
 #      objects;
-#   3. the run's outer KafkaUsers and their Strimzi secrets;
-#   4. the run's Keycloak realm, through the outer Keycloak's admin API;
-#   5. the run's output files (.vcluster-runs/<run> by default).
+#   3. the orders namespace (osac) on the outer cluster, but only when
+#      this run created it: its instance label carries the run's name,
+#      and a pre-existing namespace (the shared AAP and CA bundle live
+#      in osac on today's outer clusters) is left alone;
+#   4. the run's outer KafkaUsers and their Strimzi secrets;
+#   5. the run's Keycloak realm, through the outer Keycloak's admin API;
+#   6. the run's output files (.vcluster-runs/<run> by default).
 #
 # It then verifies that nothing named after the run remains among the kinds
 # the run setup and the vcluster create, and fails loudly otherwise.
@@ -51,6 +55,13 @@ KEYCLOAK_ADMIN_CREDENTIALS_SECRET="keycloak-admin-credentials"
 KEYCLOAK_URL_DEFAULT="https://keycloak.keycloak.svc.cluster.local"
 CERT_MANAGER_NAMESPACE="cert-manager"
 
+# The ClusterOrder namespace on the outer cluster, created by the run setup
+# when absent (OSAC-8054). Deleted only when this run created it: the
+# instance label the setup wrote carries the run's name, and a namespace
+# without this run's label is not this run's to delete.
+ORDERS_NAMESPACE="osac"
+INSTANCE_LABEL_KEY="osac.openshift.io/instance"
+
 # The kinds whose names the run setup and the vcluster chart prefix with
 # the run. Synced objects inside vc-<run> keep their inner names, so the
 # namespace deletion is what removes them; these kinds are the ones a
@@ -85,10 +96,11 @@ Options:
   -h, --help          show this help
 
 Deletes the run's vcluster (Helm release, then namespace vc-<run>), its
-outer KafkaUsers and Strimzi secrets, its Keycloak realm and its output
-files, then verifies nothing named after the run remains among the kinds
-the run setup and the vcluster create. The run's AAP organization is left
-in place (known gap). Objects the tests create in the outer cluster are
+orders namespace on the outer cluster when the run created it, its outer
+KafkaUsers and Strimzi secrets, its Keycloak realm and its output files,
+then verifies nothing named after the run remains among the kinds the run
+setup and the vcluster create. The run's AAP organization is left in
+place (known gap). Objects the tests create in the outer cluster are
 not touched (known gap, label-based deletion is the follow-up).
 EOF
 }
@@ -200,6 +212,35 @@ delete_host_namespace() {
     # it, so it can take minutes; the teardown must not report success
     # while the namespace still exists.
     wait_until_absent namespace "${HOST_NAMESPACE}" "" 120
+}
+
+# Delete the orders namespace only when this run created it: the instance
+# label the setup wrote at creation carries the run's name. An absent
+# namespace, or one labelled for another run (or not labelled at all --
+# today's outer clusters keep the shared AAP and CA bundle in osac), is
+# left in place; the run's ClusterOrders are gone with the vcluster
+# anyway.
+delete_orders_namespace() {
+    local output label
+    if ! output="$(kubectl get namespace "${ORDERS_NAMESPACE}" \
+        -o jsonpath="{.metadata.labels.${INSTANCE_LABEL_KEY//./\\.}}" 2>&1)"; then
+        if [[ "${output}" == *"NotFound"* ]]; then
+            echo "Namespace ${ORDERS_NAMESPACE} does not exist on the outer cluster; nothing to delete."
+            return
+        fi
+        die "Cannot read namespace ${ORDERS_NAMESPACE}: ${output}"
+    fi
+    label="${output}"
+    if [[ -z "${label}" ]]; then
+        echo "Namespace ${ORDERS_NAMESPACE} carries no ${INSTANCE_LABEL_KEY} label; not this run's to delete."
+        return
+    fi
+    if [[ "${label}" != "${RUN_NAME}" ]]; then
+        echo "Namespace ${ORDERS_NAMESPACE} carries ${INSTANCE_LABEL_KEY}=${label}, not ${RUN_NAME}; leaving it in place."
+        return
+    fi
+    kubectl delete namespace "${ORDERS_NAMESPACE}" --ignore-not-found
+    wait_until_absent namespace "${ORDERS_NAMESPACE}" "" 120
 }
 
 delete_kafka_users() {
@@ -330,7 +371,8 @@ verify_no_run_objects_remain() {
     echo "Teardown complete: no objects matching ${RUN_NAME}-* remain among"
     echo "the kinds the run setup and the vcluster create (namespaces,"
     echo "KafkaUsers, secrets, cluster roles and bindings, Helm releases,"
-    echo "Keycloak realm), and the run's output files are deleted."
+    echo "Keycloak realm), and the run's output files are deleted. The"
+    echo "orders namespace was deleted only if this run created it."
     echo "Left in place on purpose: the run's AAP organization, and any"
     echo "objects the tests created in the outer cluster (see the known"
     echo "gaps in docs/vcluster-run-setup.md)."
@@ -396,6 +438,7 @@ main() {
 
     uninstall_vcluster_release
     delete_host_namespace
+    delete_orders_namespace
     delete_kafka_users
     delete_keycloak_realm
     delete_output_files

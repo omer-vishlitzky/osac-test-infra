@@ -5,11 +5,14 @@
 # Runs both REAL scripts end to end against stubbed kubectl, helm, vcluster
 # and curl binaries backed by a directory of marker files (the "cluster
 # state"), with the REAL realm.json from the osac monorepo and REAL
-# python3, openssl, sed and base64. Two runs are set up side by side to
-# prove the per-run isolation; the first is torn down to prove the
-# name-anchored verification leaves the second (and a run whose name is a
-# prefix of another) untouched; a planted leftover must fail the teardown
-# loudly.
+# python3, openssl, sed and base64. A VMaaS and a BMaaS run are set up side
+# by side to prove the per-run isolation; the first is torn down to prove
+# the name-anchored verification leaves the second (and a run whose name is
+# a prefix of another) untouched, and that a pre-existing orders namespace
+# survives; a CaaS run on an outer cluster without an orders namespace
+# proves the run creates it (labelled) and its teardown deletes it; a
+# planted leftover must fail the teardown loudly. A run name without a
+# suite letter must fail the setup loudly.
 #
 # The sed-hostile Keycloak admin password (p#ss&\word$x) and the
 # JSON-hostile fixture password (p@ss"w0rd\2) exercise the escape handling
@@ -147,6 +150,14 @@ case "$1" in
                 elif [[ "${output}" == *uid-range* ]]; then
                     [[ -d "${STATE}/namespace/${name}" ]] || { echo "Error from server (NotFound): namespaces \"${name}\" not found" >&2; exit 1; }
                     echo "1000880000/10000"
+                elif [[ "${output}" == *".labels."* ]]; then
+                    # A label query: the instance label the setup records
+                    # when it creates the namespace, empty for a
+                    # pre-existing one.
+                    [[ -d "${STATE}/namespace/${name}" ]] || { echo "Error from server (NotFound): namespaces \"${name}\" not found" >&2; exit 1; }
+                    if [[ -f "${STATE}/namespace/${name}/instance-label" ]]; then
+                        cat "${STATE}/namespace/${name}/instance-label"
+                    fi
                 elif [[ -d "${STATE}/namespace/${name}" ]]; then
                     echo "namespace/${name}"
                 else
@@ -334,6 +345,16 @@ case "$1" in
                     mkdir -p "${STATE}/secret/osac-kafka/${user}"
                     echo "stub-password-${user}" >"${STATE}/secret/osac-kafka/${user}/password"
                 done
+                ;;
+            Namespace)
+                # Record the instance label the run setup writes when it
+                # creates the orders namespace, so the teardown's
+                # label-based check can read it back.
+                mkdir -p "${STATE}/namespace/${object_name}"
+                label="$(printf '%s\n' "${input}" | sed -n 's/^    osac\.openshift\.io\/instance: //p')"
+                if [[ -n "${label}" ]]; then
+                    printf '%s\n' "${label}" >"${STATE}/namespace/${object_name}/instance-label"
+                fi
                 ;;
             *)
                 mkdir -p "${STATE}/${kind,,}/${object_name}"
@@ -648,7 +669,11 @@ seed_outer_cluster() {
     mkdir -p "${outer}/secret/cert-manager/default-ca" \
         "${outer}/secret/keycloak/keycloak-admin-credentials" \
         "${outer}/secret/osac/osac-aap-admin-password" \
-        "${outer}/configmap/osac/ca-bundle"
+        "${outer}/configmap/osac/ca-bundle" \
+        "${outer}/namespace/osac"
+    # The outer cluster's own osac namespace, as a real outer cluster has
+    # it (the shared AAP and the CA bundle live there): the run setup must
+    # reuse it for the run's ClusterOrders and never label or delete it.
     printf -- '-----BEGIN CERTIFICATE-----\nstub-ca\n-----END CERTIFICATE-----\n' \
         >"${outer}/secret/cert-manager/default-ca/ca.crt"
     printf -- '-----BEGIN CERTIFICATE-----\nstub-leaf\n-----END CERTIFICATE-----\n' \
@@ -670,7 +695,8 @@ export KUBECONFIG="${WORKSPACE}/outer-kubeconfig"
 printf 'stub outer kubeconfig\n' >"${KUBECONFIG}"
 
 # Reruns start clean.
-rm -rf "${REPO_ROOT}/.vcluster-runs/vcrun1" "${REPO_ROOT}/.vcluster-runs/vcrun2"
+rm -rf "${REPO_ROOT}/.vcluster-runs/vcrunv1" "${REPO_ROOT}/.vcluster-runs/vcrunb1" \
+    "${REPO_ROOT}/.vcluster-runs/vcrunc1"
 
 ###############################################################################
 # Assertions
@@ -730,7 +756,7 @@ assert_file_absent() {
 }
 
 ###############################################################################
-# Run the setup for two runs
+# Run the setup for the runs
 ###############################################################################
 
 run_setup() {
@@ -740,58 +766,70 @@ run_setup() {
 }
 
 echo
-echo "== Setting up run vcrun1 =="
-run_setup vcrun1 >"${WORKSPACE}/calls/setup-vcrun1.log" 2>&1 \
-    || { cat "${WORKSPACE}/calls/setup-vcrun1.log"; fail "setup for vcrun1 failed"; }
+echo "== A run name without a suite letter fails loudly =="
+if "${SETUP_SCRIPT}" vcrun1 --realm-json "${REALM_JSON}" \
+    --output-dir "${REPO_ROOT}/.vcluster-runs/vcrun1" \
+    >"${WORKSPACE}/calls/setup-badname.log" 2>&1; then
+    fail "setup accepted a run name without a suite letter"
+else
+    echo "ok: setup rejected a run name without a suite letter"
+fi
+assert_contains "${WORKSPACE}/calls/setup-badname.log" "suite letter" \
+    "the failure explains the suite-letter convention"
 
 echo
-echo "== Setting up run vcrun2 =="
-run_setup vcrun2 >"${WORKSPACE}/calls/setup-vcrun2.log" 2>&1 \
-    || { cat "${WORKSPACE}/calls/setup-vcrun2.log"; fail "setup for vcrun2 failed"; }
+echo "== Setting up run vcrunv1 (VMaaS) =="
+run_setup vcrunv1 >"${WORKSPACE}/calls/setup-vcrunv1.log" 2>&1 \
+    || { cat "${WORKSPACE}/calls/setup-vcrunv1.log"; fail "setup for vcrunv1 failed"; }
+
+echo
+echo "== Setting up run vcrunb1 (BMaaS) =="
+run_setup vcrunb1 >"${WORKSPACE}/calls/setup-vcrunb1.log" 2>&1 \
+    || { cat "${WORKSPACE}/calls/setup-vcrunb1.log"; fail "setup for vcrunb1 failed"; }
 
 APPLIES="${WORKSPACE}/calls/applies.txt"
 
 echo
 echo "== KafkaUsers are run-prefixed =="
-assert_contains "${APPLIES}" "name: vcrun1-fulfillment-service$" "fulfillment KafkaUser named after run vcrun1"
-assert_contains "${APPLIES}" "name: vcrun1-osac-metering$" "metering KafkaUser named after run vcrun1"
-assert_contains "${APPLIES}" "name: vcrun1-osac-metering-echo-adapter$" "echo adapter KafkaUser named after run vcrun1"
-assert_contains "${APPLIES}" "name: vcrun2-fulfillment-service$" "fulfillment KafkaUser named after run vcrun2"
+assert_contains "${APPLIES}" "name: vcrunv1-fulfillment-service$" "fulfillment KafkaUser named after run vcrunv1"
+assert_contains "${APPLIES}" "name: vcrunv1-osac-metering$" "metering KafkaUser named after run vcrunv1"
+assert_contains "${APPLIES}" "name: vcrunv1-osac-metering-echo-adapter$" "echo adapter KafkaUser named after run vcrunv1"
+assert_contains "${APPLIES}" "name: vcrunb1-fulfillment-service$" "fulfillment KafkaUser named after run vcrunb1"
 assert_not_contains "${APPLIES}" "^  name: fulfillment-service$" "no unprefixed fulfillment KafkaUser"
 assert_not_contains "${APPLIES}" "^  name: osac-metering$" "no unprefixed metering KafkaUser"
 
 echo
 echo "== Kafka ACLs carry the run prefixes =="
-for prefix in "vcrun1.events." "vcrun1.system." "vcrun1.metering.heartbeat." "vcrun1.metering.dlq."; do
+for prefix in "vcrunv1.events." "vcrunv1.system." "vcrunv1.metering.heartbeat." "vcrunv1.metering.dlq."; do
     assert_contains "${APPLIES}" "name: ${prefix}" "ACL prefix ${prefix}"
 done
-assert_contains "${APPLIES}" "name: vcrun1.metering.inference$" "inference topic is run-prefixed"
-assert_contains "${APPLIES}" "name: vcrun1.metering.inference.dlq$" "inference dead-letter topic is run-prefixed"
+assert_contains "${APPLIES}" "name: vcrunv1.metering.inference$" "inference topic is run-prefixed"
+assert_contains "${APPLIES}" "name: vcrunv1.metering.inference.dlq$" "inference dead-letter topic is run-prefixed"
 assert_not_contains "${APPLIES}" "name: osac.events." "no shared osac.events. ACL"
 assert_not_contains "${APPLIES}" "name: osac.system." "no shared osac.system. ACL"
 
 echo
 echo "== The vcluster secrets are run-prefixed =="
-assert_contains "${APPLIES}" "name: vcrun1-fulfillment-service-kafka" "fulfillment Kafka connection secret"
-assert_contains "${APPLIES}" "user: vcrun1-fulfillment-service" "connection secret carries the run-prefixed user"
-assert_contains "${APPLIES}" "password: stub-password-vcrun1-fulfillment-service" "connection secret carries this run's Strimzi password"
-assert_contains "${APPLIES}" "name: vcrun1-osac-metering$" "metering Strimzi secret mirrored under its run-prefixed name"
-assert_contains "${APPLIES}" "name: vcrun1-aap-vcluster-token" "AAP token secret"
-assert_contains "${APPLIES}" "token: stub-token-vcrun1-aap" "AAP token secret holds the minted token"
-assert_contains "${APPLIES}" "name: vcrun1-fulfillment-controller-credentials" "controller credentials secret"
+assert_contains "${APPLIES}" "name: vcrunv1-fulfillment-service-kafka" "fulfillment Kafka connection secret"
+assert_contains "${APPLIES}" "user: vcrunv1-fulfillment-service" "connection secret carries the run-prefixed user"
+assert_contains "${APPLIES}" "password: stub-password-vcrunv1-fulfillment-service" "connection secret carries this run's Strimzi password"
+assert_contains "${APPLIES}" "name: vcrunv1-osac-metering$" "metering Strimzi secret mirrored under its run-prefixed name"
+assert_contains "${APPLIES}" "name: vcrunv1-aap-vcluster-token" "AAP token secret"
+assert_contains "${APPLIES}" "token: stub-token-vcrunv1-aap" "AAP token secret holds the minted token"
+assert_contains "${APPLIES}" "name: vcrunv1-fulfillment-controller-credentials" "controller credentials secret"
 assert_contains "${APPLIES}" "client-id: osac-controller" "controller credentials carry the realm client id"
-assert_contains "${APPLIES}" "name: vcrun1-osac-ui-backend-credentials" "UI backend credentials secret"
+assert_contains "${APPLIES}" "name: vcrunv1-osac-ui-backend-credentials" "UI backend credentials secret"
 assert_contains "${APPLIES}" "client-id: osac-ui-backend" "UI backend credentials carry the realm client id"
 assert_contains "${APPLIES}" "name: osac-aap-admin-password" "AAP admin password copied under the chart's name"
 
 echo
 echo "== Each run's Strimzi password is used exactly once, by that run =="
-assert_count "${APPLIES}" "stub-password-vcrun1-fulfillment-service" 1 "vcrun1's fulfillment password appears once"
-assert_count "${APPLIES}" "stub-password-vcrun2-fulfillment-service" 1 "vcrun2's fulfillment password appears once"
+assert_count "${APPLIES}" "stub-password-vcrunv1-fulfillment-service" 1 "vcrunv1's fulfillment password appears once"
+assert_count "${APPLIES}" "stub-password-vcrunb1-fulfillment-service" 1 "vcrunb1's fulfillment password appears once"
 
 echo
 echo "== The realm JSON: rename, id drop, placeholder resolution =="
-python3 - "${WORKSPACE}/calls/imported-realm-vcrun1.json" \
+python3 - "${WORKSPACE}/calls/imported-realm-vcrunv1.json" \
     "${KEYCLOAK_ADMIN_USERNAME}" "${KEYCLOAK_ADMIN_PASSWORD}" <<'PYEOF' || fail "realm JSON assertions failed"
 import json
 import sys
@@ -801,7 +839,7 @@ with open(realm_path) as source:
     realm = json.load(source)
 
 checks = []
-checks.append(("realm renamed to the run", realm.get("realm") == "vcrun1"))
+checks.append(("realm renamed to the run", realm.get("realm") == "vcrunv1"))
 checks.append(("top-level id dropped", "id" not in realm))
 
 admin_user = next(u for u in realm["users"] if u["username"] == admin_username)
@@ -818,7 +856,7 @@ checks.append(("UI backend client secret resolved", bool(ui_backend["secret"])))
 ui_client = next(c for c in realm["clients"] if c["clientId"] == "osac-ui")
 checks.append((
     "UI URL resolved to the run's route",
-    ui_client["rootUrl"] == "https://osac-ui-vcrun1.apps.ci.example.com",
+    ui_client["rootUrl"] == "https://osac-ui-vcrunv1.apps.ci.example.com",
 ))
 
 failed = [description for description, ok in checks if not ok]
@@ -828,7 +866,7 @@ if failed:
     sys.exit(1)
 PYEOF
 
-assert_not_contains "${WORKSPACE}/calls/imported-realm-vcrun1.json" "__OSAC_" "no unresolved placeholders in the realm"
+assert_not_contains "${WORKSPACE}/calls/imported-realm-vcrunv1.json" "__OSAC_" "no unresolved placeholders in the realm"
 
 echo
 echo "== The realm's controller secret matches the vcluster credentials =="
@@ -837,7 +875,7 @@ import json, sys
 with open(sys.argv[1]) as source:
     realm = json.load(source)
 print(next(c for c in realm['clients'] if c['clientId'] == 'osac-controller')['secret'])
-" "${WORKSPACE}/calls/imported-realm-vcrun1.json")"
+" "${WORKSPACE}/calls/imported-realm-vcrunv1.json")"
 assert_contains "${APPLIES}" "client-secret: ${controller_secret}" "vcluster controller credentials hold the realm's secret"
 
 echo
@@ -968,7 +1006,7 @@ PYEOF
 
 echo
 echo "== The per-run values overlay =="
-OVERLAY="${REPO_ROOT}/.vcluster-runs/vcrun1/instance-values.yaml"
+OVERLAY="${REPO_ROOT}/.vcluster-runs/vcrunv1/instance-values.yaml"
 assert_file_exists "${OVERLAY}" "overlay written"
 python3 - "${OVERLAY}" <<'PYEOF' || fail "overlay assertions failed"
 import sys
@@ -979,26 +1017,72 @@ with open(sys.argv[1]) as source:
     values = yaml.safe_load(source)
 
 checks = [
-    ("instanceId", values["global"]["instanceId"] == "vcrun1"),
-    ("eventTopicPrefix", values["global"]["eventTopicPrefix"] == "vcrun1.events."),
-    ("issuer realm", values["service"]["auth"]["issuerUrl"].endswith("/realms/vcrun1")),
-    ("vault issuer realm", values["service"]["vault"]["keycloakIssuerUrl"].endswith("/realms/vcrun1")),
-    ("ui issuer realm", values["ui"]["auth"]["oidcIssuerURL"].endswith("/realms/vcrun1")),
-    ("vault namespace", values["service"]["vault"]["namespace"] == "vcrun1"),
-    ("controller credentials", values["service"]["auth"]["controllerCredentials"][0]["secret"]["name"] == "vcrun1-fulfillment-controller-credentials"),
-    ("idp credentials", values["service"]["idp"]["credentials"][0]["secret"]["name"] == "vcrun1-fulfillment-controller-credentials"),
-    ("ui backend credentials", values["ui"]["auth"]["serviceAccount"]["credentialsSecret"] == "vcrun1-osac-ui-backend-credentials"),
-    ("service db config", values["service"]["database"]["connection"][0]["secret"]["name"] == "vcrun1-db-config"),
-    ("service db cert", values["service"]["database"]["connection"][1]["secret"]["name"] == "vcrun1-db-client-cert"),
-    ("metering db config", values["metering"]["database"]["connection"][0]["secret"]["name"] == "vcrun1-db-metering-config"),
-    ("metering db cert", values["metering"]["database"]["connection"][1]["secret"]["name"] == "vcrun1-db-metering-client-cert"),
-    ("kafka connection", values["service"]["kafka"]["connection"][0]["secret"]["name"] == "vcrun1-fulfillment-service-kafka"),
-    ("operator template prefix", values["operator"]["aap"]["templatePrefix"] == "vcrun1"),
-    ("operator fulfillment credentials", values["operator"]["fulfillment"]["credentials"]["secretName"] == "vcrun1-fulfillment-controller-credentials"),
-    ("aap api server url", values["aap"]["vcluster"]["apiServerUrl"] == "https://vcrun1.vc-vcrun1.svc.cluster.local"),
-    ("aap token secret", values["aap"]["vcluster"]["tokenSecret"] == {"name": "vcrun1-aap-vcluster-token", "key": "token"}),
+    ("instanceId", values["global"]["instanceId"] == "vcrunv1"),
+    ("eventTopicPrefix", values["global"]["eventTopicPrefix"] == "vcrunv1.events."),
+    ("issuer realm", values["service"]["auth"]["issuerUrl"].endswith("/realms/vcrunv1")),
+    ("vault issuer realm", values["service"]["vault"]["keycloakIssuerUrl"].endswith("/realms/vcrunv1")),
+    ("ui issuer realm", values["ui"]["auth"]["oidcIssuerURL"].endswith("/realms/vcrunv1")),
+    ("vault namespace", values["service"]["vault"]["namespace"] == "vcrunv1"),
+    ("controller credentials", values["service"]["auth"]["controllerCredentials"][0]["secret"]["name"] == "vcrunv1-fulfillment-controller-credentials"),
+    ("idp credentials", values["service"]["idp"]["credentials"][0]["secret"]["name"] == "vcrunv1-fulfillment-controller-credentials"),
+    ("ui backend credentials", values["ui"]["auth"]["serviceAccount"]["credentialsSecret"] == "vcrunv1-osac-ui-backend-credentials"),
+    ("service db config", values["service"]["database"]["connection"][0]["secret"]["name"] == "vcrunv1-db-config"),
+    ("service db cert", values["service"]["database"]["connection"][1]["secret"]["name"] == "vcrunv1-db-client-cert"),
+    ("metering db config", values["metering"]["database"]["connection"][0]["secret"]["name"] == "vcrunv1-db-metering-config"),
+    ("metering db cert", values["metering"]["database"]["connection"][1]["secret"]["name"] == "vcrunv1-db-metering-client-cert"),
+    ("kafka connection", values["service"]["kafka"]["connection"][0]["secret"]["name"] == "vcrunv1-fulfillment-service-kafka"),
+    ("operator template prefix", values["operator"]["aap"]["templatePrefix"] == "vcrunv1"),
+    ("operator aap url", values["operator"]["aap"]["url"] == "https://osac-aap.apps.ci.example.com/api/controller"),
+    ("operator fulfillment credentials", values["operator"]["fulfillment"]["credentials"]["secretName"] == "vcrunv1-fulfillment-controller-credentials"),
+    ("aap api server url", values["aap"]["vcluster"]["apiServerUrl"] == "https://vcrunv1.vc-vcrunv1.svc.cluster.local"),
+    ("aap token secret", values["aap"]["vcluster"]["tokenSecret"] == {"name": "vcrunv1-aap-vcluster-token", "key": "token"}),
     ("no aap.organization", "organization" not in values.get("aap", {})),
     ("no aap.templatePrefix", "templatePrefix" not in values.get("aap", {})),
+    # VMaaS suite: the vmaas service key restates the profile default and
+    # nothing else is toggled.
+    ("vmaas service enabled", values["global"]["services"] == {"vmaas": {"enabled": True}}),
+    ("no networking override", "networking" not in values["global"]),
+    ("no bmf block", "bmf" not in values),
+    ("no clusterVersions block", "clusterVersions" not in values),
+    ("no controller overrides", "controllers" not in values["operator"]),
+    ("no ignition override", "ignition" not in values["operator"]),
+    ("no instance group overrides", "instanceGroups" not in values.get("aap", {})),
+]
+
+failed = [description for description, ok in checks if not ok]
+for description, ok in checks:
+    print(("ok: " if ok else "FAIL: ") + description)
+if failed:
+    sys.exit(1)
+PYEOF
+
+echo
+echo "== The BMaaS overlay selects the suite =="
+BMAAS_OVERLAY="${REPO_ROOT}/.vcluster-runs/vcrunb1/instance-values.yaml"
+assert_file_exists "${BMAAS_OVERLAY}" "BMaaS overlay written"
+python3 - "${BMAAS_OVERLAY}" <<'PYEOF' || fail "BMaaS overlay assertions failed"
+import sys
+
+import yaml
+
+with open(sys.argv[1]) as source:
+    values = yaml.safe_load(source)
+
+checks = [
+    ("instanceId", values["global"]["instanceId"] == "vcrunb1"),
+    ("bmaas service enabled", values["global"]["services"]["bmaas"]["enabled"] is True),
+    ("vmaas service disabled", values["global"]["services"]["vmaas"]["enabled"] is False),
+    ("caas absent", "caas" not in values["global"]["services"]),
+    ("k8s manager cleared", values["global"]["networking"]["k8sManager"] == ""),
+    ("cluster fulfillment instance group", values["aap"]["instanceGroups"]["clusterFulfillment"]["enabled"] is True),
+    ("bmf metal3 namespace", values["bmf"]["metal3"] == {"enabled": True, "namespace": "vcrunb1-hosts"}),
+    ("bmf aap url", values["bmf"]["env"]["aapUrl"] == "https://osac-aap.apps.ci.example.com/api/controller"),
+    ("bmf aap insecure", values["bmf"]["env"]["aapInsecureSkipVerify"] == "true"),
+    ("bmf aap template prefix", values["bmf"]["env"]["aapTemplatePrefix"] == "vcrunb1"),
+    ("bmf issuer realm", values["bmf"]["secretAPI"]["issuerUrl"].endswith("/realms/vcrunb1")),
+    ("bmf credentials secret", values["bmf"]["secretAPI"]["credentialsSecret"] == "vcrunb1-fulfillment-controller-credentials"),
+    ("operator aap url", values["operator"]["aap"]["url"] == "https://osac-aap.apps.ci.example.com/api/controller"),
+    ("no clusterVersions block", "clusterVersions" not in values),
 ]
 
 failed = [description for description, ok in checks if not ok]
@@ -1010,78 +1094,180 @@ PYEOF
 
 echo
 echo "== The printed make command =="
-assert_contains "${WORKSPACE}/calls/setup-vcrun1.log" "--values ${OVERLAY}" "make command passes the overlay"
-assert_contains "${WORKSPACE}/calls/setup-vcrun1.log" "fulfillment-api-vcrun1.${OUTER_DOMAIN}" "make command passes the run-prefixed API hostname"
-assert_contains "${WORKSPACE}/calls/setup-vcrun1.log" "osac-ui-vcrun1.${OUTER_DOMAIN}" "make command passes the run-prefixed UI hostname"
-assert_contains "${WORKSPACE}/calls/setup-vcrun1.log" "OSAC_KEYCLOAK_REALM=vcrun1" "printed hint names the run's realm"
-assert_contains "${WORKSPACE}/calls/setup-vcrun1.log" "aap.controllerUrl=https://osac-aap.${OUTER_DOMAIN}" "make command passes the shared AAP controller URL (resolved from the route)"
-assert_contains "${WORKSPACE}/calls/setup-vcrun1.log" "aap.bootstrap.adminPasswordSecret.name=osac-aap-admin-password" "make command passes the AAP admin password secret name"
+assert_contains "${WORKSPACE}/calls/setup-vcrunv1.log" "--values ${OVERLAY}" "make command passes the overlay"
+assert_contains "${WORKSPACE}/calls/setup-vcrunv1.log" "fulfillment-api-vcrunv1.${OUTER_DOMAIN}" "make command passes the run-prefixed API hostname"
+assert_contains "${WORKSPACE}/calls/setup-vcrunv1.log" "osac-ui-vcrunv1.${OUTER_DOMAIN}" "make command passes the run-prefixed UI hostname"
+assert_contains "${WORKSPACE}/calls/setup-vcrunv1.log" "OSAC_KEYCLOAK_REALM=vcrunv1" "printed hint names the run's realm"
+assert_contains "${WORKSPACE}/calls/setup-vcrunv1.log" "aap.controllerUrl=https://osac-aap.${OUTER_DOMAIN}" "make command passes the shared AAP controller URL (resolved from the route)"
+assert_contains "${WORKSPACE}/calls/setup-vcrunv1.log" "aap.bootstrap.adminPasswordSecret.name=osac-aap-admin-password" "make command passes the AAP admin password secret name"
 
 echo
 echo "== Isolation between the two runs =="
-assert_file_exists "${WORKSPACE}/state/outer/kafkauser/vcrun1-fulfillment-service" "vcrun1 KafkaUser exists in the outer cluster"
-assert_file_exists "${WORKSPACE}/state/outer/kafkauser/vcrun2-fulfillment-service" "vcrun2 KafkaUser exists in the outer cluster"
-assert_file_exists "${WORKSPACE}/state/outer/realm/vcrun1" "realm vcrun1 exists"
-assert_file_exists "${WORKSPACE}/state/outer/realm/vcrun2" "realm vcrun2 exists"
-assert_file_exists "${WORKSPACE}/state/vcluster-vcrun1/secret/osac/vcrun1-aap-vcluster-token" "vcrun1's AAP token secret is inside its vcluster"
-assert_file_exists "${WORKSPACE}/state/vcluster-vcrun2/secret/osac/vcrun2-aap-vcluster-token" "vcrun2's AAP token secret is inside its vcluster"
-assert_file_absent "${WORKSPACE}/state/vcluster-vcrun1/secret/osac/vcrun2-aap-vcluster-token" "vcrun2's AAP token secret is not in vcrun1"
+assert_file_exists "${WORKSPACE}/state/outer/kafkauser/vcrunv1-fulfillment-service" "vcrunv1 KafkaUser exists in the outer cluster"
+assert_file_exists "${WORKSPACE}/state/outer/kafkauser/vcrunb1-fulfillment-service" "vcrunb1 KafkaUser exists in the outer cluster"
+assert_file_exists "${WORKSPACE}/state/outer/realm/vcrunv1" "realm vcrunv1 exists"
+assert_file_exists "${WORKSPACE}/state/outer/realm/vcrunb1" "realm vcrunb1 exists"
+assert_file_exists "${WORKSPACE}/state/vcluster-vcrunv1/secret/osac/vcrunv1-aap-vcluster-token" "vcrunv1's AAP token secret is inside its vcluster"
+assert_file_exists "${WORKSPACE}/state/vcluster-vcrunb1/secret/osac/vcrunb1-aap-vcluster-token" "vcrunb1's AAP token secret is inside its vcluster"
+assert_file_absent "${WORKSPACE}/state/vcluster-vcrunv1/secret/osac/vcrunb1-aap-vcluster-token" "vcrunb1's AAP token secret is not in vcrunv1"
+
+echo
+echo "== The orders namespace is reused, not created or labelled =="
+# The outer cluster came with its own osac namespace (seeded above), so the
+# setup must reuse it: no labelled Namespace apply, no label written. (The
+# plain "kind: Namespace" applies in the log are the vcluster's own osac
+# and osac-kafka namespaces, created inside the vcluster.)
+assert_not_contains "${APPLIES}" "osac.openshift.io/instance:" "no labelled Namespace is applied when osac exists"
+assert_file_absent "${WORKSPACE}/state/outer/namespace/osac/instance-label" "the pre-existing osac namespace carries no instance label"
+assert_contains "${WORKSPACE}/calls/setup-vcrunv1.log" "already exists on the outer cluster; the run reuses it" "vcrunv1 setup reports the reuse"
+assert_contains "${WORKSPACE}/calls/setup-vcrunb1.log" "already exists on the outer cluster; the run reuses it" "vcrunb1 setup reports the reuse"
 
 ###############################################################################
 # Teardown
 ###############################################################################
 
-# A decoy belonging to a run whose name starts with vcrun1: the teardown of
-# vcrun1 must not match or delete it (name anchoring).
-mkdir -p "${WORKSPACE}/state/outer/secret/osac-kafka/vcrun10-osac-metering"
-echo "stub-password-vcrun10-osac-metering" \
-    >"${WORKSPACE}/state/outer/secret/osac-kafka/vcrun10-osac-metering/password"
+# A decoy belonging to a run whose name starts with vcrunv1: the teardown of
+# vcrunv1 must not match or delete it (name anchoring).
+mkdir -p "${WORKSPACE}/state/outer/secret/osac-kafka/vcrunv10-osac-metering"
+echo "stub-password-vcrunv10-osac-metering" \
+    >"${WORKSPACE}/state/outer/secret/osac-kafka/vcrunv10-osac-metering/password"
 
 echo
-echo "== Tearing down run vcrun1 (vcrun2 and vcrun10 stay) =="
-"${TEARDOWN_SCRIPT}" vcrun1 >"${WORKSPACE}/calls/teardown-vcrun1.log" 2>&1 \
-    || { cat "${WORKSPACE}/calls/teardown-vcrun1.log"; fail "teardown of vcrun1 failed"; }
-assert_contains "${WORKSPACE}/calls/teardown-vcrun1.log" "Teardown complete" "teardown reports success"
+echo "== Tearing down run vcrunv1 (vcrunb1 and vcrunv10 stay) =="
+"${TEARDOWN_SCRIPT}" vcrunv1 >"${WORKSPACE}/calls/teardown-vcrunv1.log" 2>&1 \
+    || { cat "${WORKSPACE}/calls/teardown-vcrunv1.log"; fail "teardown of vcrunv1 failed"; }
+assert_contains "${WORKSPACE}/calls/teardown-vcrunv1.log" "Teardown complete" "teardown reports success"
 
 echo
-echo "== vcrun1's objects are gone, vcrun2's and vcrun10's remain =="
-assert_file_absent "${WORKSPACE}/state/outer/namespace/vc-vcrun1" "namespace vc-vcrun1 deleted"
-assert_file_absent "${WORKSPACE}/state/outer/kafkauser/vcrun1-fulfillment-service" "vcrun1 fulfillment KafkaUser deleted"
-assert_file_absent "${WORKSPACE}/state/outer/kafkauser/vcrun1-osac-metering" "vcrun1 metering KafkaUser deleted"
-assert_file_absent "${WORKSPACE}/state/outer/secret/osac-kafka/vcrun1-fulfillment-service" "vcrun1 Strimzi secret deleted"
-assert_file_absent "${WORKSPACE}/state/outer/realm/vcrun1" "realm vcrun1 deleted"
-assert_file_absent "${REPO_ROOT}/.vcluster-runs/vcrun1" "output files deleted"
-assert_file_exists "${WORKSPACE}/state/outer/kafkauser/vcrun2-fulfillment-service" "vcrun2 KafkaUser untouched"
-assert_file_exists "${WORKSPACE}/state/outer/secret/osac-kafka/vcrun2-osac-metering" "vcrun2 Strimzi secret untouched"
-assert_file_exists "${WORKSPACE}/state/outer/realm/vcrun2" "realm vcrun2 untouched"
-assert_file_exists "${WORKSPACE}/state/outer/secret/osac-kafka/vcrun10-osac-metering" "vcrun10 decoy untouched (name anchoring)"
-assert_file_exists "${REPO_ROOT}/.vcluster-runs/vcrun2" "vcrun2 output files untouched"
+echo "== vcrunv1's objects are gone, vcrunb1's and vcrunv10's remain =="
+assert_file_absent "${WORKSPACE}/state/outer/namespace/vc-vcrunv1" "namespace vc-vcrunv1 deleted"
+assert_file_absent "${WORKSPACE}/state/outer/kafkauser/vcrunv1-fulfillment-service" "vcrunv1 fulfillment KafkaUser deleted"
+assert_file_absent "${WORKSPACE}/state/outer/kafkauser/vcrunv1-osac-metering" "vcrunv1 metering KafkaUser deleted"
+assert_file_absent "${WORKSPACE}/state/outer/secret/osac-kafka/vcrunv1-fulfillment-service" "vcrunv1 Strimzi secret deleted"
+assert_file_absent "${WORKSPACE}/state/outer/realm/vcrunv1" "realm vcrunv1 deleted"
+assert_file_absent "${REPO_ROOT}/.vcluster-runs/vcrunv1" "output files deleted"
+assert_file_exists "${WORKSPACE}/state/outer/kafkauser/vcrunb1-fulfillment-service" "vcrunb1 KafkaUser untouched"
+assert_file_exists "${WORKSPACE}/state/outer/secret/osac-kafka/vcrunb1-osac-metering" "vcrunb1 Strimzi secret untouched"
+assert_file_exists "${WORKSPACE}/state/outer/realm/vcrunb1" "realm vcrunb1 untouched"
+assert_file_exists "${WORKSPACE}/state/outer/secret/osac-kafka/vcrunv10-osac-metering" "vcrunv10 decoy untouched (name anchoring)"
+assert_file_exists "${REPO_ROOT}/.vcluster-runs/vcrunb1" "vcrunb1 output files untouched"
+# The orders namespace pre-existed the runs, so the teardown of vcrunv1
+# must leave it exactly as it was.
+assert_file_exists "${WORKSPACE}/state/outer/namespace/osac" "the pre-existing orders namespace survives the teardown"
+assert_contains "${WORKSPACE}/calls/teardown-vcrunv1.log" "carries no osac.openshift.io/instance label" "teardown explains why the orders namespace stays"
+assert_not_contains "${WORKSPACE}/calls/teardown-vcrunv1.log" "kubectl delete namespace osac" "the pre-existing orders namespace is not deleted"
 
 echo
 echo "== The vcluster release was uninstalled before the namespace deletion =="
 # grep exits non-zero on no match; under pipefail that would kill the test
 # silently, so the match count is checked explicitly instead.
-uninstall_line="$(grep -n "helm uninstall vcrun1" "${WORKSPACE}/calls/all-calls.txt" | cut -d: -f1 || true)"
-delete_namespace_line="$(grep -n "kubectl delete namespace vc-vcrun1" "${WORKSPACE}/calls/all-calls.txt" | cut -d: -f1 || true)"
+uninstall_line="$(grep -n "helm uninstall vcrunv1" "${WORKSPACE}/calls/all-calls.txt" | cut -d: -f1 || true)"
+delete_namespace_line="$(grep -n "kubectl delete namespace vc-vcrunv1" "${WORKSPACE}/calls/all-calls.txt" | cut -d: -f1 || true)"
 if [[ -n "${uninstall_line}" && -n "${delete_namespace_line}" \
     && "${uninstall_line}" -lt "${delete_namespace_line}" ]]; then
     echo "ok: helm uninstall of the vcluster precedes the namespace deletion"
 else
     fail "helm uninstall of the vcluster does not precede the namespace deletion (uninstall line '${uninstall_line}', namespace deletion line '${delete_namespace_line}')"
-    echo "--- all-calls.txt (teardown of vcrun1 onwards) ---" >&2
-    grep -n "vcrun1" "${WORKSPACE}/calls/all-calls.txt" | tail -20 >&2
+    echo "--- all-calls.txt (teardown of vcrunv1 onwards) ---" >&2
+    grep -n "vcrunv1" "${WORKSPACE}/calls/all-calls.txt" | tail -20 >&2
 fi
+
+###############################################################################
+# A CaaS run on an outer cluster without an osac namespace
+###############################################################################
+
+# Remove the pre-seeded orders namespace: an outer cluster whose osac
+# namespace does not exist (the AAP placed elsewhere, say). The next run
+# must create it, labelled, and its teardown must delete it again.
+rm -rf "${WORKSPACE}/state/outer/namespace/osac"
+
+echo
+echo "== Setting up run vcrunc1 (CaaS, orders namespace absent) =="
+run_setup vcrunc1 >"${WORKSPACE}/calls/setup-vcrunc1.log" 2>&1 \
+    || { cat "${WORKSPACE}/calls/setup-vcrunc1.log"; fail "setup for vcrunc1 failed"; }
+
+echo
+echo "== The run created the orders namespace, labelled with its name =="
+assert_contains "${APPLIES}" "^kind: Namespace$" "a Namespace object is applied when osac is absent"
+assert_contains "${APPLIES}" "osac.openshift.io/instance: vcrunc1" "the orders namespace carries the run's instance label"
+assert_file_exists "${WORKSPACE}/state/outer/namespace/osac/instance-label" "the label is recorded on the namespace"
+assert_contains "${WORKSPACE}/calls/setup-vcrunc1.log" "Created namespace osac on the outer cluster" "setup reports the creation"
+
+echo
+echo "== The CaaS overlay selects the suite =="
+CAAS_OVERLAY="${REPO_ROOT}/.vcluster-runs/vcrunc1/instance-values.yaml"
+assert_file_exists "${CAAS_OVERLAY}" "CaaS overlay written"
+python3 - "${CAAS_OVERLAY}" <<'PYEOF' || fail "CaaS overlay assertions failed"
+import sys
+
+import yaml
+
+with open(sys.argv[1]) as source:
+    values = yaml.safe_load(source)
+
+cluster_fulfillment = values["aap"]["instanceGroups"]["clusterFulfillment"]
+checks = [
+    ("instanceId", values["global"]["instanceId"] == "vcrunc1"),
+    ("caas service enabled", values["global"]["services"]["caas"]["enabled"] is True),
+    ("bmaas service enabled", values["global"]["services"]["bmaas"]["enabled"] is True),
+    ("vmaas service stays on", values["global"]["services"]["vmaas"]["enabled"] is True),
+    ("agentless_net fabric manager", values["global"]["networking"]["fabricManager"] == "agentless_net"),
+    ("compute instance controller off", values["operator"]["controllers"]["computeInstance"] is False),
+    ("ingress CA trusted", values["operator"]["ignition"]["trustIngressCA"] is True),
+    (
+        "cluster fulfillment config",
+        cluster_fulfillment["config"] == {
+            "HOSTED_CLUSTER_CONTROLLER_AVAILABILITY_POLICY": "SingleReplica",
+            "HOSTED_CLUSTER_INFRASTRUCTURE_AVAILABILITY_POLICY": "SingleReplica",
+            "HOSTED_CLUSTER_BASE_DOMAIN": "hosted.ci.example.com",
+        },
+    ),
+    ("cluster fulfillment enabled", cluster_fulfillment["enabled"] is True),
+    (
+        "cluster versions",
+        values["clusterVersions"] == {
+            "enabled": True,
+            "versions": [
+                {"version": "4.20.0", "image": "quay.io/openshift-release-dev/ocp-release:4.20.0-multi"},
+                {
+                    "version": "4.22.0",
+                    "image": "quay.io/openshift-release-dev/ocp-release:4.22.0-multi",
+                    "default": True,
+                    "diskImage": {"name": "rhcos-4-22", "sourceRef": "oci://quay.io/osac-project/rhcos:4.22.0"},
+                },
+            ],
+        },
+    ),
+    ("bmf metal3 namespace", values["bmf"]["metal3"] == {"enabled": True, "namespace": "vcrunc1-hosts"}),
+    ("bmf aap template prefix", values["bmf"]["env"]["aapTemplatePrefix"] == "vcrunc1"),
+    ("bmf credentials secret", values["bmf"]["secretAPI"]["credentialsSecret"] == "vcrunc1-fulfillment-controller-credentials"),
+    ("k8s manager not overridden", "k8sManager" not in values["global"]["networking"]),
+]
+
+failed = [description for description, ok in checks if not ok]
+for description, ok in checks:
+    print(("ok: " if ok else "FAIL: ") + description)
+if failed:
+    sys.exit(1)
+PYEOF
+
+echo
+echo "== Tearing down run vcrunc1 deletes the orders namespace it created =="
+"${TEARDOWN_SCRIPT}" vcrunc1 >"${WORKSPACE}/calls/teardown-vcrunc1.log" 2>&1 \
+    || { cat "${WORKSPACE}/calls/teardown-vcrunc1.log"; fail "teardown of vcrunc1 failed"; }
+assert_contains "${WORKSPACE}/calls/teardown-vcrunc1.log" "Teardown complete" "vcrunc1 teardown reports success"
+assert_file_absent "${WORKSPACE}/state/outer/namespace/osac" "the orders namespace the run created is deleted"
 
 echo
 echo "== A leftover fails the teardown loudly =="
-mkdir -p "${WORKSPACE}/state/outer/secret/osac-kafka/vcrun2-stray-secret"
-echo "leftover" >"${WORKSPACE}/state/outer/secret/osac-kafka/vcrun2-stray-secret/password"
-if "${TEARDOWN_SCRIPT}" vcrun2 >"${WORKSPACE}/calls/teardown-vcrun2.log" 2>&1; then
-    fail "teardown of vcrun2 succeeded with a leftover present"
+mkdir -p "${WORKSPACE}/state/outer/secret/osac-kafka/vcrunb1-stray-secret"
+echo "leftover" >"${WORKSPACE}/state/outer/secret/osac-kafka/vcrunb1-stray-secret/password"
+if "${TEARDOWN_SCRIPT}" vcrunb1 >"${WORKSPACE}/calls/teardown-vcrunb1.log" 2>&1; then
+    fail "teardown of vcrunb1 succeeded with a leftover present"
 else
-    echo "ok: teardown of vcrun2 failed with a leftover present"
+    echo "ok: teardown of vcrunb1 failed with a leftover present"
 fi
-assert_contains "${WORKSPACE}/calls/teardown-vcrun2.log" "secret/vcrun2-stray-secret" "failure names the leftover object"
+assert_contains "${WORKSPACE}/calls/teardown-vcrunb1.log" "secret/vcrunb1-stray-secret" "failure names the leftover object"
 
 echo
 if [[ "${FAILURES}" -eq 0 ]]; then

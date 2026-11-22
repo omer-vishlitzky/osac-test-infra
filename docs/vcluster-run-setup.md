@@ -65,11 +65,19 @@ The setup script:
    the vcluster and stores its one-year token as secret
    `<run>-aap-vcluster-token` (key `token`) in the vcluster's `osac`
    namespace, so the shared AAP can launch the run's job pods inside the
-   vcluster.10. **Copies the AAP admin password and the shared CA bundle** into the
+   vcluster.
+10. **Copies the AAP admin password and the shared CA bundle** into the
     vcluster (table below).
-11. **Writes the per-run values overlay** `.vcluster-runs/<run>/
-    instance-values.yaml` and **prints the `make install-osac` command** for
-    the run, plus the kubeconfig path.
+11. **Creates the orders namespace `osac` on the outer cluster when
+    absent** (OSAC-8054): remote-mode ClusterOrders need their namespace
+    there. A pre-existing namespace is reused untouched and never deleted
+    by the teardown; a namespace the run created is labelled
+    `osac.openshift.io/instance=<run>` and deleted by the run's teardown.
+12. **Writes the per-run values overlay** `.vcluster-runs/<run>/
+    instance-values.yaml` -- the run's ID plus the suite's service
+    toggles selected by the run name's suite letter (see "The run's
+    suite") -- and **prints the `make install-osac` command** for the run,
+    plus the kubeconfig path.
 
 Run it like this (the realm source is the PR's own monorepo checkout, so a
 PR that changes `realm.json` is tested like any other change):
@@ -94,6 +102,8 @@ runs on one outer cluster do not collide:
 | --- | --- | --- |
 | vcluster | `pr2100v1`, in namespace `vc-pr2100v1` | outer cluster |
 | OSAC namespace | `osac` | vcluster |
+| Orders namespace | `osac` — created when absent, labelled `osac.openshift.io/instance=<run>` (OSAC-8054); the teardown deletes it only when the run created it | outer cluster |
+| Bare-metal hosts namespace (b/c suites) | `pr2100b1-hosts`, passed as `bmf.metal3.namespace` | outer cluster |
 | Kafka users | `pr2100v1-fulfillment-service`, `pr2100v1-osac-metering`, `pr2100v1-osac-metering-echo-adapter` | outer cluster |
 | Kafka topics (ACLs) | `pr2100v1.events.*`, `pr2100v1.metering.heartbeat.*`, `pr2100v1.metering.dlq.*` | outer cluster |
 | Kafka consumer groups (ACLs) | `pr2100v1.system.*`, `pr2100v1-osac-metering-echo-adapter` | outer cluster |
@@ -102,10 +112,25 @@ runs on one outer cluster do not collide:
 | Keycloak client credentials | `pr2100v1-fulfillment-controller-credentials`, `pr2100v1-osac-ui-backend-credentials` | vcluster |
 | Databases (chart-derived, see below) | `pr2100v1_service`, `pr2100v1_metering`; secrets `pr2100v1-db-config`, `pr2100v1-db-client-cert`, `pr2100v1-db-metering-config`, `pr2100v1-db-metering-client-cert` | outer cluster / vcluster |
 | AAP service account and token secret | `pr2100v1-aap`, `pr2100v1-aap-vcluster-token` | vcluster |
-| AAP job template prefix | `pr2100v1` (operator and bare-metal operator), via `operator.aap.templatePrefix` and `global.instanceId` | vcluster |
+| AAP job template prefix | `pr2100v1` (operator and bare-metal operator), via `operator.aap.templatePrefix`, `bmf.env.aapTemplatePrefix` and `global.instanceId` | vcluster |
 | AAP organization | `pr2100v1` (derived by the chart from `global.instanceId`) | outer cluster |
 | OpenBao namespace | `pr2100v1` (via `service.vault.namespace`) | outer cluster |
 | Run routes (not created yet) | `fulfillment-api-pr2100v1.<domain>`, `fulfillment-internal-api-pr2100v1.<domain>`, `osac-ui-pr2100v1.<domain>` | outer cluster |
+
+## The run's suite
+
+The run name's last letter before the attempt digits is the suite letter:
+`v` for VMaaS (`pr2100v1`), `b` for BMaaS (`pr2100b2`), `c` for CaaS
+(`nightlyc1`). The setup fails loudly when a run name carries none. The
+letter selects the suite's service toggles in the per-run values overlay,
+with the keys documented in the vcluster-ci profile
+(`osac-installer/values/vcluster-ci/instance.yaml`, "Suite selection");
+the BMaaS and CaaS suites additionally get the BMF operator wiring (the
+Metal3 namespace `<run>-hosts`, the shared AAP's URL for the BMF
+operator, the run's job template prefix and credential secret), and CaaS
+gets the hosted-cluster settings and the cluster versions its orders
+reference. Without the suite keys the profile renders VMaaS; the VMaaS
+overlay only restates that default.
 
 ## The Keycloak realm
 
@@ -399,11 +424,15 @@ The teardown deletes, in order:
 2. namespace `vc-<run>` (its deletion removes the vcluster's pods and every
    object the syncer copied there, which keep their inner names and so
    cannot be found by a name-anchored scan), waiting until it is gone;
-3. the run's outer KafkaUsers, then their Strimzi secrets (the users go
+3. the orders namespace `osac` on the outer cluster, but only when this run
+   created it: the instance label the setup wrote at creation carries the
+   run's name, and a namespace without this run's label — a pre-existing
+   one, or one another run created — is left in place;
+4. the run's outer KafkaUsers, then their Strimzi secrets (the users go
    first: while a KafkaUser exists, the Strimzi user operator recreates its
    secret), waiting until each is gone;
-4. the run's Keycloak realm through the admin API;
-5. the run's output files (`.vcluster-runs/<run>` by default; pass
+5. the run's Keycloak realm through the admin API;
+6. the run's output files (`.vcluster-runs/<run>` by default; pass
    `--output-dir` if the setup was given one).
 
 It then verifies that nothing named after the run remains among the kinds
