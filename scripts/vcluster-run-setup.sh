@@ -1450,6 +1450,15 @@ service:
   vault:
     namespace: ${RUN_NAME}
     keycloakIssuerUrl: https://keycloak-keycloak.${OUTER_DOMAIN}/realms/${RUN_NAME}
+    # The vault client authenticates with the same run client as the auth
+    # and idp blocks; the profile names the shared secret, so the overlay
+    # points it at the run's.
+    credentials:
+    - secret:
+        name: ${RUN_NAME}-fulfillment-controller-credentials
+        items:
+        - key: client-secret
+          param: client-secret
 metering:
   database:
     connection:
