@@ -158,6 +158,10 @@ case "$1" in
                 # The only service read is the outer cluster's DNS service.
                 echo "172.30.0.10"
                 ;;
+            route)
+                # The only route read is the shared AAP instance's.
+                echo "osac-aap.apps.ci.example.com"
+                ;;
             kafka)
                 echo "kafka.kafka.strimzi.io/osac-kafka"
                 ;;
@@ -534,6 +538,58 @@ fi
 # The admin API branches come before the public-realm branch: an URL like
 # /admin/realms/<run> also ends in /realms/<run> and must not answer the
 # public probe instead.
+if [[ "${URL}" =~ /admin/realms/([^/]+)/clients$ ]]; then
+    client_id=""
+    for arg in "${ARGS[@]:-}"; do
+        case "${arg}" in
+            clientId=*) client_id="${arg#clientId=}" ;;
+        esac
+    done
+    echo "client-query ${client_id}" >>"${WORKSPACE}/calls/client-queries.txt"
+    echo "[{\"id\":\"client-id-${client_id}\",\"clientId\":\"${client_id}\"}]"
+    exit 0
+fi
+
+if [[ "${URL}" =~ /admin/realms/([^/]+)/clients/([^/]+)/service-account-user$ ]]; then
+    echo "{\"id\":\"sa-user-${BASH_REMATCH[2]}\"}"
+    exit 0
+fi
+
+if [[ "${URL}" =~ /admin/realms/([^/]+)/clients/([^/]+)/roles/([^/]+)$ ]]; then
+    role="${BASH_REMATCH[3]}"
+    echo "{\"id\":\"role-id-${role}\",\"name\":\"${role}\",\"description\":\"stub role\",\"scope\":\"client\"}"
+    exit 0
+fi
+
+if [[ "${URL}" =~ /admin/realms/([^/]+)/users/([^/]+)/role-mappings/clients/([^/]+)$ ]]; then
+    echo "${METHOD} ${URL} ${DATA}" >>"${WORKSPACE}/calls/role-mappings.txt"
+    exit 0
+fi
+
+if [[ "${URL}" =~ /admin/realms/([^/]+)/components$ ]]; then
+    if [[ "${METHOD}" == "PUT" ]]; then
+        echo "stub curl: unhandled PUT ${URL}" >&2
+        exit 1
+    fi
+    echo '[{"id":"component-allowed-protocol-mappers","name":"Allowed Protocol Mappers","providerId":"allowed-protocol-mappers","subType":"authenticated","config":{"allowed-protocol-mapper-types":["oidc-user-property-mapper"]}},{"id":"component-allowed-client-templates","name":"Allowed Client Templates","providerId":"allowed-client-templates","subType":"authenticated","config":{"allowed-client-scopes":["basic"]}}]'
+    exit 0
+fi
+
+if [[ "${URL}" =~ /admin/realms/([^/]+)/components/([^/]+)$ ]]; then
+    echo "${DATA}" >>"${WORKSPACE}/calls/component-puts.txt"
+    exit 0
+fi
+
+if [[ "${URL}" =~ /admin/realms/([^/]+)/client-policies/(profiles|policies)$ ]]; then
+    policies_kind="${BASH_REMATCH[2]}"
+    if [[ "${METHOD}" == "PUT" ]]; then
+        echo "${DATA}" >>"${WORKSPACE}/calls/client-policies-${policies_kind}.txt"
+        exit 0
+    fi
+    echo "{\"${policies_kind}\":[]}"
+    exit 0
+fi
+
 if [[ "${URL}" =~ /admin/realms/([^/]+)/users$ ]]; then
     username=""
     for arg in "${ARGS[@]:-}"; do
@@ -813,6 +869,104 @@ assert_contains "${WORKSPACE}/calls/user-queries.txt" "tenant1_admin" "fixture u
 assert_not_contains "${WORKSPACE}/calls/user-queries.txt" "service-account-" "service-account users are skipped"
 
 echo
+echo "== The controller client's service account gets its realm-management roles =="
+assert_contains "${WORKSPACE}/calls/client-queries.txt" "osac-controller" "controller client looked up"
+assert_contains "${WORKSPACE}/calls/client-queries.txt" "realm-management" "realm-management client looked up"
+python3 - "${WORKSPACE}/calls/role-mappings.txt" <<'PYEOF' || fail "role-grant assertions failed"
+import json
+import sys
+
+with open(sys.argv[1]) as source:
+    calls = [line.split(" ", 2) for line in source if line.strip()]
+
+checks = []
+grants = [json.loads(data) for method, url, data in calls if method == "POST"]
+revocations = [json.loads(data) for method, url, data in calls if method == "DELETE"]
+checks.append(("one role grant and one revocation per run (2 runs)", len(grants) == 2 and len(revocations) == 2))
+for grant in grants:
+    role_names = sorted(role["name"] for role in grant)
+    checks.append((
+        "the grant carries create-client and view-clients",
+        role_names == ["create-client", "view-clients"],
+    ))
+for revocation in revocations:
+    checks.append((
+        "the revocation removes manage-clients",
+        [role["name"] for role in revocation] == ["manage-clients"],
+    ))
+for method, url, data in calls:
+    checks.append((
+        "the mapping targets the controller's service-account user in realm-management",
+        "/users/sa-user-client-id-osac-controller/role-mappings/clients/client-id-realm-management" in url,
+    ))
+
+failed = [description for description, ok in checks if not ok]
+for description, ok in checks:
+    print(("ok: " if ok else "FAIL: ") + description)
+if failed:
+    sys.exit(1)
+PYEOF
+
+echo
+echo "== The registration policies allow the service-account client shape =="
+python3 - "${WORKSPACE}/calls/component-puts.txt" <<'PYEOF' || fail "registration-policy assertions failed"
+import json
+import sys
+
+with open(sys.argv[1]) as source:
+    components = [json.loads(line) for line in source if line.strip()]
+
+checks = []
+by_provider = {component["providerId"]: component for component in components}
+checks.append(("both policy components updated (per run: 2 runs x 2)", len(components) == 4))
+mappers = by_provider.get("allowed-protocol-mappers", {}).get("config", {}).get("allowed-protocol-mapper-types", [])
+checks.append((
+    "the protocol-mapper allowlist carries the tenant-client mappers",
+    all(mapper in mappers for mapper in ("oidc-hardcoded-claim-mapper", "oidc-audience-mapper", "oidc-usersessionmodel-note-mapper")),
+))
+scopes = by_provider.get("allowed-client-templates", {}).get("config", {}).get("allowed-client-scopes", [])
+checks.append(("the client-scope allowlist carries service_account", "service_account" in scopes))
+
+failed = [description for description, ok in checks if not ok]
+for description, ok in checks:
+    print(("ok: " if ok else "FAIL: ") + description)
+if failed:
+    sys.exit(1)
+PYEOF
+python3 - "${WORKSPACE}/calls/client-policies-profiles.txt" "${WORKSPACE}/calls/client-policies-policies.txt" <<'PYEOF' || fail "registration-token-policy assertions failed"
+import json
+import sys
+
+with open(sys.argv[1]) as source:
+    profile_payloads = [json.loads(line) for line in source if line.strip()]
+with open(sys.argv[2]) as source:
+    policy_payloads = [json.loads(line) for line in source if line.strip()]
+
+checks = []
+checks.append(("one profile and one policy PUT per run (2 runs)", len(profile_payloads) == 2 and len(policy_payloads) == 2))
+for payload in profile_payloads:
+    profile = next(p for p in payload["profiles"] if p["name"] == "osac-service-account-registration-token-reuse")
+    executors = [executor["executor"] for executor in profile["executors"]]
+    checks.append((
+        "the profile disables registration-token rotation",
+        "registration-access-token-rotation-disabled" in executors,
+    ))
+for payload in policy_payloads:
+    policy = next(p for p in payload["policies"] if p["name"] == "osac-service-account-registration-token-reuse")
+    checks.append((
+        "the policy binds the profile to registration-token updates",
+        policy["conditions"][0]["configuration"]["update-client-source"] == ["ByRegistrationAccessToken"]
+        and policy["profiles"] == ["osac-service-account-registration-token-reuse"],
+    ))
+
+failed = [description for description, ok in checks if not ok]
+for description, ok in checks:
+    print(("ok: " if ok else "FAIL: ") + description)
+if failed:
+    sys.exit(1)
+PYEOF
+
+echo
 echo "== The per-run values overlay =="
 OVERLAY="${REPO_ROOT}/.vcluster-runs/vcrun1/instance-values.yaml"
 assert_file_exists "${OVERLAY}" "overlay written"
@@ -840,6 +994,7 @@ checks = [
     ("metering db cert", values["metering"]["database"]["connection"][1]["secret"]["name"] == "vcrun1-db-metering-client-cert"),
     ("kafka connection", values["service"]["kafka"]["connection"][0]["secret"]["name"] == "vcrun1-fulfillment-service-kafka"),
     ("operator template prefix", values["operator"]["aap"]["templatePrefix"] == "vcrun1"),
+    ("operator fulfillment credentials", values["operator"]["fulfillment"]["credentials"]["secretName"] == "vcrun1-fulfillment-controller-credentials"),
     ("aap api server url", values["aap"]["vcluster"]["apiServerUrl"] == "https://vcrun1.vc-vcrun1.svc.cluster.local"),
     ("aap token secret", values["aap"]["vcluster"]["tokenSecret"] == {"name": "vcrun1-aap-vcluster-token", "key": "token"}),
     ("no aap.organization", "organization" not in values.get("aap", {})),
@@ -859,8 +1014,8 @@ assert_contains "${WORKSPACE}/calls/setup-vcrun1.log" "--values ${OVERLAY}" "mak
 assert_contains "${WORKSPACE}/calls/setup-vcrun1.log" "fulfillment-api-vcrun1.${OUTER_DOMAIN}" "make command passes the run-prefixed API hostname"
 assert_contains "${WORKSPACE}/calls/setup-vcrun1.log" "osac-ui-vcrun1.${OUTER_DOMAIN}" "make command passes the run-prefixed UI hostname"
 assert_contains "${WORKSPACE}/calls/setup-vcrun1.log" "OSAC_KEYCLOAK_REALM=vcrun1" "printed hint names the run's realm"
-assert_not_contains "${WORKSPACE}/calls/setup-vcrun1.log" "aap.controllerUrl" "no aap.controllerUrl (schema rejects it on osac main)"
-assert_not_contains "${WORKSPACE}/calls/setup-vcrun1.log" "adminPasswordSecret" "no adminPasswordSecret (schema rejects it on osac main)"
+assert_contains "${WORKSPACE}/calls/setup-vcrun1.log" "aap.controllerUrl=https://osac-aap.${OUTER_DOMAIN}" "make command passes the shared AAP controller URL (resolved from the route)"
+assert_contains "${WORKSPACE}/calls/setup-vcrun1.log" "aap.bootstrap.adminPasswordSecret.name=osac-aap-admin-password" "make command passes the AAP admin password secret name"
 
 echo
 echo "== Isolation between the two runs =="

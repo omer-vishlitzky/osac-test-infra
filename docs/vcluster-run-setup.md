@@ -28,7 +28,8 @@ The setup script:
    domain readable, the Strimzi Kafka cluster present, the CI certificate
    authority present, the Keycloak admin credentials secret present with
    its three keys, the Keycloak service reachable with that CA, the AAP
-   admin-password secret present, and the shared CA bundle present.
+   admin-password secret and the shared AAP's route present (or
+   `--aap-controller-url` given), and the shared CA bundle present.
 2. **Creates namespace `vc-<run name>`** and renders
    `scripts/vcluster-values.yaml.template` with the namespace's allocated
    UID, the vcluster API service DNS name, and the outer DNS service IP.
@@ -64,8 +65,7 @@ The setup script:
    the vcluster and stores its one-year token as secret
    `<run>-aap-vcluster-token` (key `token`) in the vcluster's `osac`
    namespace, so the shared AAP can launch the run's job pods inside the
-   vcluster.
-10. **Copies the AAP admin password and the shared CA bundle** into the
+   vcluster.10. **Copies the AAP admin password and the shared CA bundle** into the
     vcluster (table below).
 11. **Writes the per-run values overlay** `.vcluster-runs/<run>/
     instance-values.yaml` and **prints the `make install-osac` command** for
@@ -160,10 +160,36 @@ vcluster, so OSAC itself keeps using the route URL
 (`https://keycloak-keycloak.<domain>/realms/<run>`) — that is what the
 overlay's issuer URLs carry.
 
-The osac-infra hook also grants the controller client's service account
-realm-management roles, registers the MCP client and adjusts client
-registration policies. The run setup does not mirror those steps yet; see
-known gaps.
+### What runs after the realm import
+
+The osac-infra chart configures its realm with a post-install hook
+(keycloak-set-passwords). The run setup mirrors the steps the fulfillment
+service needs at runtime, against the run's realm:
+
+- **The fixture users' passwords** (step 5 above).
+- **The controller client's realm-management roles** (
+  `grant_controller_realm_management_roles`, the hook's
+  `ensure_controller_idp_roles`): the `osac-controller` client's
+  service-account user receives `create-client` and `view-clients`, and
+  `manage-clients` is revoked. The fulfillment service manages
+  organizations and users through the admin API with that client
+  (`service.idp.credentials`).
+- **The authenticated client-registration policies** (
+  `ensure_service_account_registration_policies`, same name in the hook):
+  the `allowed-protocol-mappers` and `allowed-client-templates` policies
+  gain the protocol mappers (`oidc-hardcoded-claim-mapper`,
+  `oidc-audience-mapper`, `oidc-usersessionmodel-note-mapper`) and the
+  `service_account` scope the fulfillment service's dynamically registered
+  tenant service-account clients carry (it registers them through
+  `/realms/<run>/clients-registrations/default`).
+- **The registration-token reuse policy** (
+  `ensure_service_account_registration_token_policy`, same name in the
+  hook): a client profile that disables registration-access-token
+  rotation, bound by a policy to clients updated by registration token,
+  so the service can recover an ambiguous registration by retrying.
+
+The hook's two MCP steps are deliberately not mirrored; see the known
+gaps.
 
 ## The AAP service account
 
@@ -181,10 +207,15 @@ resolves from inside the outer cluster (POC-verified).
 The run's AAP organization (`<run>`) and job templates are created by the
 chart's bootstrap job against the shared AAP, derived from
 `global.instanceId`; the run setup only copies the AAP admin password
-secret into the vcluster so those jobs can log in. The osac-aap chart
-derives that secret's name from `aap.aap.instance.name` even with the
-instance disabled, so the copy keeps the outer instance's name and the
-`vcluster-ci` profile's `aap.aap.instance.name` must match it.
+secret into the vcluster so those jobs can log in. The chart's
+external-instance mode reads the shared AAP's controller URL from
+`aap.controllerUrl` and the admin password from
+`aap.bootstrap.adminPasswordSecret` (the run setup copies the outer
+cluster's `<aap-instance>-admin-password` into the vcluster under that
+name, and the printed make command passes both values). The osac-aap chart
+derives the in-cluster secret name from `aap.aap.instance.name`; with the
+instance disabled the external values apply, both from the unified osac
+branch (PR osac#2566).
 
 ## The per-run values overlay
 
@@ -243,6 +274,9 @@ ui:
     serviceAccount:
       credentialsSecret: pr2100v1-osac-ui-backend-credentials
 operator:
+  fulfillment:
+    credentials:
+      secretName: pr2100v1-fulfillment-controller-credentials
   aap:
     templatePrefix: pr2100v1
 aap:
@@ -254,7 +288,11 @@ aap:
 ```
 
 `aap.organization` and `aap.templatePrefix` are deliberately not set: the
-chart derives both from `global.instanceId`.
+chart derives both from `global.instanceId`. The operator's credential
+reference overrides `operator.fulfillment.credentials.secretName` (the
+vmaas-ci and vcluster-ci profiles name the unprefixed
+`fulfillment-controller-credentials`; the run's operator must read the
+run's own client, and the `client-id`/`client-secret` keys already match).
 
 The printed command is:
 
@@ -266,7 +304,9 @@ make install-osac PLATFORM=openshift PROFILE=vcluster-ci NS=osac \
     EXTRA_HELM_ARGS="--values <repo>/.vcluster-runs/<run>/instance-values.yaml \
 --set service.externalHostname=fulfillment-api-<run>.<outer domain> \
 --set service.internalHostname=fulfillment-internal-api-<run>.<outer domain> \
---set ui.externalHostname=osac-ui-<run>.<outer domain>"
+--set ui.externalHostname=osac-ui-<run>.<outer domain> \
+--set aap.controllerUrl=<shared AAP controller URL> \
+--set aap.bootstrap.adminPasswordSecret.name=osac-aap-admin-password"
 ```
 
 Run it from the osac monorepo's `osac-installer` directory. The vcluster has
@@ -274,19 +314,26 @@ no OpenShift ingress config for the Makefile to read, so `CLUSTER_DOMAIN`
 (the Makefile override landing with the osac chart package) carries the
 domain and the run-prefixed route hostnames are passed through
 `EXTRA_HELM_ARGS`, the same settings `make install-osac` derives for a
-normal install. Run the suite with `OSAC_KEYCLOAK_REALM=<run>` so the JWT
-fixtures use the run's realm.
+normal install. The AAP URL is the shared AAP's controller URL, resolved
+from the OpenShift route named after the AnsibleAutomationPlatform CR
+(`--aap-controller-url` overrides), and
+`aap.bootstrap.adminPasswordSecret.name` names the admin-password secret
+the run setup copied into the vcluster (the key defaults to `password`).
+Run the suite with `OSAC_KEYCLOAK_REALM=<run>` so the JWT fixtures use the
+run's realm.
 
-**Dependency on the parallel osac chart work.** `global.instanceId` and
-`aap.vcluster.*` do not exist on osac main yet, and the umbrella schema
-rejects unknown keys, so installing with the overlay requires that work to
-land first. The same work derives, from `instanceId`, the database secret
-names the overlay references (`<run>-db-config` and friends, today the
-fixed prefix `osac`) and the metering Kafka secret names
+**Dependency on the unified osac branch (PR osac#2566).** `global.instanceId`,
+`aap.vcluster.*`, `aap.controllerUrl` and
+`aap.bootstrap.adminPasswordSecret` do not exist on osac main; they live on
+the unified osac branch `vcluster-e2e` (PR osac#2566), and the umbrella
+schema rejects unknown keys, so installing with the overlay and the AAP
+flags requires that branch. The same branch derives, from `instanceId`, the
+database secret names the overlay references (`<run>-db-config` and
+friends, today the fixed prefix `osac`) and the metering Kafka secret names
 (`<run>-osac-metering` and `<run>-osac-metering-echo-adapter`, today the
-fixed names `osac-metering` and `osac-metering-echo-adapter`), and adds the
-external-AAP wiring. Until then the profile, the `CLUSTER_DOMAIN` override
-and the schema keys do not exist.
+fixed names `osac-metering` and `osac-metering-echo-adapter`). Until it
+merges, the profile, the `CLUSTER_DOMAIN` override and the schema keys do
+not exist on main.
 
 ## Why Kafka objects go through the run setup
 
@@ -331,7 +378,9 @@ osac chart creates them itself in the vcluster, pointing at
 CoreDNS zone) and issuing the certificates from the copied CA, named after
 the instanceId-derived prefix. The AAP instance defaults to `osac-aap` in
 namespace `osac`; override with `--aap-instance` and `--aap-namespace` if
-the outer cluster places it elsewhere.
+the outer cluster places it elsewhere. The AAP controller URL comes from
+the OpenShift route named after the AnsibleAutomationPlatform CR, or from
+`--aap-controller-url`.
 
 ## Teardown
 
@@ -456,19 +505,25 @@ already exists).
 - The run routes (`fulfillment-api-<run>.<domain>` and friends) are not
   created yet; the overlay and the printed command carry the hostnames so
   the wiring is stable once they are.
-- The Keycloak steps mirror only the password-setting part of the
-  osac-infra keycloak-set-passwords hook. The hook also grants the
-  controller client's service account realm-management roles (create-client,
-  view-clients, and a manage-clients revocation), registers the MCP client
-  and adjusts client-registration policies; runs that exercise tenant
-  creation through the fulfillment API may need those mirrored too.
+- The Keycloak steps mirror the password-setting, controller role-grant
+  and registration-policy parts of the osac-infra keycloak-set-passwords
+  hook. The hook's two MCP steps are deliberately not mirrored: the MCP
+  exchange client and the `osac-mcp-client` registration serve the MCP
+  HTTP API, which the vmaas-ci and vcluster-ci profiles leave disabled
+  (`service.mcp.enabled` defaults to false), and the MCP resource URL they
+  are built from (the run's MCP route) does not exist until the run-route
+  work lands. Neither client is one of realm.json's seven placeholders:
+  the exchange client is created by the hook from the
+  `osac-mcp-exchange` secret, and the MCP client from
+  `files/mcp-client.json`.
 - The AAP bootstrap still applies the license manifest on every run; the
   follow-up to skip it is tracked in OSAC-7084.
-- `make install-osac` against a vcluster still needs the parallel chart work
-  described above: the `vcluster-ci` profile, the `CLUSTER_DOMAIN` Makefile
-  override, `global.instanceId`, `aap.vcluster.*`, the external-AAP wiring
-  and the preflight skips (`db-init-host-endpoints`,
-  `default-storageclass`). Until those land, the Makefile hard-fails against
+- `make install-osac` against a vcluster still needs the unified osac
+  branch (PR osac#2566): the `vcluster-ci` profile, the `CLUSTER_DOMAIN`
+  Makefile override, `global.instanceId`, `aap.vcluster.*`, the
+  external-AAP values (`aap.controllerUrl`,
+  `aap.bootstrap.adminPasswordSecret`) and the preflight skips
+  (`db-init-host-endpoints`, `default-storageclass`). Until it merges, the Makefile hard-fails against
   a vcluster where it runs `oc get ingresses.config/cluster`. Neither
   `kafka-access` nor the OpenShift version check needs skipping: with
   `kafka.enabled=false` the kafka-access check verifies the

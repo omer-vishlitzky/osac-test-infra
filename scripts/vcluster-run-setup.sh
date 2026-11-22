@@ -24,8 +24,10 @@
 #   6. imports the run's Keycloak realm from the monorepo's realm.json
 #      through the outer Keycloak's admin API (realm renamed to the run,
 #      placeholders resolved, top-level id dropped), sets the fixture users'
-#      passwords, and writes the controller and UI client credentials into
-#      the vcluster;
+#      passwords, grants the controller client's service account the
+#      realm-management roles and registration policies the fulfillment
+#      service needs, and writes the controller and UI client credentials
+#      into the vcluster;
 #   7. creates an AAP service account with cluster-admin in the vcluster
 #      and stores its one-year token as a secret in the vcluster, so the
 #      shared AAP can launch the run's job pods inside the vcluster;
@@ -52,6 +54,9 @@
 #   --aap-instance NAME         shared AAP instance name (default: osac-aap)
 #   --aap-namespace NAMESPACE   namespace of the shared AAP instance
 #                               (default: osac)
+#   --aap-controller-url URL    external AAP controller URL; by default the
+#                               script reads the AAP route named
+#                               <aap-instance> in <aap-namespace>
 #   -h, --help                  show this help
 #
 # Environment:
@@ -157,6 +162,7 @@ OUTPUT_DIR=""
 KEYCLOAK_URL="${KEYCLOAK_URL_DEFAULT}"
 AAP_INSTANCE="${AAP_INSTANCE_DEFAULT}"
 AAP_NAMESPACE="${AAP_NAMESPACE_DEFAULT}"
+AAP_CONTROLLER_URL=""
 
 # Run-derived names, set in main once RUN_NAME is validated. v0 used fixed
 # chart names; v1 prefixes everything with the run so concurrent runs do
@@ -208,6 +214,9 @@ Options:
   --aap-instance NAME         shared AAP instance name (default: osac-aap)
   --aap-namespace NAMESPACE   namespace of the shared AAP instance
                               (default: osac)
+  --aap-controller-url URL    external AAP controller URL; by default the
+                              script reads the AAP route named
+                              <aap-instance> in <aap-namespace>
   -h, --help                  show this help
 
 The run name becomes the vcluster name, its namespace vc-<run name> in the
@@ -333,6 +342,27 @@ check_kafka_cluster() {
         || die "Strimzi Kafka cluster osac-kafka is missing in namespace ${KAFKA_NAMESPACE}. The KafkaUsers this script creates would never become ready."
 }
 
+# Resolve the shared AAP controller URL from its OpenShift route, unless the
+# caller passed one. The AAP operator names the platform gateway route after
+# the AnsibleAutomationPlatform CR.
+resolve_aap_controller_url() {
+    if [[ -n "${AAP_CONTROLLER_URL}" ]]; then
+        case "${AAP_CONTROLLER_URL}" in
+            https://*) ;;
+            http://*) die "--aap-controller-url must use https://." ;;
+            *) AAP_CONTROLLER_URL="https://${AAP_CONTROLLER_URL}" ;;
+        esac
+        return
+    fi
+    local route_host
+    route_host="$(kubectl --namespace "${AAP_NAMESPACE}" get route "${AAP_INSTANCE}" -o jsonpath='{.spec.host}')" \
+        || die "Cannot read route ${AAP_INSTANCE} in namespace ${AAP_NAMESPACE}. Pass --aap-controller-url, or fix --aap-instance/--aap-namespace."
+    [[ -n "${route_host}" ]] \
+        || die "Route ${AAP_INSTANCE} in namespace ${AAP_NAMESPACE} has no host. Pass --aap-controller-url."
+    AAP_CONTROLLER_URL="https://${route_host}"
+    echo "Shared AAP controller URL is ${AAP_CONTROLLER_URL} (route ${AAP_INSTANCE} in ${AAP_NAMESPACE})."
+}
+
 read_keycloak_admin_credentials() {
     KEYCLOAK_ADMIN_USERNAME="$(read_secret_key "${KEYCLOAK_NAMESPACE}" \
         "${KEYCLOAK_ADMIN_CREDENTIALS_SECRET}" admin-username | base64 -d)"
@@ -426,6 +456,7 @@ check_all_preconditions() {
     read_keycloak_admin_credentials
     fetch_keycloak_ca
     check_keycloak_reachable
+    resolve_aap_controller_url
 }
 
 ###############################################################################
@@ -1020,6 +1051,178 @@ PYEOF
     )
 }
 
+# Grant the controller client's service-account user the realm-management
+# roles the fulfillment service needs to manage organizations, users and
+# tenant service-account clients through the admin API: create-client and
+# view-clients, with manage-clients explicitly revoked. Mirrors the
+# osac-infra keycloak-set-passwords hook's ensure_controller_idp_roles,
+# against the run's realm.
+grant_controller_realm_management_roles() {
+    local token realm_management_id controller_id user_id
+    local create_role view_role manage_role payload
+    token="$(keycloak_admin_token)"
+    realm_management_id="$(keycloak_curl -s --fail-with-body -G \
+        "${KEYCLOAK_URL}/admin/realms/${RUN_NAME}/clients" \
+        -H "Authorization: Bearer ${token}" \
+        --data-urlencode "clientId=realm-management" \
+        --data-urlencode "exact=true" \
+        | python3 -c "import json,sys; print(next((x['id'] for x in json.load(sys.stdin) if x['clientId']=='realm-management'), ''))")"
+    controller_id="$(keycloak_curl -s --fail-with-body -G \
+        "${KEYCLOAK_URL}/admin/realms/${RUN_NAME}/clients" \
+        -H "Authorization: Bearer ${token}" \
+        --data-urlencode "clientId=osac-controller" \
+        --data-urlencode "exact=true" \
+        | python3 -c "import json,sys; print(next((x['id'] for x in json.load(sys.stdin) if x['clientId']=='osac-controller'), ''))")"
+    [[ -n "${realm_management_id}" && -n "${controller_id}" ]] \
+        || die "Clients realm-management or osac-controller are missing from realm ${RUN_NAME}; the realm import did not bring them."
+    user_id="$(keycloak_curl -s --fail-with-body \
+        "${KEYCLOAK_URL}/admin/realms/${RUN_NAME}/clients/${controller_id}/service-account-user" \
+        -H "Authorization: Bearer ${token}" \
+        | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")"
+    [[ -n "${user_id}" ]] \
+        || die "The osac-controller client has no service-account user in realm ${RUN_NAME}."
+
+    create_role="$(keycloak_curl -s --fail-with-body \
+        "${KEYCLOAK_URL}/admin/realms/${RUN_NAME}/clients/${realm_management_id}/roles/create-client" \
+        -H "Authorization: Bearer ${token}")"
+    view_role="$(keycloak_curl -s --fail-with-body \
+        "${KEYCLOAK_URL}/admin/realms/${RUN_NAME}/clients/${realm_management_id}/roles/view-clients" \
+        -H "Authorization: Bearer ${token}")"
+    manage_role="$(keycloak_curl -s --fail-with-body \
+        "${KEYCLOAK_URL}/admin/realms/${RUN_NAME}/clients/${realm_management_id}/roles/manage-clients" \
+        -H "Authorization: Bearer ${token}")"
+
+    payload="$(python3 -c "import json,sys; print(json.dumps([json.loads(sys.argv[1]),json.loads(sys.argv[2])]))" "${create_role}" "${view_role}")"
+    keycloak_curl -s --fail-with-body -X POST \
+        "${KEYCLOAK_URL}/admin/realms/${RUN_NAME}/users/${user_id}/role-mappings/clients/${realm_management_id}" \
+        -H "Authorization: Bearer ${token}" -H 'Content-Type: application/json' \
+        -d "${payload}" >/dev/null
+    payload="$(python3 -c "import json,sys; print(json.dumps([json.loads(sys.argv[1])]))" "${manage_role}")"
+    keycloak_curl -s --fail-with-body -X DELETE \
+        "${KEYCLOAK_URL}/admin/realms/${RUN_NAME}/users/${user_id}/role-mappings/clients/${realm_management_id}" \
+        -H "Authorization: Bearer ${token}" -H 'Content-Type: application/json' \
+        -d "${payload}" >/dev/null
+    echo "Granted create-client and view-clients to the osac-controller service account in realm ${RUN_NAME} (manage-clients revoked)."
+}
+
+# Extend the authenticated client-registration policies with the protocol
+# mappers and the client scope the fulfillment service's dynamically
+# registered tenant service-account clients carry (fulfillment-service
+# internal/idp/service_account_client.go registers them through
+# /clients-registrations/default with oidc-hardcoded-claim-mapper,
+# oidc-audience-mapper and the service_account scope). Mirrors the
+# osac-infra keycloak-set-passwords hook's
+# ensure_service_account_registration_policies.
+ensure_service_account_registration_policies() {
+    local token components provider component component_id
+    token="$(keycloak_admin_token)"
+    components="$(keycloak_curl -s --fail-with-body -G \
+        "${KEYCLOAK_URL}/admin/realms/${RUN_NAME}/components" \
+        -H "Authorization: Bearer ${token}" \
+        --data-urlencode "type=org.keycloak.services.clientregistration.policy.ClientRegistrationPolicy")"
+    for provider in allowed-protocol-mappers allowed-client-templates; do
+        component="$(python3 -c '
+import json
+import sys
+
+provider, data = sys.argv[1], json.loads(sys.argv[2])
+matches = [c for c in data if c.get("providerId") == provider and c.get("subType") == "authenticated"]
+if len(matches) != 1:
+    raise SystemExit("authenticated client registration policy missing or ambiguous")
+component = matches[0]
+config = component.setdefault("config", {})
+key = "allowed-protocol-mapper-types" if provider == "allowed-protocol-mappers" else "allowed-client-scopes"
+required = ("oidc-hardcoded-claim-mapper", "oidc-audience-mapper", "oidc-usersessionmodel-note-mapper") if provider == "allowed-protocol-mappers" else ("service_account",)
+config[key] = list(dict.fromkeys(config.get(key, []) + list(required)))
+print(json.dumps(component))
+' "${provider}" "${components}")"
+        component_id="$(python3 -c "import json,sys; print(json.loads(sys.argv[1])['id'])" "${component}")"
+        keycloak_curl -s --fail-with-body -X PUT \
+            "${KEYCLOAK_URL}/admin/realms/${RUN_NAME}/components/${component_id}" \
+            -H "Authorization: Bearer ${token}" -H 'Content-Type: application/json' \
+            -d "${component}" >/dev/null
+    done
+    echo "Extended the authenticated client-registration policies of realm ${RUN_NAME} for service-account clients."
+}
+
+# Keep registration access tokens reusable across retries, so the
+# fulfillment service can recover an ambiguous service-account client
+# registration (fulfillment-service's recoverAmbiguousServiceAccountCreation
+# re-reads and re-registers). Mirrors the hook's
+# ensure_service_account_registration_token_policy: a client profile that
+# disables registration-access-token rotation, bound by a policy to clients
+# updated by registration token.
+ensure_service_account_registration_token_policy() {
+    local token profiles policies payload
+    token="$(keycloak_admin_token)"
+    profiles="$(keycloak_curl -s --fail-with-body -G \
+        "${KEYCLOAK_URL}/admin/realms/${RUN_NAME}/client-policies/profiles" \
+        -H "Authorization: Bearer ${token}" \
+        --data-urlencode "include-global-profiles=false")"
+    payload="$(python3 -c '
+import json
+import sys
+
+profile_name = "osac-service-account-registration-token-reuse"
+executor_name = "registration-access-token-rotation-disabled"
+response = json.loads(sys.argv[1])
+profiles = response.setdefault("profiles", [])
+if not isinstance(profiles, list):
+    raise SystemExit("invalid Keycloak client profile response")
+profile = next((item for item in profiles if item.get("name") == profile_name), None)
+if profile is None:
+    profile = {"name": profile_name, "executors": []}
+    profiles.append(profile)
+profile["description"] = "Keep OSAC service-account registration tokens reusable for retries"
+executors = profile.setdefault("executors", [])
+executor = next((item for item in executors if item.get("executor") == executor_name), None)
+if executor is None:
+    executors.append({"executor": executor_name, "configuration": {}})
+else:
+    executor["configuration"] = {}
+print(json.dumps({"profiles": profiles}))
+' "${profiles}")"
+    keycloak_curl -s --fail-with-body -X PUT \
+        "${KEYCLOAK_URL}/admin/realms/${RUN_NAME}/client-policies/profiles" \
+        -H "Authorization: Bearer ${token}" -H 'Content-Type: application/json' \
+        -d "${payload}" >/dev/null
+
+    policies="$(keycloak_curl -s --fail-with-body -G \
+        "${KEYCLOAK_URL}/admin/realms/${RUN_NAME}/client-policies/policies" \
+        -H "Authorization: Bearer ${token}" \
+        --data-urlencode "include-global-profiles=false")"
+    payload="$(python3 -c '
+import json
+import sys
+
+profile_name = "osac-service-account-registration-token-reuse"
+policy_name = "osac-service-account-registration-token-reuse"
+response = json.loads(sys.argv[1])
+policies = response.setdefault("policies", [])
+if not isinstance(policies, list):
+    raise SystemExit("invalid Keycloak client policy response")
+policy = next((item for item in policies if item.get("name") == policy_name), None)
+if policy is None:
+    policy = {"name": policy_name}
+    policies.append(policy)
+policy.update({
+    "description": "Keep OSAC service-account registration tokens reusable for retries",
+    "enabled": True,
+    "conditions": [{
+        "condition": "client-updater-context",
+        "configuration": {"update-client-source": ["ByRegistrationAccessToken"]},
+    }],
+    "profiles": [profile_name],
+})
+print(json.dumps({"policies": policies}))
+' "${policies}")"
+    keycloak_curl -s --fail-with-body -X PUT \
+        "${KEYCLOAK_URL}/admin/realms/${RUN_NAME}/client-policies/policies" \
+        -H "Authorization: Bearer ${token}" -H 'Content-Type: application/json' \
+        -d "${payload}" >/dev/null
+    echo "Ensured reusable registration tokens for service-account clients in realm ${RUN_NAME}."
+}
+
 # Write the per-run Keycloak client credentials into the vcluster, in the
 # shape the osac-infra chart's create-controller-credentials and
 # create-ui-backend-credentials hooks create in a normal install: keys
@@ -1093,10 +1296,12 @@ write_instance_values() {
 # scripts/vcluster-run-setup.sh for run ${RUN_NAME}. Pass it to
 # 'make install-osac' through EXTRA_HELM_ARGS="--values <this file>".
 #
-# Dependencies (parallel osac work, not on main yet): global.instanceId,
-# aap.vcluster.*, and the instanceId-derived database secret and metering
-# Kafka secret names this overlay references. The umbrella schema rejects
-# unknown keys, so installing with this overlay requires that work.
+# Dependencies: global.instanceId, aap.vcluster.*, the external-AAP values
+# and the instanceId-derived database secret and metering Kafka secret
+# names this overlay references exist on the unified osac branch
+# vcluster-e2e (PR osac#2566), not on osac main. The umbrella schema
+# rejects unknown keys, so installing with this overlay requires that
+# branch.
 global:
   instanceId: ${RUN_NAME}
   eventTopicPrefix: "${EVENT_TOPIC_PREFIX}"
@@ -1173,6 +1378,13 @@ ui:
     serviceAccount:
       credentialsSecret: ${RUN_NAME}-osac-ui-backend-credentials
 operator:
+  fulfillment:
+    # The operator reads the same Keycloak client credentials as the
+    # fulfillment service (operator.fulfillment.credentials in
+    # values/vmaas-ci/instance.yaml, which names the unprefixed secret);
+    # a run's operator must read this run's client.
+    credentials:
+      secretName: ${RUN_NAME}-fulfillment-controller-credentials
   aap:
     templatePrefix: ${RUN_NAME}
 aap:
@@ -1200,11 +1412,22 @@ print_next_steps() {
     # run-prefixed so concurrent runs do not collide once the run routes are
     # published. The issuer URLs and credential references live in the
     # overlay instead.
+    #
+    # The AAP settings: the umbrella aliases the osac-aap dependency as
+    # `aap`, so the external-instance values are aap.controllerUrl (the
+    # shared AAP's controller URL) and
+    # aap.bootstrap.adminPasswordSecret.name (the run setup copies the
+    # outer cluster's <aap-instance>-admin-password secret into the
+    # vcluster under that name; the key defaults to password). Both exist
+    # on the unified osac branch vcluster-e2e (PR osac#2566), not on osac
+    # main: with aap.aap.instance.enabled=false the chart requires them.
     local extra_helm_args
     extra_helm_args="--values ${INSTANCE_VALUES_FILE}"
     extra_helm_args="${extra_helm_args} --set service.externalHostname=fulfillment-api-${RUN_NAME}.${OUTER_DOMAIN}"
     extra_helm_args="${extra_helm_args} --set service.internalHostname=fulfillment-internal-api-${RUN_NAME}.${OUTER_DOMAIN}"
     extra_helm_args="${extra_helm_args} --set ui.externalHostname=osac-ui-${RUN_NAME}.${OUTER_DOMAIN}"
+    extra_helm_args="${extra_helm_args} --set aap.controllerUrl=${AAP_CONTROLLER_URL}"
+    extra_helm_args="${extra_helm_args} --set aap.bootstrap.adminPasswordSecret.name=${AAP_INSTANCE}-admin-password"
 
     echo
     echo "Run setup complete."
@@ -1224,11 +1447,13 @@ print_next_steps() {
     echo "Run the suite with the run's realm and routes:"
     echo "  OSAC_KEYCLOAK_REALM=${RUN_NAME}"
     echo
-    echo "PROFILE=vcluster-ci, the chart's vcluster support, the"
-    echo "CLUSTER_DOMAIN Makefile override, global.instanceId and"
-    echo "aap.vcluster.* land with the parallel osac chart work; until then"
-    echo "they do not exist and the umbrella schema rejects the overlay's"
-    echo "unknown keys. Tear the run down with"
+    echo "PROFILE=vcluster-ci, the chart's vcluster support and the"
+    echo "CLUSTER_DOMAIN Makefile override land with the osac chart work"
+    echo "(the unified osac branch vcluster-e2e, PR osac#2566), which also"
+    echo "carries global.instanceId, aap.vcluster.* and the external-AAP"
+    echo "values aap.controllerUrl and aap.bootstrap.adminPasswordSecret."
+    echo "Until it merges, the umbrella schema on osac main rejects the"
+    echo "overlay's unknown keys. Tear the run down with"
     echo "scripts/vcluster-run-teardown.sh ${RUN_NAME}."
 }
 
@@ -1267,6 +1492,11 @@ main() {
             --aap-namespace)
                 [[ $# -ge 2 ]] || die "--aap-namespace needs a value."
                 AAP_NAMESPACE="$2"
+                shift 2
+                ;;
+            --aap-controller-url)
+                [[ $# -ge 2 ]] || die "--aap-controller-url needs a value."
+                AAP_CONTROLLER_URL="$2"
                 shift 2
                 ;;
             -h|--help)
@@ -1321,6 +1551,9 @@ main() {
     import_keycloak_realm
     wait_for_keycloak_realm
     set_fixture_user_passwords
+    grant_controller_realm_management_roles
+    ensure_service_account_registration_policies
+    ensure_service_account_registration_token_policy
     write_keycloak_credentials_into_vcluster
     create_aap_service_account
     copy_outer_secrets_into_vcluster
