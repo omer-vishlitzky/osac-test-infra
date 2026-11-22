@@ -715,3 +715,35 @@ def test_the_check_imports_nothing_it_checks():
     for module in ("workflow_exporter", "ci_observe_prs", "ci_observe_insights", "ci_observe_phases",
                    "ci_observe_trends", "ci_observe_runs"):
         assert f"import {module}" not in source and f"from {module}" not in source, module
+
+
+def test_an_unreadable_check_result_is_not_not_checked_yet(tmp_path):
+    """A broken ci-observe-audit.json is a broken result: shown as "not
+    checked yet" it would hide that the guard itself is down."""
+    phases = _load("ci_observe_phases", "ci_observe_phases.py")
+    path = tmp_path / phases.AUDIT_FILE_NAME
+    assert phases.read_audit_summary(str(path)) is None
+    path.write_text("{ truncated")
+    summary = phases.read_audit_summary(str(path))
+    source, notes = phases.audit_lines(summary, NOW, "e2e")
+    assert source.startswith("The check against GitHub cannot be read")
+    assert notes and "nothing is known" in notes[0]
+    path.write_text('{"e2e": {}}')
+    assert "holds no summary" in phases.audit_lines(phases.read_audit_summary(str(path)), NOW, "prs")[0]
+
+
+def test_a_merged_count_the_check_could_not_compare_is_not_a_difference():
+    phases = _load("ci_observe_phases", "ci_observe_phases.py")
+    checked_at = NOW.strftime("%Y-%m-%dT%H:%M:%SZ")
+    for merged_ok, says in ((True, "matches"), (False, "differs"), (None, "was not checked")):
+        summary = {"checked_at": checked_at, "prs": {"sample": 5, "sample_differ": 0, "merged_ok": merged_ok}}
+        source, notes = phases.audit_lines(summary, NOW, "prs")
+        assert source.endswith(f"the merged count {says}")
+        assert any("differs from GitHub's search" in note for note in notes) == (merged_ok is False)
+
+
+def test_an_unreadable_test_history_fails_the_check_instead_of_reporting_runs_missing(tmp_path):
+    broken = tmp_path / "trends.db"
+    broken.write_bytes(b"not a database")
+    with pytest.raises(RuntimeError, match="test history .* could not be read"):
+        audit.stored_test_results(str(broken), ["1"])

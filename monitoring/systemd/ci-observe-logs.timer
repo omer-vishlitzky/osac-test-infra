@@ -4,9 +4,10 @@
 # Runs hourly at 55 past, after the exporter's poll and the trends rollup
 # (25 past), so a finished run's bundle is usually published by then: a
 # collect run in the private artifact repository can trail its source run
-# by minutes. Persistent means a missed pass (machine down) runs when the
-# machine comes back; a bundle inside GitHub's 30-day window is read late,
-# not lost.
+# by minutes, and a bundle not found yet is asked for again every pass for
+# six hours. Persistent means a missed pass (machine down) runs when the
+# machine comes back, and every pass looks back 30 days: a bundle inside
+# GitHub's 30-day window is read late, not lost.
 
 [Unit]
 Description=Run the ci-observe artifact-log rollup hourly

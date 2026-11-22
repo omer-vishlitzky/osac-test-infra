@@ -281,9 +281,17 @@ class CIObserveRuns:
             return ""
         if not self.exporter._logs_indexed(run_id):
             return ""
-        query = '{source="artifact", run_id="%s"}' % run_id
-        left = json.dumps({"datasource": "loki", "queries": [{"expr": query, "refId": "A"}]})
-        return "/explore?orgId=1&left=" + quote(left, safe="")
+        # The run is structured metadata on the lines (the rollup keeps the
+        # stream labels few), so it is a filter after the selector; the
+        # rollup stamps every line inside the run, so the run's own time
+        # range, with two hours of slack, shows them all.
+        query = '{source="artifact"} | run_id="%s"' % run_id
+        state = {"datasource": "loki", "queries": [{"expr": query, "refId": "A"}]}
+        started, ended = self._parse_time(run.get("created_at")), self._parse_time(run.get("updated_at"))
+        if started and ended:
+            state["range"] = {"from": str(int((started - timedelta(hours=2)).timestamp() * 1000)),
+                              "to": str(int((ended + timedelta(hours=2)).timestamp() * 1000))}
+        return "/explore?orgId=1&left=" + quote(json.dumps(state), safe="")
 
     @staticmethod
     def _details_url(run, capture_id, started_at_ms, done_at_ms):

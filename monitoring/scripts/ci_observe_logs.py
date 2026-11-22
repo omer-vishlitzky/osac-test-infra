@@ -10,26 +10,29 @@ places). This job reads them and answers two different questions:
 
 "What failed in this run?" -- Loki holds the failed runs' error lines and
 their failure-summary context, queryable per run, outliving the artifacts.
-Labels on every line:
+Stream labels stay few, because Loki keeps one index entry and one chunk
+per label set:
     source="artifact"      these lines came from a bundle, not the live
                            capture (the live lane pushes without it)
-    repo, run_id, attempt  the run the bundle belongs to
-    suite                  vmaas, caas or bmaas, from the artifact name
-    phase                  the failing step's phase (ci_observe_phases:
-                           prepare, build, install, cluster, test, collect,
-                           other)
-    kind                   the bundle area: aap-jobs (the install
-                           pipeline's job outputs), test-failure (the
-                           per-test captured logs), pod, events, summary
-                           (the gather script's own digest), other
+    repo, suite            the run's repository and suite (vmaas, caas or
+                           bmaas, from the artifact name)
+    kind                   "error" for an error line, "summary" for the
+                           gather script's failure-summary context
+Every line also carries structured metadata, which LogQL filters on after
+the selector without an index entry per value:
+    run_id, attempt        the run the bundle belongs to
     signature              only on error lines: the message with its
                            instance-specific parts and log prefixes
                            replaced (ci_observe_phases.message_signature),
                            so the same error in two runs counts as one
-Lines are stored verbatim, without a file label: a per-file label would
-multiply the stream count by the bundle's file count. Timestamps are
-parsed from the line when it carries an RFC 3339 one, else the run's end
-time, so time-range queries stay honest.
+so the lines of one run are {source="artifact"} | run_id="<id>". (Before
+2026-11-22 run_id, attempt and signature were stream labels: one stream
+per run and signature, tens of thousands a week. A label filter after the
+selector matches both kinds of line.) Lines are stored verbatim, without a
+file label. A line's own RFC 3339 timestamp is kept when it falls inside
+the run (an hour of slack each side, never in the future); any other line
+is stamped with the run's end, so a query over the run's time range finds
+all of its lines and Loki never refuses a stamp as too old or too new.
 
 "What makes failed runs different from passing ones?" -- trends.db (the
 ci-observe store) holds one row per (run, signature): how often each
@@ -39,24 +42,35 @@ both answers nothing, and only the comparison can tell a cause from the
 ambient noise every cluster logs (informer timeouts, libvirt races).
 
 Population: the in-scope suites (ci_observe_phases.SUITE_WORKFLOWS), every
-trigger. Failed runs are indexed fully; passing runs contribute their
-signatures.
+trigger, the latest attempt of each run. Failed runs are indexed fully;
+passing runs contribute their signatures.
 
 State lives in trends.db:
-    artifact_logs          per (run, suite): "indexed", "missing" (no
-                          bundle in either place; retried every pass,
-                          because a collect run can trail its source run by
-                          minutes) or "unavailable" (expired or unreadable;
-                          the run's own fact, said once)
-    artifact_log_signatures per (run, suite, signature): occurrence count
+    artifact_logs          per (run, suite), with the attempt it read:
+                          "indexed"; "missing" (no bundle in either place
+                          yet: a collect run can trail its source run by
+                          minutes, so it is asked for again every pass for
+                          MISSING_RETRY_HOURS after the run ended, then
+                          recorded "unavailable"); "unavailable" (expired,
+                          over the bound, not a zip, or never published:
+                          the run's own fact, said once); "rejected" (Loki
+                          refused the run's own lines: the run's fact, the
+                          reason kept, the pass goes on). A newer attempt of
+                          the run is read again.
+    artifact_log_signatures per (run, suite, signature): occurrence count,
+                          of the attempt the state names
+    rollup_passes          the job "logs": when a pass last ran to its end,
+                          which the pages and CiObserveHourlyStoreStale read
 
 Usage:
     ci_observe_logs.py [--days N] [--limit N] [--force] [--dry-run]
-                        [--failures-only]
+                        [--failures-only] [--resign]
 
-Exit status: 0 when the pass ran, 1 when Loki or GitHub refused anything
-(fail fast: the guard retries next hour, but a refusal must be visible,
-never silent).
+Exit status: 0 when the pass ran and every run's bundle was read; 1 when
+GitHub or Loki refused the pass (it stops: the refusal is the same for
+every following run, and the next hour retries) or when a run's bundle
+could not be read or was rejected (the pass goes on; the failure must be
+visible, never silent).
 """
 
 from __future__ import annotations
@@ -109,6 +123,15 @@ MAX_LINE_BYTES = 262144
 # One Loki push carries at most this many lines: keeps request bodies small
 # enough for the LGTM defaults.
 PUSH_BATCH_LINES = 500
+# A line's own timestamp is kept only inside the run, with this slack each
+# side: a stamp outside it (a skewed clock, a local time read as UTC, an
+# old date quoted in a message) would put the line where no query over the
+# run looks, or be refused by Loki as too new or too old.
+LINE_TIME_SLACK = timedelta(hours=1)
+# A bundle not found in either place is asked for again every pass for this
+# long after the run ended (a collect run can trail its source run), then
+# recorded unavailable: a bundle that never came is the run's own fact.
+MISSING_RETRY_HOURS = 6
 
 # The strong error patterns the gather script's own summary greps for,
 # minus its noise filter: a zero counter is not an error.
@@ -163,8 +186,10 @@ def line_message(line):
     return text.strip()
 
 
-def parse_line_time(line, fallback):
-    """The line's own timestamp, or the run's end time when it has none."""
+def parse_line_time(line, fallback, earliest=None, latest=None):
+    """The line's own timestamp when it falls in [earliest, latest], else
+    `fallback` (the run's end): a stamp outside the run would put the line
+    where no query over the run looks, or be refused by Loki."""
     match = LINE_TIME_RE.match(line) or JSON_TIME_RE.search(line[:200])
     if not match:
         return fallback
@@ -175,6 +200,8 @@ def parse_line_time(line, fallback):
         return fallback
     if moment.tzinfo is None:
         moment = moment.replace(tzinfo=timezone.utc)
+    if (earliest is not None and moment < earliest) or (latest is not None and moment > latest):
+        return fallback
     return moment
 
 
@@ -218,11 +245,16 @@ def open_state(db_path):
         " files INTEGER NOT NULL DEFAULT 0, lines INTEGER NOT NULL DEFAULT 0,"
         " error_lines INTEGER NOT NULL DEFAULT 0, skipped_files INTEGER NOT NULL DEFAULT 0,"
         " skipped_lines INTEGER NOT NULL DEFAULT 0,"
-        " ingested_at TEXT NOT NULL, PRIMARY KEY (run_id, suite))"
+        " ingested_at TEXT NOT NULL, attempt TEXT NOT NULL DEFAULT '', PRIMARY KEY (run_id, suite))"
     )
     columns = {row[1] for row in conn.execute("PRAGMA table_info(artifact_logs)")}
     if "skipped_lines" not in columns:
         conn.execute("ALTER TABLE artifact_logs ADD COLUMN skipped_lines INTEGER NOT NULL DEFAULT 0")
+    if "attempt" not in columns:
+        # Rows from before carry no attempt; they were read at the attempt
+        # stored then, which is the first for nearly every run (see
+        # stored_attempt).
+        conn.execute("ALTER TABLE artifact_logs ADD COLUMN attempt TEXT NOT NULL DEFAULT ''")
     conn.execute(
         "CREATE TABLE IF NOT EXISTS artifact_log_signatures ("
         " run_id TEXT NOT NULL, suite TEXT NOT NULL, kind TEXT NOT NULL, signature TEXT NOT NULL,"
@@ -232,40 +264,55 @@ def open_state(db_path):
     return conn
 
 
+def stored_attempt(row):
+    """The attempt a state row was read at: rows recorded before the attempt
+    was kept read the first."""
+    return (row["attempt"] if "attempt" in row.keys() else "") or "1"
+
+
 def runs_in_window(days, now, failures_only):
     """The in-scope suite runs inside the window, newest first: [{run_id,
     repo, trigger, workflow, suite, conclusion, failed_step, attempt,
-    finished_at, outcome}]. A merge-queue run appears once per suite (it
-    holds three bundles); every other run once for its own suite. The
-    trigger is the taxonomy word (pr, merge_queue, scheduled, manual) the
-    artifact places route on, not the raw stored text ("merge queue (PR
-    #2180)"): the stored text names the run, the taxonomy names where its
-    artifact lives."""
+    created_at, finished_at, outcome}], one per (run, suite) at its latest
+    attempt. A merge-queue run appears once per suite (it holds three
+    bundles); every other run once for its own suite. A re-run leaves a
+    suite row per attempt behind; only the latest attempt's is the run's
+    result, and its bundle is the newest of that name. The trigger is the
+    taxonomy word (pr, merge_queue, scheduled, manual) the artifact places
+    route on, not the raw stored text ("merge queue (PR #2180)"): the
+    stored text names the run, the taxonomy names where its artifact
+    lives."""
     conn = sqlite3.connect(f"file:{EXPORTER_DB}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     since = (now - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
     conclusion = "AND conclusion = 'failure'" if failures_only else "AND conclusion IN ('success', 'failure')"
     try:
         rows = conn.execute(
-            "SELECT run_id, repo, workflow, event, trigger, failed_step, conclusion, updated_at, run_attempt"
-            f" FROM jobs WHERE category = 'e2e' {conclusion}"
+            "SELECT run_id, repo, workflow, event, trigger, failed_step, conclusion, created_at, updated_at,"
+            f" run_attempt FROM jobs WHERE category = 'e2e' {conclusion}"
             " AND updated_at >= ? ORDER BY updated_at DESC", (since,)).fetchall()
     finally:
         conn.close()
-    runs = []
+    latest = {}
     for row in rows:
         suite = phases.suite_key(row["workflow"])
         if not suite:
             continue
-        runs.append({
+        finished = phases.parse_time(row["updated_at"]) or now
+        run = {
             "run_id": str(row["run_id"]), "repo": row["repo"],
             "trigger": phases.trigger_key(row["event"], row["workflow"]),
             "workflow": row["workflow"], "failed_step": row["failed_step"], "suite": suite,
             "conclusion": row["conclusion"], "outcome": "success" if row["conclusion"] == "success" else "failure",
             "attempt": str(row["run_attempt"] or 1),
-            "finished_at": phases.parse_time(row["updated_at"]) or now,
-        })
-    return runs
+            "created_at": phases.parse_time(row["created_at"]) or finished,
+            "finished_at": finished,
+        }
+        key = (run["run_id"], suite)
+        held = latest.get(key)
+        if held is None or (int(run["attempt"]), run["finished_at"]) > (int(held["attempt"]), held["finished_at"]):
+            latest[key] = run
+    return sorted(latest.values(), key=lambda run: run["finished_at"], reverse=True)
 
 
 def list_bundle(run, headers):
@@ -302,24 +349,33 @@ def download_bundle(artifact, headers):
         return None, "the artifact is not a zip archive"
 
 
-def read_bundle(archive, run):
+def read_bundle(archive, run, now=None):
     """(streams, signatures, counts) of one bundle:
-    streams -- {labels tuple: [(ns, line)]} of the lines to push to Loki
-        (failed runs only: every error line, and the failure summary's
-        context lines)
+    streams -- {labels tuple: [(ns, line, metadata)]} of the lines to push
+        to Loki (failed runs only: every error line, and the failure
+        summary's context lines); the labels are few (see the module
+        docstring), the run and the signature ride as structured metadata
     signatures -- [(signature, kind, lines)] for the presence table, the
         same for failed and passing runs
     counts -- files, error_lines, skipped_files, lines
     A file over MAX_FILE_BYTES is skipped and counted, never truncated."""
+    now = now or datetime.now(timezone.utc)
     streams = {}
     signatures = {}
     counts = {"files": 0, "lines": 0, "error_lines": 0, "skipped_files": 0, "skipped_lines": 0}
     failed = run["outcome"] == "failure"
+    finished = run["finished_at"]
+    earliest = (run.get("created_at") or finished) - LINE_TIME_SLACK
+    latest = min(finished + LINE_TIME_SLACK, now)
     for info in archive.infolist():
         if info.is_dir() or not info.filename.endswith(TEXT_SUFFIXES):
             continue
         is_summary = info.filename.rsplit("/", 1)[-1] == "failure-summary.txt"
-        if not is_summary and info.file_size > MAX_FILE_BYTES:
+        # The summary is read whatever its size up to the bundle's own
+        # bound: it is the gather script's digest, and a bundle may not
+        # declare a summary bigger than itself (a zip bomb would).
+        bound = MAX_BUNDLE_BYTES if is_summary else MAX_FILE_BYTES
+        if info.file_size > bound:
             counts["skipped_files"] += 1
             continue
         counts["files"] += 1
@@ -344,22 +400,27 @@ def read_bundle(archive, run):
                 signatures[(signature, kind)] = entry + 1
             if not failed or not (error_line or is_summary):
                 continue
-            # Per-line labels stay small: repo, run, suite and, on error
-            # lines, the signature the queries aggregate by. Kind and phase
-            # are per-run facts and live in the signature table; a label
-            # per line would multiply the stream count by nothing useful.
-            labels = {
-                "source": "artifact", "repo": run["repo"], "run_id": run["run_id"],
-                "attempt": run["attempt"], "suite": run["suite"],
-            }
+            labels = {"source": "artifact", "repo": run["repo"], "suite": run["suite"],
+                      "kind": "error" if error_line else "summary"}
+            metadata = {"run_id": run["run_id"], "attempt": run["attempt"]}
             if error_line:
-                labels["signature"] = signature
-            else:
-                labels["kind"] = "summary"
-            moment = parse_line_time(line, run["finished_at"])
+                metadata["signature"] = signature
+            moment = parse_line_time(line, finished, earliest, latest)
             streams.setdefault(tuple(sorted(labels.items())), []).append(
-                (int(moment.timestamp() * 1e9), line))
+                (int(moment.timestamp() * 1e9), line, metadata))
     return streams, signatures, counts
+
+
+class LokiRefused(RuntimeError):
+    """Loki did not take a push for a reason every following run shares
+    (it is down, overloaded, or refusing this client): the pass stops."""
+
+
+class LokiRejected(EvidenceError):
+    """Loki answered 400 to this run's own lines (their content, not the
+    service): the run's fact, recorded with Loki's reason; the pass goes
+    on. The lines it accepted before stay; the run is not pushed again
+    unless forced, so nothing is stored twice."""
 
 
 def push_streams(streams, session):
@@ -371,13 +432,19 @@ def push_streams(streams, session):
             batch = values[start:start + PUSH_BATCH_LINES]
             payload = {"streams": [{
                 "stream": group_labels,
-                "values": [[str(when), line] for when, line in batch],
+                "values": [[str(when), line, metadata] for when, line, metadata in batch],
             }]}
-            response = session.post(f"{LOKI_URL}/loki/api/v1/push", json=payload, timeout=120)
-            if response.status_code != 204:
-                raise RuntimeError(
-                    f"Loki answered HTTP {response.status_code} to a push of {len(batch)} lines: "
-                    f"{response.text[:300]}")
+            try:
+                response = session.post(f"{LOKI_URL}/loki/api/v1/push", json=payload, timeout=120)
+            except requests.exceptions.RequestException as error:
+                raise LokiRefused(f"Loki did not answer a push of {len(batch)} lines: {error}") from None
+            if response.status_code == 204:
+                continue
+            answer = f"Loki answered HTTP {response.status_code} to a push of {len(batch)} lines: " \
+                     f"{(response.text or '')[:300]}"
+            if response.status_code == 400:
+                raise LokiRejected(answer)
+            raise LokiRefused(answer)
 
 
 def flush_loki(session):
@@ -392,11 +459,16 @@ def flush_loki(session):
         logger.warning("the Loki flush failed: %s", error)
 
 
+NO_COUNTS = {"files": 0, "lines": 0, "error_lines": 0, "skipped_files": 0, "skipped_lines": 0}
+
+
 def record_run(state, run, state_name, reason, counts, now):
-    state.execute("INSERT OR REPLACE INTO artifact_logs VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                  (run["run_id"], run["suite"], run["repo"], state_name, reason,
-                   counts["files"], counts["lines"], counts["error_lines"], counts["skipped_files"],
-                   counts["skipped_lines"], now.strftime("%Y-%m-%dT%H:%M:%SZ")))
+    state.execute(
+        "INSERT OR REPLACE INTO artifact_logs (run_id, suite, repo, state, reason, files, lines, error_lines,"
+        " skipped_files, skipped_lines, ingested_at, attempt) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+        (run["run_id"], run["suite"], run["repo"], state_name, reason,
+         counts["files"], counts["lines"], counts["error_lines"], counts["skipped_files"],
+         counts["skipped_lines"], now.strftime("%Y-%m-%dT%H:%M:%SZ"), run["attempt"]))
 
 
 def record_signatures(state, run, signatures):
@@ -412,7 +484,9 @@ def record_signatures(state, run, signatures):
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Index the artifact logs of ci-observe's suite runs.")
     parser.add_argument("--days", type=int, default=1, help="read runs updated in the last N days")
-    parser.add_argument("--limit", type=int, default=None, help="stop after N indexed bundles")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="stop after looking up N runs' bundles (indexed, missing or unreadable alike:"
+                             " each costs GitHub calls); the next pass goes on")
     parser.add_argument("--force", action="store_true", help="re-index runs the guard already recorded")
     parser.add_argument("--dry-run", action="store_true", help="resolve and read, push and record nothing")
     parser.add_argument("--failures-only", action="store_true",
@@ -431,67 +505,78 @@ def main(argv=None):
     now = datetime.now(timezone.utc)
     headers = {"Authorization": f"Bearer {TOKEN}", "Accept": "application/vnd.github+json"}
     session = requests.Session()
-    session.headers.update(headers)
 
     state = open_state(TRENDS_DB)
     runs = runs_in_window(args.days, now, args.failures_only)
     logger.info("%d in-scope suite run(s) in the last %d day(s)", len(runs), args.days)
 
-    indexed = skipped = failed = missing = 0
-    done = 0
+    indexed = skipped = failed = missing = unavailable = 0
+    looked_up = 0
     for run in runs:
-        row = state.execute("SELECT state FROM artifact_logs WHERE run_id = ? AND suite = ?",
+        row = state.execute("SELECT * FROM artifact_logs WHERE run_id = ? AND suite = ?",
                             (run["run_id"], run["suite"])).fetchone()
-        if row and not args.force:
-            if row["state"] == "unavailable":
-                # The run's own fact (expired, unreadable); only a forced
-                # pass says it again.
-                skipped += 1
-                continue
-            if row["state"] == "indexed" and not args.resign:
-                skipped += 1
-                continue
-            # "missing": a collect run can trail its source run by minutes,
-            # so a missing bundle is asked for again every pass.
-        if args.resign and (row is None or row["state"] != "indexed"):
+        same_attempt = row is not None and stored_attempt(row) == run["attempt"]
+        if args.resign:
             # A repair pass recomputes what was indexed; a run with no
             # recorded bundle has nothing to recompute.
+            if row is None or row["state"] != "indexed" or not same_attempt:
+                skipped += 1
+                continue
+        elif row is not None and same_attempt and not args.force and row["state"] in (
+                "indexed", "unavailable", "rejected"):
+            # The run's own fact at this attempt; only a forced pass reads
+            # it again. A newer attempt is a new bundle and is read.
             skipped += 1
             continue
+        # "missing": a collect run can trail its source run by minutes, so a
+        # missing bundle is asked for again every pass while the run is young.
+        if args.limit and looked_up >= args.limit:
+            logger.info("the pass stops at its limit of %d runs looked up; the next pass goes on", args.limit)
+            break
+        looked_up += 1
         try:
             bundle = list_bundle(run, headers)
             if bundle is None:
                 expected, other = artifact_places(run["trigger"], run["repo"], run["run_id"], ORG)
                 reason = (f"no {SUITE_ARTIFACTS[run['suite']].format(run_id=run['run_id'])} artifact"
                           f" in {expected} or in {other}")
+                hours = (now - run["finished_at"]).total_seconds() / 3600
+                final = hours > MISSING_RETRY_HOURS
+                if final:
+                    reason += f" {hours:.0f} hours after the run ended"
                 if not args.dry_run:
-                    record_run(state, run, "missing", reason,
-                               {"files": 0, "lines": 0, "error_lines": 0, "skipped_files": 0,
-                                "skipped_lines": 0}, now)
+                    record_run(state, run, "unavailable" if final else "missing", reason, NO_COUNTS, now)
                     state.commit()
-                missing += 1
+                if final:
+                    unavailable += 1
+                else:
+                    missing += 1
                 logger.info("  %s run %s (%s, %s): %s", run["repo"], run["run_id"], run["suite"],
                             run["outcome"], reason)
                 continue
             archive, reason = download_bundle(bundle["artifact"], headers)
             if archive is None:
                 if not args.dry_run:
-                    record_run(state, run, "unavailable", reason,
-                               {"files": 0, "lines": 0, "error_lines": 0, "skipped_files": 0,
-                                "skipped_lines": 0}, now)
+                    record_run(state, run, "unavailable", reason, NO_COUNTS, now)
                     state.commit()
-                missing += 1
+                unavailable += 1
                 logger.info("  %s run %s (%s, %s): %s", run["repo"], run["run_id"], run["suite"],
                             run["outcome"], reason)
                 continue
-            streams, signatures, counts = read_bundle(archive, run)
+            streams, signatures, counts = read_bundle(archive, run, now)
             if not args.dry_run and streams and not args.resign:
-                push_streams(streams, session)
+                try:
+                    push_streams(streams, session)
+                except LokiRejected as error:
+                    # Recorded before the next run, so a later pass does not
+                    # push the lines Loki already took a second time.
+                    record_run(state, run, "rejected", str(error), counts, now)
+                    state.commit()
+                    raise
             if not args.dry_run:
                 record_run(state, run, "indexed", "", counts, now)
                 record_signatures(state, run, signatures)
             indexed += 1
-            done += 1
             logger.info("  %s run %s (%s, %s): %d file(s), %d error line(s), %d signature(s)%s",
                         run["repo"], run["run_id"], run["suite"], run["outcome"], counts["files"],
                         counts["error_lines"], len(signatures),
@@ -499,26 +584,26 @@ def main(argv=None):
             if counts["skipped_lines"]:
                 logger.info("  %s run %s: %d line(s) over Loki's entry bound were not stored",
                             run["repo"], run["run_id"], counts["skipped_lines"])
-            if args.limit and done >= args.limit:
-                break
-        except (GitHubRefused, RuntimeError) as error:
+        except (GitHubRefused, LokiRefused) as error:
             # A refusal is the same for every following run: stop the pass,
-            # say why, exit non-zero. The guard retries next hour.
+            # say why, exit non-zero. The guard retries next hour. No pass
+            # is recorded, so the store's freshness ages and alerts.
             logger.error("  %s run %s (%s): %s", run["repo"], run["run_id"], run["suite"], error)
             logger.error("the artifact log pass stopped, nothing more was stored")
             state.close()
             return 1
         except EvidenceError as error:
-            # This run's own unreadable bundle; the pass continues.
+            # This run's own unreadable or rejected bundle; the pass continues.
             failed += 1
             logger.error("  %s run %s (%s): %s", run["repo"], run["run_id"], run["suite"], error)
 
+    summary = (f"{indexed} indexed, {missing} missing, {unavailable} unavailable, {skipped} already read,"
+               f" {failed} unreadable or rejected")
     if not args.dry_run:
         flush_loki(session)
+        phases.record_pass(state, "logs", now, summary)
     state.close()
-    logger.info("%d bundle(s) indexed, %d missing, %d skipped, %d unreadable%s",
-                indexed, missing, skipped, failed,
-                " (dry run, nothing pushed or recorded)" if args.dry_run else "")
+    logger.info("%s%s", summary, " (dry run, nothing pushed or recorded)" if args.dry_run else "")
     return 1 if failed else 0
 
 

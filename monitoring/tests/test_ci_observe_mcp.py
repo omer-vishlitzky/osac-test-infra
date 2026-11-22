@@ -8,12 +8,14 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import math
+import socket
 import sys
 import threading
 import time
 import urllib.parse
+from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
-from http.server import ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -70,6 +72,11 @@ class FakeStatus:
 
     def json(self):
         return self._payload
+
+
+def grafana_user(login, role="Viewer", disabled=False, labels=("GitHub",)):
+    """One /api/org/users entry, the fields Grafana 13 answers with."""
+    return {"login": login, "role": role, "isDisabled": disabled, "authLabels": list(labels)}
 
 
 @pytest.fixture
@@ -204,14 +211,53 @@ def test_a_health_question_returns_rows_urls_and_the_about_row(config, web):
     assert answer["not_answerable"] == ""
 
 
+def days_ago(days):
+    return (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+
+
 def test_an_end_reaches_the_api_and_the_question(config, web):
+    end = days_ago(3)
     web.add("http://exporter/api/ci-observe/failures?days=7&suite=vmaas&trigger=pr&repo=osac"
-            "&end=2026-11-01", {"flaky": [{"test": "t"}], "about": [{}], "window": [{}], "notes": []})
+            f"&end={end}T00%3A00%3A00Z", {"flaky": [{"test": "t"}], "about": [{}], "window": [{}], "notes": []})
     answer = tool_call(config, "flaky_tests",
-                       {"suite": "vmaas", "trigger": "pr", "repo": "osac", "days": 7,
-                        "end": "2026-11-01"})
-    assert answer["api_url"].endswith("end=2026-11-01")
-    assert "ending 2026-11-01" in answer["question"]
+                       {"suite": "vmaas", "trigger": "pr", "repo": "osac", "days": 7, "end": end})
+    assert answer["api_url"].endswith(f"end={end}T00%3A00%3A00Z")
+    assert f"ending {end}T00:00:00Z" in answer["question"]
+
+
+@pytest.mark.parametrize(("end", "reason"), [
+    ("2026-11-01T12:00:00+02:00", "must be a UTC date"),  # the API would answer it for a window ending now
+    ("2026-11-01 12:00", "must be a UTC date"),
+    ("not a date", "must be a UTC date"),
+    (7, "must be a UTC date"),
+])
+def test_an_end_the_api_cannot_read_is_refused_before_any_call(config, web, end, reason):
+    with pytest.raises(mcp.ToolError, match=reason):
+        tool_call(config, "suite_health", {"suite": "vmaas", "trigger": "pr", "repo": "osac", "days": 7,
+                                           "end": end})
+    assert web.calls == []
+
+
+def test_a_future_end_is_refused(config, web):
+    tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d")
+    with pytest.raises(mcp.ToolError, match="in the future"):
+        tool_call(config, "suite_health", {"suite": "vmaas", "trigger": "pr", "repo": "osac", "days": 7,
+                                           "end": tomorrow})
+    assert web.calls == []
+
+
+def test_a_window_ending_in_the_past_must_lie_inside_the_retention(config, web):
+    # 30 days ending 70 days ago reach back 100: past the 90-day archive.
+    with pytest.raises(mcp.ToolError, match="starts before the 90 days"):
+        tool_call(config, "suite_health", {"suite": "vmaas", "trigger": "pr", "repo": "osac", "days": 30,
+                                           "end": days_ago(70)})
+    # The job history keeps 30 days: 7 days ending 25 days ago reach 32.
+    with pytest.raises(mcp.ToolError, match="starts before the 30 days the job history keeps"):
+        tool_call(config, "list_runs", {"suite": "vmaas", "result": "failure", "repo": "osac", "days": 7,
+                                        "end": days_ago(25)})
+    with pytest.raises(mcp.ToolError, match="starts before the 90 days"):
+        tool_call(config, "pull_requests", {"repo": "osac", "days": 30, "state": "merged", "end": days_ago(80)})
+    assert web.calls == []
 
 
 def test_a_failed_tests_502_is_the_reason_not_an_empty_answer(config, web):
@@ -255,6 +301,78 @@ def test_rows_are_capped_at_twenty(config, web):
     answer = tool_call(config, "failing_tests",
                        {"suite": "vmaas", "trigger": "pr", "repo": "osac", "days": 7})
     assert len(answer["rows"]) == mcp.MAX_ROWS == 20
+    # A cut list says it is one: how many there were and that there are more.
+    assert answer["rows_total"] == 50
+    assert any("showing 20 of 50" in note for note in answer["notes"])
+
+
+def test_a_list_that_fits_has_no_cut_note(config, web):
+    web.add("http://exporter/api/ci-observe/failures?days=7&suite=vmaas&trigger=pr&repo=osac",
+            {"tests": [{"test": "t"}], "about": [{}], "window": [{}], "notes": []})
+    answer = tool_call(config, "failing_tests", {"suite": "vmaas", "trigger": "pr", "repo": "osac", "days": 7})
+    assert answer["rows_total"] == 1 and not any("showing" in note for note in answer["notes"])
+
+
+def test_a_capped_runs_page_names_its_total(config, web):
+    web.add("http://exporter/api/ci-observe/runs?days=7&repo=osac&suite=vmaas&result=failure&limit=20",
+            {"runs": [{"id": i} for i in range(20)], "truncated": True, "total": 57})
+    answer = tool_call(config, "list_runs", {"suite": "vmaas", "result": "failure", "repo": "osac", "days": 7})
+    assert answer["rows_total"] == 57
+    assert any("20 newest of 57" in note for note in answer["notes"])
+
+
+def pr_row(number, merged_days_ago=None, opened_days_ago=40, closed_days_ago=None, state="merged"):
+    def moment(days):
+        return (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    return {"number": number, "repo": "osac", "title": f"PR {number}", "state": state,
+            "opened_at": moment(opened_days_ago),
+            "merged_at": moment(merged_days_ago) if merged_days_ago is not None else None,
+            "closed_at": moment(closed_days_ago) if closed_days_ago is not None else None}
+
+
+def test_the_pull_requests_of_a_past_window_are_its_own(config, web):
+    # Window: the 7 days ending 10 days ago. #1 merged after it, #2 and #3 inside, #4 before it,
+    # #5 was closed inside it (the index windows a closed one by its close).
+    rows = [pr_row(1, merged_days_ago=5), pr_row(2, merged_days_ago=11), pr_row(3, merged_days_ago=16),
+            pr_row(4, merged_days_ago=18), pr_row(5, closed_days_ago=12, state="closed")]
+    # The index is asked back to the window's start: 17 days and the part of today gone by.
+    end = days_ago(10)
+    start = datetime.strptime(end, "%Y-%m-%d").replace(tzinfo=timezone.utc) - timedelta(days=7)
+    fetch = math.ceil((datetime.now(timezone.utc) - start).total_seconds() / 86400)
+    web.add(f"http://exporter/api/ci-observe/prs?days={fetch}&repo=osac", {"prs": rows, "about": [{}], "notes": []})
+    answer = tool_call(config, "pull_requests", {"repo": "osac", "days": 7, "state": "all", "end": end})
+    assert [row["number"] for row in answer["rows"]] == [2, 5, 3]
+    assert answer["rows_total"] == 3
+    merged = tool_call(config, "pull_requests", {"repo": "osac", "days": 7, "state": "merged", "end": end})
+    assert [row["number"] for row in merged["rows"]] == [2, 3]
+
+
+def test_more_than_twenty_pull_requests_say_how_to_reach_the_rest(config, web):
+    rows = [pr_row(number, merged_days_ago=1 + number / 10) for number in range(1, 31)]
+    web.add("http://exporter/api/ci-observe/prs?days=7&repo=osac", {"prs": rows, "about": [{}], "notes": []})
+    answer = tool_call(config, "pull_requests", {"repo": "osac", "days": 7, "state": "merged"})
+    assert [row["number"] for row in answer["rows"]] == list(range(1, 21))  # the latest first
+    assert answer["rows_total"] == 30
+    note = next(note for note in answer["notes"] if "showing the 20 latest of 30" in note)
+    assert f"end={answer['rows'][-1]['merged_at']}" in note
+
+
+def test_a_failing_tool_is_an_error_answer_not_a_reset_connection(config, monkeypatch):
+    def broken(config, arguments):
+        raise KeyError("boom")
+
+    monkeypatch.setitem(mcp.TOOL_BY_NAME, "suite_health",
+                        mcp.Tool("suite_health", "", {}, broken))
+    status, answer = rpc(config, {"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                                  "params": {"name": "suite_health", "arguments": {}}})
+    assert answer["result"]["isError"] is True
+    assert "failed answering" in answer["result"]["content"][0]["text"]
+
+
+def test_initialize_survives_params_that_are_not_an_object(config):
+    status, answer = rpc(config, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": []})
+    assert answer["result"]["protocolVersion"] == mcp.PROTOCOL_VERSIONS[0]
 
 
 def test_every_population_dimension_is_required(config):
@@ -307,10 +425,21 @@ def test_a_test_history_question_passes_the_test(config, web):
 
 
 def test_pull_request_rows_come_from_the_kpis_and_the_funnel(config, web):
+    # The document's kpis is a list of one row, as ci_observe_prs serves it.
     web.add("http://exporter/api/ci-observe/prs?days=30&repo=osac",
-            {"kpis": {"merged": 10}, "funnel": [{"stage": "review"}], "about": [{}], "notes": []})
+            {"kpis": [{"merged": 10}], "funnel": [{"stage": "review"}], "about": [{}], "notes": []})
     answer = tool_call(config, "pull_request_stats", {"repo": "osac", "days": 30})
     assert answer["rows"] == [{"merged": 10}, {"stage": "review"}]
+
+
+def test_the_pull_request_numbers_include_the_real_document_kpis(config, web):
+    """The served document, not a hand-made one: its kpis row must reach
+    the answer (a dict-only check dropped it)."""
+    prs = load("ci_observe_prs")
+    document = {"kpis": prs._kpis([], {}), "funnel": prs._funnel([]), "about": [{}], "notes": []}
+    web.add("http://exporter/api/ci-observe/prs?days=30&repo=osac", document)
+    answer = tool_call(config, "pull_request_stats", {"repo": "osac", "days": 30})
+    assert "lead_median_s" in answer["rows"][0]
 
 
 # -- the HTTP server and the OAuth gate ----------------------------------------------
@@ -320,7 +449,7 @@ def test_pull_request_rows_come_from_the_kpis_and_the_funnel(config, web):
 def server(config, monkeypatch):
     state = mcp.McpState(config)
     mcp.McpHandler.state = state
-    httpd = ThreadingHTTPServer(("127.0.0.1", 0), mcp.McpHandler)
+    httpd = mcp.McpServer(("127.0.0.1", 0), mcp.McpHandler)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
     yield httpd
@@ -412,7 +541,7 @@ def test_an_mcp_call_without_a_token_is_refused_with_the_resource_metadata(serve
 
 def test_the_full_login_ends_in_a_working_token(server, config, monkeypatch):
     monkeypatch.setattr(mcp, "github_login", lambda config, code: "dev" if code == "gh-code" else "")
-    monkeypatch.setattr(mcp, "grafana_user_exists", lambda config, login: login == "dev")
+    monkeypatch.setattr(mcp, "grafana_admission", lambda config, login: "" if login == "dev" else "no user")
 
     # 1. Register the client and send the browser to /authorize.
     _, payload = request(server, "POST", "/register",
@@ -430,8 +559,9 @@ def test_the_full_login_ends_in_a_working_token(server, config, monkeypatch):
     back = urllib.parse.urlparse(answer.getheader("Location"))
     assert back.scheme == "http" and back.hostname == "localhost"
     code = urllib.parse.parse_qs(back.query)["code"][0]
-    headers = dict(answer.getheaders())
-    assert headers.get("Set-Cookie", "").startswith("ci_observe_mcp_session=")
+    # No browser session: a cookie on this host would be a bearer token
+    # every port of the host receives.
+    assert answer.getheader("Set-Cookie") is None
 
     # 3. The client exchanges the code with its verifier.
     answer, payload = request(server, "POST", "/token",
@@ -467,7 +597,7 @@ def test_the_state_github_receives_is_a_short_nonce(server, monkeypatch):
 
 def test_a_verifier_that_does_not_match_is_refused(server, monkeypatch):
     monkeypatch.setattr(mcp, "github_login", lambda config, code: "dev")
-    monkeypatch.setattr(mcp, "grafana_user_exists", lambda config, login: True)
+    monkeypatch.setattr(mcp, "grafana_admission", lambda config, login: "")
     _, payload = request(server, "POST", "/register",
                          body=json.dumps({"redirect_uris": ["http://127.0.0.1:41111/callback"]}),
                          headers={"Content-Type": "application/json"})
@@ -512,8 +642,8 @@ def test_the_grafana_check_reads_a_separate_reachable_address(config, web):
         grafana_service_token="token", session_secret="session-secret", github_api_url="https://gh",
         grafana_verify_tls=False,
     )
-    web.add("https://127.0.0.1:3000/api/org/users", [{"login": "dev"}])
-    assert mcp.grafana_user_exists(reachable, "dev") is True
+    web.add("https://127.0.0.1:3000/api/org/users", [grafana_user("dev")])
+    assert mcp.grafana_admission(reachable, "dev") == ""
     assert all("127.0.0.1:3000" in call for call in web.calls)
 
 
@@ -526,31 +656,51 @@ def test_an_unreachable_grafana_is_an_error_not_a_crash(config, web, monkeypatch
         lambda *args, **kwargs: (_ for _ in ()).throw(
             mcp.requests.exceptions.ConnectionError("Failed to resolve 'osac-ci.redhat.com'")))
     with pytest.raises(mcp.AuthError, match="could not be reached"):
-        mcp.grafana_user_exists(config, "dev")
+        mcp.grafana_admission(config, "dev")
 
 
 def test_the_grafana_gate_reads_the_org_user_list(config, web):
-    web.add("https://grafana/api/org/users",
-            [{"login": "dev", "role": "Admin"}, {"login": "other", "role": "Viewer"}])
-    assert mcp.grafana_user_exists(config, "dev") is True
-    assert mcp.grafana_user_exists(config, "stranger") is False
+    web.add("https://grafana/api/org/users", [grafana_user("dev", role="Admin"), grafana_user("other")])
+    assert mcp.grafana_admission(config, "dev") == ""
+    assert "no Grafana user" in mcp.grafana_admission(config, "stranger")
+
+
+def test_a_disabled_grafana_user_is_refused(config, web):
+    # Disabling the user is how access is taken away; the gate must follow it.
+    web.add("https://grafana/api/org/users", [grafana_user("left-the-team", disabled=True)])
+    assert "is disabled" in mcp.grafana_admission(config, "left-the-team")
+
+
+def test_a_local_grafana_user_does_not_stand_for_a_github_login(config, web):
+    # A local account that shares a GitHub account's name is not that account.
+    web.add("https://grafana/api/org/users", [grafana_user("ops", labels=[])])
+    assert "does not sign in with GitHub" in mcp.grafana_admission(config, "ops")
+
+
+def test_a_grafana_that_hides_the_user_state_is_an_error(config, web):
+    web.add("https://grafana/api/org/users", [{"login": "dev", "authLabels": ["GitHub"]}])
+    with pytest.raises(mcp.AuthError, match="isDisabled"):
+        mcp.grafana_admission(config, "dev")
+    web.add("https://grafana/api/org/users", [{"login": "dev", "isDisabled": False}])
+    with pytest.raises(mcp.AuthError, match="authLabels"):
+        mcp.grafana_admission(config, "dev")
 
 
 def test_a_refused_grafana_token_names_the_fix(config, web):
     web.add("https://grafana/api/org/users", {"message": "no"}, status=403)
     with pytest.raises(mcp.AuthError, match="Admin basic role"):
-        mcp.grafana_user_exists(config, "dev")
+        mcp.grafana_admission(config, "dev")
 
 
 def test_a_grafana_that_does_not_answer_is_an_error(config, web):
     web.add("https://grafana/api/org/users", {"message": "broken"}, status=502)
     with pytest.raises(mcp.AuthError, match="HTTP 502"):
-        mcp.grafana_user_exists(config, "dev")
+        mcp.grafana_admission(config, "dev")
 
 
 def test_a_login_without_a_grafana_user_is_refused(server, monkeypatch):
     monkeypatch.setattr(mcp, "github_login", lambda config, code: "stranger")
-    monkeypatch.setattr(mcp, "grafana_user_exists",
+    monkeypatch.setattr(mcp, "grafana_admission",
                         lambda config, login: (_ for _ in ()).throw(AssertionError("looked up")))
     answer, payload = request(server, "GET", "/oauth/callback?code=gh&state=broken")
     assert answer.status == 400  # the broken state, before any lookup
@@ -558,7 +708,8 @@ def test_a_login_without_a_grafana_user_is_refused(server, monkeypatch):
 
 def test_a_github_login_without_a_grafana_user_is_refused(server, monkeypatch):
     monkeypatch.setattr(mcp, "github_login", lambda config, code: "stranger")
-    monkeypatch.setattr(mcp, "grafana_user_exists", lambda config, login: False)
+    monkeypatch.setattr(mcp, "grafana_admission",
+                        lambda config, login: f"the GitHub login {login} has no Grafana user on grafana")
     _, payload = request(server, "POST", "/register",
                          body=json.dumps({"redirect_uris": ["http://localhost:1/cb"]}),
                          headers={"Content-Type": "application/json"})
@@ -568,3 +719,204 @@ def test_a_github_login_without_a_grafana_user_is_refused(server, monkeypatch):
                               f"/oauth/callback?code=gh&state={urllib.parse.quote(nonce)}")
     assert answer.status == 403
     assert "no Grafana user" in json.loads(payload)["error"]
+
+
+# -- the redirect, the client and the limits -------------------------------------------
+
+
+def register(server, *uris):
+    answer, payload = request(server, "POST", "/register", body=json.dumps({"redirect_uris": list(uris)}),
+                              headers={"Content-Type": "application/json"})
+    return answer, json.loads(payload)
+
+
+def authorize(server, client_id, redirect_uri, verifier="the-verifier-the-client-made-up", headers=None):
+    query = urllib.parse.urlencode({
+        "response_type": "code", "client_id": client_id, "redirect_uri": redirect_uri,
+        "code_challenge": mcp._sha256_b64(verifier), "code_challenge_method": "S256", "state": "st"})
+    return request(server, "GET", f"/authorize?{query}", headers=headers)
+
+
+@pytest.mark.parametrize("uri", [
+    "http://evil.example\\@localhost/cb",      # Python reads host localhost, a browser evil.example
+    "http://evil.example%5C@localhost/cb",
+    "http://evil.example%5c@127.0.0.1:8080/cb",
+    "http://user@localhost/cb",
+    "http://localhost#@evil.example/",
+    "https://localhost/cb",
+    "http://localhost.evil.example/cb",
+    "http://localhost:99999/cb",
+    "http://local host/cb",
+])
+def test_a_redirect_that_is_not_plain_loopback_is_refused(uri):
+    assert mcp.loopback_redirect(uri) is None
+
+
+def test_the_backslash_redirect_can_be_neither_registered_nor_asked_for(server, config):
+    """The login theft the review reproduced: a signed-in user's code sent to
+    http://evil.example\\@localhost/cb, which a browser opens on evil.example."""
+    answer, document = register(server, "http://evil.example\\@localhost/cb")
+    assert answer.status == 400
+    answer, document = register(server, "http://127.0.0.1/cb")
+    answer, payload = authorize(server, document["client_id"], "http://evil.example\\@localhost/cb")
+    assert answer.status == 400
+    assert json.loads(payload)["error"] == "invalid_redirect_uri"
+
+
+def test_authorize_admits_only_a_registered_redirect_on_any_port(server):
+    _, document = register(server, "http://127.0.0.1:41111/callback")
+    client_id = document["client_id"]
+    assert authorize(server, client_id, "http://127.0.0.1:41111/callback")[0].status == 302
+    # RFC 8252 7.3: a loopback client binds an ephemeral port at login time.
+    assert authorize(server, client_id, "http://127.0.0.1:50999/callback")[0].status == 302
+    assert authorize(server, client_id, "http://127.0.0.1:41111/elsewhere")[0].status == 400
+    assert authorize(server, client_id, "http://localhost:41111/callback")[0].status == 400
+
+
+def test_a_client_id_this_server_did_not_sign_is_unknown(server, config):
+    _, document = register(server, "http://localhost/cb")
+    prefix, payload, signature = document["client_id"].split(".")
+    forged = f"{prefix}.{mcp._b64(json.dumps(['http://evil.example/cb']).encode())}.{signature}"
+    for client_id in (forged, "plain-random-id", ""):
+        answer, payload = authorize(server, client_id, "http://localhost/cb")
+        assert answer.status == 400 and json.loads(payload)["error"] == "invalid_client"
+
+
+def test_a_registration_survives_a_restart(server, config):
+    # The client id carries its registration: a new process admits it.
+    _, document = register(server, "http://localhost:41111/callback")
+    mcp.McpHandler.state = mcp.McpState(config)
+    assert authorize(server, document["client_id"], "http://localhost:41111/callback")[0].status == 302
+
+
+def test_login_does_not_skip_github_on_a_cookie(server, config, monkeypatch):
+    # The old session cookie minted codes without GitHub or Grafana; it is gone.
+    _, document = register(server, "http://localhost:41111/callback")
+    cookie = f"ci_observe_mcp_session={mcp.mint_token(config.session_secret, 'victim', time.time())}"
+    answer, _ = authorize(server, document["client_id"], "http://localhost:41111/callback", headers={"Cookie": cookie})
+    assert answer.getheader("Location").startswith("https://github.com/login/oauth/authorize")
+
+
+def full_login(server, monkeypatch, redirect="http://localhost:41111/callback", verifier="v" * 43):
+    monkeypatch.setattr(mcp, "github_login", lambda config, code: "dev")
+    monkeypatch.setattr(mcp, "grafana_admission", lambda config, login: "")
+    _, document = register(server, redirect)
+    answer, _ = authorize(server, document["client_id"], redirect, verifier=verifier)
+    nonce = urllib.parse.parse_qs(urllib.parse.urlparse(answer.getheader("Location")).query)["state"][0]
+    answer, _ = request(server, "GET", f"/oauth/callback?code=gh&state={urllib.parse.quote(nonce)}")
+    code = urllib.parse.parse_qs(urllib.parse.urlparse(answer.getheader("Location")).query)["code"][0]
+    return document["client_id"], code
+
+
+def exchange(server, **form):
+    answer, payload = request(server, "POST", "/token", body=urllib.parse.urlencode(form),
+                              headers={"Content-Type": "application/x-www-form-urlencoded"})
+    return answer, json.loads(payload)
+
+
+def test_the_code_is_exchanged_only_by_its_client_and_redirect(server, monkeypatch):
+    verifier = "v" * 43
+    client_id, code = full_login(server, monkeypatch, verifier=verifier)
+    answer, document = exchange(server, grant_type="authorization_code", code=code, code_verifier=verifier,
+                                client_id="someone-else")
+    assert answer.status == 400 and document["error"] == "invalid_grant"
+    client_id, code = full_login(server, monkeypatch, verifier=verifier)
+    answer, document = exchange(server, grant_type="authorization_code", code=code, code_verifier=verifier,
+                                redirect_uri="http://localhost:41111/other")
+    assert answer.status == 400
+    client_id, code = full_login(server, monkeypatch, verifier=verifier)
+    answer, document = exchange(server, grant_type="authorization_code", code=code, code_verifier=verifier,
+                                client_id=client_id, redirect_uri="http://localhost:41111/callback")
+    assert answer.status == 200 and document["access_token"]
+
+
+def raw(server, data, wait=3.0):
+    """Send bytes on a fresh connection; return what came back before it
+    closed or `wait` passed."""
+    sock = socket.create_connection(("127.0.0.1", server.server_address[1]), timeout=wait)
+    sock.sendall(data)
+    received = b""
+    try:
+        while True:
+            chunk = sock.recv(65536)
+            if not chunk:
+                break
+            received += chunk
+    except TimeoutError:
+        pass
+    finally:
+        sock.close()
+    return received
+
+
+def test_an_oversized_body_is_refused_unread(server):
+    # The review's case: 4 GB declared without a token held a thread waiting for it.
+    started = time.monotonic()
+    answer = raw(server, b"POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Length: 4000000000\r\n\r\n{")
+    assert answer.startswith(b"HTTP/1.1 413")
+    assert b"Connection: close" in answer
+    assert time.monotonic() - started < 2
+
+
+@pytest.mark.parametrize(("headers", "status"), [
+    (b"Content-Length: lots\r\n", b"400"),
+    (b"Transfer-Encoding: chunked\r\n", b"411"),
+])
+def test_a_body_of_unknown_length_is_refused(server, headers, status):
+    answer = raw(server, b"POST /register HTTP/1.1\r\nHost: x\r\n" + headers + b"\r\n")
+    assert answer.startswith(b"HTTP/1.1 " + status)
+
+
+def test_a_silent_connection_is_dropped(server, monkeypatch):
+    monkeypatch.setattr(mcp.McpHandler, "timeout", 1)
+    started = time.monotonic()
+    answer = raw(server, b"POST /mcp HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n{", wait=5)
+    assert time.monotonic() - started < 4  # closed by the server, not by the client's patience
+    assert not answer.startswith(b"HTTP/1.1 200")
+
+
+def test_connections_past_the_limit_are_closed_at_once(config):
+    mcp.McpHandler.state = mcp.McpState(config)
+    httpd = mcp.McpServer(("127.0.0.1", 0), mcp.McpHandler, limit=1)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        holder = socket.create_connection(("127.0.0.1", httpd.server_address[1]), timeout=3)
+        holder.sendall(b"POST /mcp HTTP/1.1\r\nHost: x\r\n")  # occupies the one slot
+        time.sleep(0.3)
+        second = socket.create_connection(("127.0.0.1", httpd.server_address[1]), timeout=3)
+        second.sendall(b"GET /healthz HTTP/1.1\r\nHost: x\r\n\r\n")
+        assert second.recv(100) == b""  # closed without an answer
+        second.close()
+        holder.close()
+    finally:
+        httpd.shutdown()
+
+
+def test_registrations_keep_no_state(server):
+    for _ in range(50):
+        register(server, "http://localhost/cb")
+    assert not hasattr(mcp.McpHandler.state, "clients")
+
+
+def test_logins_in_flight_are_bounded(server, monkeypatch):
+    monkeypatch.setattr(mcp, "MAX_LOGINS_IN_FLIGHT", 2)
+    monkeypatch.setattr(mcp, "AUTHORIZES", {})
+    _, document = register(server, "http://localhost/cb")
+    statuses = [authorize(server, document["client_id"], "http://localhost/cb")[0].status for _ in range(3)]
+    assert statuses == [302, 302, 503]
+
+
+def test_codes_in_flight_are_bounded(monkeypatch):
+    monkeypatch.setattr(mcp, "MAX_CODES_IN_FLIGHT", 1)
+    monkeypatch.setattr(mcp, "CODES", {})
+    assert mcp.mint_code("dev", "c", "http://localhost/cb", "client", 1000.0)
+    assert mcp.mint_code("dev", "c", "http://localhost/cb", "client", 1000.0) is None
+    # An expired code makes room.
+    assert mcp.mint_code("dev", "c", "http://localhost/cb", "client", 1000.0 + mcp.CODE_SECONDS + 1)
+
+
+def test_the_callback_log_line_leaves_out_the_login_code(caplog, server, monkeypatch):
+    with caplog.at_level("INFO", logger="ci_observe_mcp"):
+        request(server, "GET", "/oauth/callback?code=secret-github-code&state=nonce")
+    assert "secret-github-code" not in caplog.text

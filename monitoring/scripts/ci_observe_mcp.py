@@ -12,16 +12,32 @@ with the cause, never as an empty success.
 The server reads only the exporter API. No database file, no free-form
 query, no second poller.
 
-Authentication (anyone on the VPN with a Grafana user):
+Authentication (anyone on the VPN with an enabled, GitHub-signed-in Grafana
+user):
 1. The MCP client starts the OAuth flow (POST /mcp without a token gets
    401 with the resource metadata URL, as the MCP spec requires).
-2. /register accepts a public client (loopback redirect URIs only),
-   /authorize sends the browser to GitHub, /oauth/callback exchanges the
-   code and checks the GitHub login exists in Grafana through a
-   service-account token, /token returns the bearer token (PKCE required).
+2. /register accepts a public client with plain loopback redirect URIs
+   (http://localhost or http://127.0.0.1, no user part, no backslash) and
+   answers a client id that carries those URIs, signed with
+   MCP_SESSION_SECRET: nothing is kept in memory, so a restart forgets no
+   client. /authorize admits only a redirect URI the client registered
+   (any port, as RFC 8252 asks for loopback) and sends the browser to
+   GitHub every time -- GitHub's own session makes that one hop for a
+   signed-in user. /oauth/callback exchanges the code and admits the
+   GitHub login only when Grafana has an enabled user who signs in with
+   GitHub under that login. /token returns the bearer token (PKCE S256
+   required; the client id and redirect URI, when sent, must be the
+   authorization's).
 3. The token is an HMAC over login and expiry signed with
    MCP_SESSION_SECRET; it lives 12 hours and holds no scope: every tool
-   may read everything the pages read.
+   may read everything the pages read. There is no browser session: a
+   cookie on this host would be a bearer token every port of the host
+   receives.
+
+Limits: a request body is at most 1 MiB, a connection is dropped after 30
+seconds of silence, at most 64 connections are served at once, and the
+logins and codes in flight are bounded; past a bound the answer is an
+error, never a silent drop.
 
 Fail-fast configuration: every required variable is checked at startup and
 a missing one stops the server with the full list, before it binds.
@@ -51,21 +67,23 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import hashlib
 import hmac
 import json
 import logging
+import math
 import os
 import re
 import secrets
 import sys
+import threading
 import time
 import urllib.parse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from http.cookies import SimpleCookie
 from typing import Callable
 
 import requests
@@ -83,7 +101,18 @@ SERVER_INFO = {"name": "ci-observe", "version": "1.0.0"}
 TOKEN_SECONDS = 12 * 3600
 CODE_SECONDS = 120
 MAX_ROWS = 20
-SESSION_COOKIE = "ci_observe_mcp_session"
+
+# What one unauthenticated caller may hold. A body is read before the 401
+# (an unread body on a keep-alive connection becomes the next request's
+# request line), so it is bounded first; a silent connection is dropped;
+# the connections served at once and the logins and codes in flight are
+# capped. Past a bound the answer says so.
+MAX_BODY_BYTES = 1 << 20
+SOCKET_TIMEOUT_SECONDS = 30
+MAX_CONNECTIONS = 64
+MAX_LOGINS_IN_FLIGHT = 500
+MAX_CODES_IN_FLIGHT = 500
+MAX_REDIRECT_URIS = 10
 
 SUITES = ("vmaas", "caas", "bmaas")
 TRIGGERS = ("pr", "merge_queue", "scheduled", "manual")
@@ -183,6 +212,77 @@ def read_token(secret: str, token: str, now: float) -> str | None:
     return login
 
 
+# -- the registered clients: signed, so nothing is kept -----------------------------
+
+CLIENT_ID_PREFIX = "c1"
+
+
+def loopback_redirect(uri: object) -> urllib.parse.SplitResult | None:
+    """The parsed URI when it is a plain loopback http redirect, else None.
+
+    Plain means what a browser and Python read alike: http to localhost or
+    127.0.0.1, an optional port, no user part, no fragment, no whitespace
+    and no backslash in any spelling. Python's parser reads
+    http://evil.example\\@localhost/cb as host localhost; a browser goes to
+    evil.example with the code."""
+    if not isinstance(uri, str) or not uri or len(uri) > 2000:
+        return None
+    if any(char in uri for char in "\\ \t\r\n") or "%5c" in uri.lower():
+        return None
+    try:
+        parsed = urllib.parse.urlsplit(uri)
+        port = parsed.port
+    except ValueError:
+        return None
+    if parsed.scheme != "http" or parsed.hostname not in ("localhost", "127.0.0.1"):
+        return None
+    if parsed.username is not None or parsed.password is not None or parsed.fragment:
+        return None
+    if parsed.netloc.lower() != parsed.hostname + (f":{port}" if port is not None else ""):
+        return None
+    return parsed
+
+
+def same_redirect(registered: str, requested: str) -> bool:
+    """Whether a requested redirect is one the client registered. A loopback
+    redirect may name any port (RFC 8252 7.3: the client binds an ephemeral
+    one at login time); everything else must be the same."""
+    mine, theirs = loopback_redirect(registered), loopback_redirect(requested)
+    if mine is None or theirs is None:
+        return False
+    return (mine.scheme, mine.hostname, mine.path or "/", mine.query) == \
+        (theirs.scheme, theirs.hostname, theirs.path or "/", theirs.query)
+
+
+def _b64(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def mint_client_id(secret: str, redirect_uris: list[str]) -> str:
+    """A client id that carries the client's redirect URIs, signed: the
+    registration survives restarts and costs no memory."""
+    payload = _b64(json.dumps(redirect_uris, separators=(",", ":")).encode())
+    return f"{CLIENT_ID_PREFIX}.{payload}.{_sign(secret, 'client.' + payload)}"
+
+
+def read_client_id(secret: str, client_id: str) -> list[str] | None:
+    """The redirect URIs a client id was registered with, or None when it
+    is not one this server signed."""
+    parts = (client_id or "").split(".")
+    if len(parts) != 3 or parts[0] != CLIENT_ID_PREFIX:
+        return None
+    _, payload, signature = parts
+    if not hmac.compare_digest(signature, _sign(secret, "client." + payload)):
+        return None
+    try:
+        uris = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+    except (ValueError, binascii.Error):
+        return None
+    if not isinstance(uris, list) or not all(isinstance(uri, str) for uri in uris):
+        return None
+    return uris
+
+
 # -- GitHub and Grafana ------------------------------------------------------------
 
 
@@ -224,13 +324,39 @@ def github_login(config: Config, code: str) -> str:
     return login
 
 
-def grafana_user_exists(config: Config, login: str) -> bool:
-    """Whether Grafana knows this login: the one gate to the data. Reads
-    the org's user list (GET /api/org/users), which a service account with
-    the Admin basic role may; the global user search needs a permission to
-    grant, and /api/users/lookup is gone in Grafana 13 (404 for the server
-    admin too), so neither is used. A Grafana that cannot be reached is an
-    error naming the address, never a crash."""
+def grafana_admission(config: Config, login: str) -> str:
+    """Why Grafana does not admit this GitHub login, or "" when it does: the
+    one gate to the data. Admitted is an org user with this login that is
+    not disabled and signs in with GitHub -- a disabled user is someone
+    whose access was taken away, and a local user who happens to share a
+    GitHub account's name is not that account. Reads the org's user list
+    (GET /api/org/users), which a service account with the Admin basic role
+    may; the global user search needs a permission to grant, and
+    /api/users/lookup is gone in Grafana 13 (404 for the server admin too),
+    so neither is used. A Grafana that cannot be reached is an error naming
+    the address, never a crash."""
+    users = _grafana_org_users(config)
+    matches = [user for user in users if isinstance(user, dict) and user.get("login") == login]
+    if not matches:
+        return f"the GitHub login {login} has no Grafana user on {config.grafana_url}; ask for one and log in again"
+    user = matches[0]
+    if user.get("isDisabled") is not False:
+        if user.get("isDisabled") is True:
+            return f"the Grafana user {login} on {config.grafana_url} is disabled"
+        raise AuthError("Grafana's org user list does not say whether users are disabled (no isDisabled);"
+                        " check MCP_GRAFANA_URL points at Grafana 10 or newer")
+    labels = user.get("authLabels")
+    if not isinstance(labels, list):
+        raise AuthError("Grafana's org user list does not say how users sign in (no authLabels);"
+                        " check MCP_GRAFANA_URL points at Grafana 10 or newer")
+    if not any(isinstance(label, str) and label.lower() == "github" for label in labels):
+        return (f"the Grafana user {login} on {config.grafana_url} does not sign in with GitHub"
+                f" ({', '.join(map(str, labels)) or 'a local password'}), so a GitHub login cannot stand for it")
+    return ""
+
+
+def _grafana_org_users(config: Config) -> list:
+    """GET /api/org/users through the service account."""
     try:
         answer = requests.get(
             f"{config.grafana_api_url}/api/org/users",
@@ -246,11 +372,14 @@ def grafana_user_exists(config: Config, login: str) -> bool:
             "https://127.0.0.1:3000."
         ) from error
     if answer.status_code == 200:
-        users = answer.json()
+        try:
+            users = answer.json()
+        except ValueError:
+            users = None
         if not isinstance(users, list):
             raise AuthError("Grafana answered its org user list with something other than a list;"
                             " check MCP_GRAFANA_URL")
-        return any(isinstance(user, dict) and user.get("login") == login for user in users)
+        return users
     if answer.status_code in (401, 403):
         raise AuthError(
             f"Grafana refused the service account for the org user list: HTTP {answer.status_code}. "
@@ -294,11 +423,14 @@ class Answer:
     window: dict | None
     not_answerable: str
     notes: list[str]
+    # How many rows the source held; rows is at most MAX_ROWS of them.
+    rows_total: int = field(default=-1)
 
     def document(self) -> dict:
         return {
             "question": self.question,
             "rows": self.rows,
+            "rows_total": len(self.rows) if self.rows_total < 0 else self.rows_total,
             "api_url": self.api_url,
             "grafana_url": self.grafana_url,
             "about": self.about,
@@ -338,14 +470,49 @@ def _need_int(arguments: dict, name: str, low: int, high: int) -> int:
     return value
 
 
-def _need_end(arguments: dict) -> str:
-    """The optional window end, a UTC date or second-precision time."""
+END_FORMATS = ("%Y-%m-%d", "%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_end(value: str) -> datetime | None:
+    """A UTC date or second-precision UTC time: the two spellings the
+    exporter API reads. Anything else would be answered there for a window
+    ending now, which is not the question that was asked."""
+    for pattern in END_FORMATS:
+        try:
+            return datetime.strptime(value, pattern).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def _need_end(arguments: dict, days: int, keep_days: int, store: str, now: datetime | None = None) -> str:
+    """The optional window end as the API spells it ("" for now), refused
+    unless it is a past moment whose window [end - days, end] lies inside
+    the store's retention: a window the store no longer holds would be
+    answered from the part it still holds, or as nothing."""
     value = arguments.get("end", "")
     if value in ("", None):
         return ""
-    if not isinstance(value, str):
-        raise ToolError("end must be a UTC date (2026-11-01) or time (2026-11-01T12:00:00Z)")
-    return value
+    moment = _parse_end(value.strip()) if isinstance(value, str) else None
+    if moment is None:
+        raise ToolError("end must be a UTC date (2026-11-01) or time (2026-11-01T12:00:00Z);"
+                        f" got {value!r}")
+    now = now or datetime.now(timezone.utc)
+    if moment > now:
+        raise ToolError(f"end {value!r} is in the future; leave it out for a window ending now")
+    start = moment - timedelta(days=days)
+    if now - start > timedelta(days=keep_days):
+        raise ToolError(f"the window {start:%Y-%m-%d %H:%M} to {moment:%Y-%m-%d %H:%M} UTC starts before the"
+                        f" {keep_days} days {store} keeps; move end forward or shorten days")
+    return moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _capped(rows: list, what: str, order: str) -> tuple[list, list[str]]:
+    """At most MAX_ROWS rows, and a note when there were more: a cut list
+    must not read as the whole answer."""
+    if len(rows) <= MAX_ROWS:
+        return rows, []
+    return rows[:MAX_ROWS], [f"showing {MAX_ROWS} of {len(rows)} {what} ({order}); narrow the question for the rest"]
 
 
 def _insight_query(pop: dict) -> str:
@@ -380,19 +547,22 @@ def _insight_tool(name: str, description: str, kind: str,
             "trigger": _need_str(arguments, "trigger", TRIGGERS),
             "repo": _need_str(arguments, "repo", REPOS),
             "days": _need_int(arguments, "days", 1, INSIGHT_MAX_DAYS),
-            "end": _need_end(arguments),
         }
+        pop["end"] = _need_end(arguments, pop["days"], INSIGHT_MAX_DAYS, "the suite-run archive")
         status, document = _fetch_document(config, kind, pop)
         not_answerable = _refusals(status, document, kind)
         rows: list[dict] = []
+        total = 0
         about = None
         window = None
         notes: list[str] = []
         if not not_answerable:
-            rows = [row for row in row_source(document) if isinstance(row, dict)][:MAX_ROWS]
+            every = [row for row in row_source(document) if isinstance(row, dict)]
+            total = len(every)
+            rows, cut = _capped(every, f"{name} rows", "in the document's order")
             about = (document.get("about") or [None])[0]
             window = (document.get("window") or [None])[0]
-            notes = list(document.get("notes") or [])
+            notes = list(document.get("notes") or []) + cut
             if not rows:
                 not_answerable = f"the {kind} document holds no {name} rows in this window"
         return Answer(
@@ -404,6 +574,7 @@ def _insight_tool(name: str, description: str, kind: str,
             window=window,
             not_answerable=not_answerable,
             notes=notes,
+            rows_total=total,
         )
 
     return Tool(
@@ -422,7 +593,8 @@ def _insight_tool(name: str, description: str, kind: str,
                          "description": "The window length in days (the archive keeps 90)."},
                 "end": {"type": "string",
                         "description": "Optional window end, a UTC date (2026-11-01) or time"
-                                       " (2026-11-01T12:00:00Z). Without it the window ends now."},
+                                       " (2026-11-01T12:00:00Z). Without it the window ends now. The"
+                                       " window must lie inside the archive's 90 days."},
             },
             "required": ["suite", "trigger", "repo", "days"],
         },
@@ -509,10 +681,12 @@ TOOLS: list[Tool] = [
     _insight_tool(
         "failure_signatures",
         "Why runs fail, from the failed runs' own logs: error signatures (the message with ids and"
-        " numbers replaced), how many failed and passing runs show each, first and last seen, and"
-        " example runs. Ranked by how much more failed runs show a signature than passing ones:"
-        " the comparison that separates a cause from noise every cluster logs. Each row's"
-        " logs_query is a Loki selector for the raw lines.",
+        " numbers replaced), how many failed and passing runs show each and what share of the"
+        " window's indexed failed and passing runs that is, first and last seen, and example runs."
+        " Ranked by the failed share minus the passing share (score): the comparison that"
+        " separates a cause from noise every cluster logs, which counts alone cannot when most"
+        " runs fail. Each row's logs_query is a LogQL query for the example runs' raw lines over"
+        " logs_from to logs_to; the notes say how many of the window's runs were indexed.",
         "failures",
         _rows_of("signatures"),
         "ci-observe-failures", "ci-observe-e28094-why-runs-fail",
@@ -547,8 +721,8 @@ def _test_history(config: Config, arguments: dict) -> Answer:
         "trigger": _need_str(arguments, "trigger", TRIGGERS),
         "repo": _need_str(arguments, "repo", REPOS),
         "days": _need_int(arguments, "days", 1, INSIGHT_MAX_DAYS),
-        "end": _need_end(arguments),
     }
+    pop["end"] = _need_end(arguments, pop["days"], INSIGHT_MAX_DAYS, "the suite-run archive")
     params = {"days": str(pop["days"]), "suite": pop["suite"], "trigger": pop["trigger"],
               "repo": pop["repo"], "test": test.strip()}
     if pop["end"]:
@@ -556,23 +730,30 @@ def _test_history(config: Config, arguments: dict) -> Answer:
     status, document = _fetch_document(config, "test", pop, extra={"test": test.strip()})
     not_answerable = _refusals(status, document, "test")
     rows = []
+    notes = []
+    total = 0
     if not not_answerable:
         summary = document.get("summary")
-        runs = document.get("runs")
-        rows = ([summary] if isinstance(summary, dict) else []) \
-            + [run for run in (runs if isinstance(runs, list) else []) if isinstance(run, dict)][:MAX_ROWS]
+        runs = [run for run in (document.get("runs") if isinstance(document.get("runs"), list) else [])
+                if isinstance(run, dict)]
+        total = len(runs) + (1 if isinstance(summary, dict) else 0)
+        # The summary row first, then the runs: the cut keeps the summary.
+        shown, notes = _capped(([summary] if isinstance(summary, dict) else []) + runs, "rows (the summary and"
+                               " the test's runs)", "the summary, then the runs newest first")
+        rows = shown
         if not rows:
             not_answerable = f"no test matches {test!r} in this window"
     return Answer(
         question=f"History of one test over the last {pop['days']} days",
-        rows=rows[:MAX_ROWS],
+        rows=rows,
         api_url=f"{config.exporter_url}/api/ci-observe/test?{urllib.parse.urlencode(params)}",
         grafana_url=(f"{config.grafana_url}/d/ci-observe-test/ci-observe-e28094-test-history"
                      f"?var-test={urllib.parse.quote(test.strip())}&{_grafana_vars(pop)}"),
         about=(document.get("about") or [None])[0] if isinstance(document, dict) else None,
         window=(document.get("window") or [None])[0] if isinstance(document, dict) else None,
         not_answerable=not_answerable,
-        notes=list(document.get("notes") or []) if isinstance(document, dict) else [],
+        notes=(list(document.get("notes") or []) if isinstance(document, dict) else []) + notes,
+        rows_total=total,
     )
 
 
@@ -587,16 +768,22 @@ def _run_failed_tests(config: Config, arguments: dict) -> Answer:
     rows = []
     not_answerable = ""
     notes = []
+    total = 0
     if status == 200 and isinstance(body, dict):
-        rows = [row for row in body.get("failed_tests") or [] if isinstance(row, dict)][:MAX_ROWS]
+        failed = [row for row in body.get("failed_tests") or [] if isinstance(row, dict)]
         # A run that failed before its tests answers with its indexed
         # error lines: "what failed in this run" has an answer even when
         # no test ever ran.
         lines = [row for row in body.get("error_lines") or [] if isinstance(row, dict)]
-        if not rows and lines:
-            rows = lines[:MAX_ROWS]
         notes = list(body.get("notes") or [])
-        if not rows and not lines:
+        if failed:
+            total = len(failed)
+            rows, cut = _capped(failed, "failed tests", "in the junit.xml's order")
+        else:
+            total = len(lines)
+            rows, cut = _capped(lines, "indexed error lines", "newest first")
+        notes += cut
+        if not rows:
             notes.append(f"the junit.xml of {capture_id} lists no failed test")
     elif isinstance(body, dict) and body.get("error"):
         not_answerable = f"{capture_id}: {body['error']}"
@@ -613,6 +800,7 @@ def _run_failed_tests(config: Config, arguments: dict) -> Answer:
         window=None,
         not_answerable=not_answerable,
         notes=notes,
+        rows_total=total,
     )
 
 
@@ -621,22 +809,25 @@ def _list_runs(config: Config, arguments: dict) -> Answer:
     result = _need_str(arguments, "result", RESULTS)
     repo = _need_str(arguments, "repo", REPOS)
     days = _need_int(arguments, "days", 1, RUNS_MAX_DAYS)
+    end = _need_end(arguments, days, RUNS_MAX_DAYS, "the job history")
     params = {"days": str(days), "repo": repo, "suite": suite, "result": result, "limit": str(MAX_ROWS)}
     question = f"{result} runs of the {suite} suite in {repo}, last {days} days"
-    end = arguments.get("end")
-    if isinstance(end, str) and end.strip():
+    if end:
         # A window ending in the past: the runs of the week a regression
         # started, without paging past everything newer.
-        params["end"] = end.strip()
-        question = f"{result} runs of the {suite} suite in {repo}, the {days} days before {end.strip()}"
+        params["end"] = end
+        question = f"{result} runs of the {suite} suite in {repo}, the {days} days before {end}"
     status, body = fetch_json(config, f"/api/ci-observe/runs?{urllib.parse.urlencode(params)}")
     rows = []
     not_answerable = ""
     notes = []
+    total = 0
     if status == 200 and isinstance(body, dict):
         rows = [row for row in body.get("runs") or [] if isinstance(row, dict)][:MAX_ROWS]
-        if body.get("truncated"):
-            notes.append("the window holds more runs than shown; narrow the question")
+        total = body.get("total") if isinstance(body.get("total"), int) else len(rows)
+        if body.get("truncated") or total > len(rows):
+            notes.append(f"showing the {len(rows)} newest of {total} runs in this window;"
+                         " move end back or narrow the question for the rest")
         if not rows:
             not_answerable = "no runs match in this window"
     else:
@@ -651,7 +842,15 @@ def _list_runs(config: Config, arguments: dict) -> Answer:
         window=None,
         not_answerable=not_answerable,
         notes=notes,
+        rows_total=total,
     )
+
+
+def _dict_rows(value: object) -> list[dict]:
+    """A document field that holds one row or a list of rows, as rows."""
+    if isinstance(value, dict):
+        return [value]
+    return [row for row in value if isinstance(row, dict)] if isinstance(value, list) else []
 
 
 def _pull_request_stats(config: Config, arguments: dict) -> Answer:
@@ -661,49 +860,39 @@ def _pull_request_stats(config: Config, arguments: dict) -> Answer:
     status, body = fetch_json(config, f"/api/ci-observe/prs?{urllib.parse.urlencode(params)}")
     rows = []
     not_answerable = ""
+    notes = []
+    total = 0
     if status == 200 and isinstance(body, dict):
-        kpis = body.get("kpis")
-        funnel = body.get("funnel")
-        rows = ([kpis] if isinstance(kpis, dict) else []) \
-            + [row for row in (funnel if isinstance(funnel, list) else []) if isinstance(row, dict)]
+        # The document's kpis is its one row of headline numbers, a list of
+        # one; the funnel follows it.
+        every = _dict_rows(body.get("kpis")) + _dict_rows(body.get("funnel"))
+        total = len(every)
+        rows, notes = _capped(every, "rows (the headline numbers, then the funnel)", "in the document's order")
         if not rows:
             not_answerable = "the pull request store holds no rows in this window"
     else:
         not_answerable = f"the exporter answered HTTP {status} for the pull request document"
     return Answer(
         question=f"Pull request numbers of {repo}, last {days} days",
-        rows=rows[:MAX_ROWS],
+        rows=rows,
         api_url=f"{config.exporter_url}/api/ci-observe/prs?{urllib.parse.urlencode(params)}",
         grafana_url=(f"{config.grafana_url}/d/ci-observe-pull-requests/ci-observe-e28094-pull-requests"
                      f"?var-days={days}&var-pr_repo={repo}"),
         about=(body.get("about") or [None])[0] if isinstance(body, dict) else None,
         window=None,
         not_answerable=not_answerable,
-        notes=list(body.get("notes") or []) if isinstance(body, dict) else [],
+        notes=(list(body.get("notes") or []) if isinstance(body, dict) else []) + notes,
+        rows_total=total,
     )
 
 
-def _window_boundary(end_text, days):
-    """(end iso, fetch days) for a window ending at `end_text`: the days
-    to fetch must reach back to the window's start (end minus days), not
-    to now minus days, or the store never serves the window's rows."""
-    try:
-        end = datetime.strptime(end_text, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    except ValueError:
-        try:
-            end = datetime.fromisoformat(end_text.replace("Z", "+00:00"))
-        except ValueError:
-            return None
-    if end.tzinfo is None:
-        end = end.replace(tzinfo=timezone.utc)
-    now = datetime.now(timezone.utc)
-    if end > now:
-        return None
-    reach = (now - (end - timedelta(days=days))).days + 1
-    return end.strftime("%Y-%m-%dT%H:%M:%SZ"), max(1, min(reach, PRS_MAX_DAYS))
+def _pull_request_moment(row: dict) -> str:
+    """The time the pull request index orders and windows a row by: when it
+    merged, else when it closed, else when it opened."""
+    return row.get("merged_at") or row.get("closed_at") or row.get("opened_at") or ""
 
 
-def _pull_requests(config: Config, arguments: dict) -> Answer:
+def _pull_requests(config: Config, arguments: dict, now: datetime | None = None) -> Answer:
     """The window's pull requests as rows: number, title, author, when it
     merged, its queue attempts and ejections. This is the "what merged
     around the drop" tool -- the change list behind a pass-rate move."""
@@ -712,33 +901,36 @@ def _pull_requests(config: Config, arguments: dict) -> Answer:
     state = arguments.get("state")
     if not isinstance(state, str) or state not in ("all", "merged", "open", "closed"):
         raise ToolError("state is required: all, merged, open or closed")
-    params = {"days": str(days), "repo": repo}
-    question = f"{state} pull requests of {repo}, last {days} days"
+    now = now or datetime.now(timezone.utc)
+    end = _need_end(arguments, days, PRS_MAX_DAYS, "the pull request store", now)
+    window_to = _parse_end(end) if end else now
+    window_from = window_to - timedelta(days=days)
+    # The index windows by the same moment from now; a window ending in the
+    # past is fetched back to its start and cut to it here.
+    fetch_days = max(1, math.ceil((now - window_from).total_seconds() / 86400))
+    params = {"days": str(fetch_days), "repo": repo}
+    if end:
+        question = f"{state} pull requests of {repo}, the {days} days before {end}"
+    else:
+        question = f"{state} pull requests of {repo}, last {days} days"
     notes = []
-    end = arguments.get("end")
-    boundary = None
-    if isinstance(end, str) and end.strip():
-        boundary = _window_boundary(end.strip(), days)
-        if boundary is None:
-            raise ToolError(f"end={end!r} is neither a past date nor a past moment")
-        params["days"] = str(boundary[1])
-        question = f"{state} pull requests of {repo}, the {days} days before {end.strip()}"
     status, body = fetch_json(config, f"/api/ci-observe/prs?{urllib.parse.urlencode(params)}")
     rows = []
+    total = 0
     not_answerable = ""
     if status == 200 and isinstance(body, dict):
-        every = body.get("pull_requests") if isinstance(body.get("pull_requests"), list) else body.get("prs")
-        rows = [row for row in (every or []) if isinstance(row, dict)]
+        low, high = window_from.strftime("%Y-%m-%dT%H:%M:%SZ"), window_to.strftime("%Y-%m-%dT%H:%M:%SZ")
+        every = [row for row in _dict_rows(body.get("pull_requests") or body.get("prs"))
+                 if low <= _pull_request_moment(row) <= high]
         if state != "all":
-            rows = [row for row in rows if (row.get("state") or "") == state]
-        if boundary:
-            # Keep the window's rows (merged on or before the end) and say
-            # what was cut: the store serves newest-first, so a window
-            # ending in the past hides nothing once the fetch reached its
-            # start.
-            rows = [row for row in rows
-                    if (row.get("merged_at") or row.get("opened_at") or "") <= boundary[0]]
-            notes.append(f"the {days} days before {end.strip()}; older merges are not listed")
+            every = [row for row in every if (row.get("state") or "") == state]
+        every.sort(key=_pull_request_moment, reverse=True)
+        total = len(every)
+        rows = every[:MAX_ROWS]
+        if total > MAX_ROWS:
+            oldest = _pull_request_moment(rows[-1])
+            notes.append(f"showing the {MAX_ROWS} latest of {total} pull requests in the window;"
+                         f" ask again with end={oldest} for the earlier ones")
         if not rows:
             not_answerable = f"the pull request store holds no {state} pull requests of {repo} in this window"
     else:
@@ -746,17 +938,18 @@ def _pull_requests(config: Config, arguments: dict) -> Answer:
     keep = ("number", "repo", "title", "author", "state", "opened_at", "merged_at", "closed_at",
             "queue_attempt_count", "ejected_attempt_count", "requeued_attempt_count", "url", "detail_url")
     rows = [{key: row.get(key) for key in keep if row.get(key) is not None} for row in rows]
-    rows.sort(key=lambda row: row.get("merged_at") or row.get("opened_at") or "", reverse=True)
     return Answer(
         question=question,
-        rows=rows[:MAX_ROWS],
+        rows=rows,
         api_url=f"{config.exporter_url}/api/ci-observe/prs?{urllib.parse.urlencode(params)}",
         grafana_url=(f"{config.grafana_url}/d/ci-observe-pull-requests/ci-observe-e28094-pull-requests"
                      f"?var-days={days}&var-pr_repo={repo}"),
         about=(body.get("about") or [None])[0] if isinstance(body, dict) else None,
-        window=None,
+        window={"window_from": window_from.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                "window_to": window_to.strftime("%Y-%m-%dT%H:%M:%SZ")},
         not_answerable=not_answerable,
         notes=notes + (list(body.get("notes") or []) if isinstance(body, dict) else []),
+        rows_total=total,
     )
 
 
@@ -769,27 +962,28 @@ def _pull_request_detail(config: Config, arguments: dict) -> Answer:
     status, body = fetch_json(config, f"/api/ci-observe/prs?{urllib.parse.urlencode(params)}")
     rows = []
     not_answerable = ""
+    notes = []
+    total = 0
     if status == 200 and isinstance(body, dict):
-        pr = body.get("pr")
-        stages = body.get("stages")
-        attempts = body.get("attempts")
-        rows = ([pr] if isinstance(pr, dict) else []) \
-            + [row for row in (stages if isinstance(stages, list) else []) if isinstance(row, dict)] \
-            + [row for row in (attempts if isinstance(attempts, list) else []) if isinstance(row, dict)]
+        every = _dict_rows(body.get("pr")) + _dict_rows(body.get("stages")) + _dict_rows(body.get("attempts"))
+        total = len(every)
+        rows, notes = _capped(every, "rows (the pull request, its stages, then its queue attempts)",
+                              "in that order")
         if not rows:
             not_answerable = f"pull request {repo}#{number} is not in the store"
     else:
         not_answerable = f"the exporter answered HTTP {status} for the pull request document"
     return Answer(
         question=f"The stages and queue attempts of {repo}#{number}",
-        rows=rows[:MAX_ROWS],
+        rows=rows,
         api_url=f"{config.exporter_url}/api/ci-observe/prs?{urllib.parse.urlencode(params)}",
         grafana_url=(f"{config.grafana_url}/d/ci-observe-pull-requests/ci-observe-e28094-pull-requests"
                      f"?var-pr_number={number}&var-pr_repo={repo}"),
         about=None,
         window=None,
         not_answerable=not_answerable,
-        notes=list(body.get("notes") or []) if isinstance(body, dict) else [],
+        notes=(list(body.get("notes") or []) if isinstance(body, dict) else []) + notes,
+        rows_total=total,
     )
 
 
@@ -808,7 +1002,8 @@ TOOLS.extend([
                 "repo": {"type": "string", "enum": list(REPOS)},
                 "days": {"type": "integer", "minimum": 1, "maximum": INSIGHT_MAX_DAYS},
                 "end": {"type": "string",
-                        "description": "Optional window end, a UTC date or second-precision time."},
+                        "description": "Optional window end, a UTC date (2026-11-01) or time"
+                                       " (2026-11-01T12:00:00Z), inside the archive's 90 days."},
             },
             "required": ["test", "suite", "trigger", "repo", "days"],
         },
@@ -830,9 +1025,10 @@ TOOLS.extend([
     Tool(
         name="list_runs",
         description="The runs of one suite and result in a window, newest first (the job history"
-                    " keeps 30 days). end moves the window into the past (a date like 2026-11-07"
-                    " or an ISO moment), so the runs of the week something broke are one call"
-                    " instead of pages past everything newer.",
+                    " keeps 30 days). end moves the window into the past (a UTC date like"
+                    " 2026-11-07 or time like 2026-11-07T12:00:00Z), so the runs of the week"
+                    " something broke are one call instead of pages past everything newer; the"
+                    " window must lie inside the 30 days.",
         schema={
             "type": "object",
             "properties": {
@@ -840,7 +1036,8 @@ TOOLS.extend([
                 "result": {"type": "string", "enum": list(RESULTS)},
                 "repo": {"type": "string", "enum": list(REPOS)},
                 "days": {"type": "integer", "minimum": 1, "maximum": RUNS_MAX_DAYS},
-                "end": {"type": "string", "description": "window end: a date (2026-11-07) or ISO moment"},
+                "end": {"type": "string",
+                        "description": "window end: a UTC date (2026-11-07) or time (2026-11-07T12:00:00Z)"},
             },
             "required": ["suite", "result", "repo", "days"],
         },
@@ -862,18 +1059,20 @@ TOOLS.extend([
     ),
     Tool(
         name="pull_requests",
-        description="The pull requests of a window as rows: number, title, author, when it merged,"
-                    " queue attempts and ejections. The change list behind a pass-rate move: ask"
-                    " 'which PRs merged in this window' here, then pull_request_detail on the"
-                    " suspects. end moves the window into the past (a date like 2026-11-06), so"
-                    " the merges of the week a regression started are one call.",
+        description="The pull requests of a window as rows, latest first: number, title, author, when"
+                    " it merged, queue attempts and ejections. The change list behind a pass-rate"
+                    " move: ask 'which PRs merged in this window' here, then pull_request_detail on"
+                    " the suspects. end moves the window into the past (a UTC date like 2026-11-06"
+                    " or time like 2026-11-06T12:00:00Z), so the merges of the week a regression"
+                    " started are one call; more than 20 are paged by moving end back.",
         schema={
             "type": "object",
             "properties": {
                 "repo": {"type": "string", "enum": list(REPOS)},
                 "days": {"type": "integer", "minimum": 1, "maximum": PRS_MAX_DAYS},
                 "state": {"type": "string", "enum": ["all", "merged", "open", "closed"]},
-                "end": {"type": "string", "description": "window end: a date (2026-11-06) or ISO moment"},
+                "end": {"type": "string",
+                        "description": "window end: a UTC date (2026-11-06) or time (2026-11-06T12:00:00Z)"},
             },
             "required": ["repo", "days", "state"],
         },
@@ -929,8 +1128,9 @@ def handle_rpc(config: Config, payload: dict, now: float) -> tuple[HTTPStatus, d
             return HTTPStatus.ACCEPTED, None
         return HTTPStatus.OK, {"jsonrpc": "2.0", "id": message_id, "result": value}
 
+    params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
     if method == "initialize":
-        wanted = payload.get("params", {}).get("protocolVersion")
+        wanted = params.get("protocolVersion")
         version = wanted if wanted in PROTOCOL_VERSIONS else PROTOCOL_VERSIONS[0]
         return result({"protocolVersion": version, "capabilities": {"tools": {}},
                        "serverInfo": SERVER_INFO})
@@ -940,7 +1140,6 @@ def handle_rpc(config: Config, payload: dict, now: float) -> tuple[HTTPStatus, d
         return result({"tools": [{"name": tool.name, "description": tool.description,
                                   "inputSchema": tool.schema} for tool in TOOLS]})
     if method == "tools/call":
-        params = payload.get("params") or {}
         try:
             answer = call_tool(config, params.get("name"), params.get("arguments") or {})
         except ToolError as error:
@@ -961,6 +1160,17 @@ def handle_rpc(config: Config, payload: dict, now: float) -> tuple[HTTPStatus, d
                            "structuredContent": {"not_answerable": str(error), "rows": []},
                            "isError": True},
             }
+        except Exception as error:  # a defect here must be an answer, not a reset connection
+            logger.exception("the tool %r failed", params.get("name"))
+            if not is_request:
+                return HTTPStatus.ACCEPTED, None
+            return HTTPStatus.OK, {
+                "jsonrpc": "2.0", "id": message_id,
+                "result": {"content": [{"type": "text", "text": f"the server failed answering: {error!r}"}],
+                           "structuredContent": {"not_answerable": f"the server failed answering: {error!r}",
+                                                 "rows": []},
+                           "isError": True},
+            }
         return result({
             "content": [{"type": "text", "text": json.dumps(answer, indent=2)}],
             "structuredContent": answer,
@@ -970,16 +1180,39 @@ def handle_rpc(config: Config, payload: dict, now: float) -> tuple[HTTPStatus, d
     return HTTPStatus.ACCEPTED, None
 
 
-# -- the authorization codes (short-lived, in memory) -------------------------------
+# -- the logins and codes in flight (short-lived, in memory, bounded) ---------------
 
+# Both maps are shared by the server's threads, so every read and write
+# holds the lock; each is purged of expired entries when it grows, and a
+# full map refuses a new entry instead of growing without bound.
+_IN_FLIGHT_LOCK = threading.Lock()
 CODES: dict[str, dict] = {}
 
 
-def mint_code(login: str, challenge: str, redirect_uri: str, now: float) -> str:
-    code = secrets.token_urlsafe(24)
-    CODES[code] = {"login": login, "challenge": challenge, "redirect_uri": redirect_uri,
-                   "expires": now + CODE_SECONDS}
-    return code
+def _purge(entries: dict[str, dict], now: float) -> None:
+    for key in [key for key, entry in entries.items() if entry["expires"] < now]:
+        entries.pop(key, None)
+
+
+def mint_code(login: str, challenge: str, redirect_uri: str, client_id: str, now: float) -> str | None:
+    """A one-use authorization code, or None when MAX_CODES_IN_FLIGHT are
+    already waiting to be exchanged."""
+    with _IN_FLIGHT_LOCK:
+        _purge(CODES, now)
+        if len(CODES) >= MAX_CODES_IN_FLIGHT:
+            return None
+        code = secrets.token_urlsafe(24)
+        CODES[code] = {"login": login, "challenge": challenge, "redirect_uri": redirect_uri,
+                       "client_id": client_id, "expires": now + CODE_SECONDS}
+        return code
+
+
+def take_code(code: str, now: float) -> dict | None:
+    with _IN_FLIGHT_LOCK:
+        entry = CODES.pop(code, None)
+    if entry is None or entry["expires"] < now:
+        return None
+    return entry
 
 
 # The logins in flight: /authorize sends GitHub a short random state and
@@ -993,17 +1226,22 @@ AUTHORIZES: dict[str, dict] = {}
 AUTHORIZE_SECONDS = 15 * 60
 
 
-def mint_authorize(redirect_uri: str, challenge: str, state: str, now: float) -> str:
-    nonce = secrets.token_urlsafe(16)
-    AUTHORIZES[nonce] = {"redirect_uri": redirect_uri, "challenge": challenge,
-                         "state": state, "expires": now + AUTHORIZE_SECONDS}
-    for key in [key for key, entry in AUTHORIZES.items() if entry["expires"] < now]:
-        AUTHORIZES.pop(key, None)
-    return nonce
+def mint_authorize(redirect_uri: str, challenge: str, state: str, client_id: str, now: float) -> str | None:
+    """The nonce GitHub carries as the state, or None when
+    MAX_LOGINS_IN_FLIGHT logins are already waiting for GitHub."""
+    with _IN_FLIGHT_LOCK:
+        _purge(AUTHORIZES, now)
+        if len(AUTHORIZES) >= MAX_LOGINS_IN_FLIGHT:
+            return None
+        nonce = secrets.token_urlsafe(16)
+        AUTHORIZES[nonce] = {"redirect_uri": redirect_uri, "challenge": challenge, "state": state,
+                             "client_id": client_id, "expires": now + AUTHORIZE_SECONDS}
+        return nonce
 
 
 def take_authorize(nonce: str, now: float) -> dict | None:
-    entry = AUTHORIZES.pop(nonce, None)
+    with _IN_FLIGHT_LOCK:
+        entry = AUTHORIZES.pop(nonce, None)
     if entry is None or entry["expires"] < now:
         return None
     return entry
@@ -1013,20 +1251,31 @@ def take_authorize(nonce: str, now: float) -> dict | None:
 
 
 class McpState:
-    """What the handler needs beyond the config: the signed secrets and the
-    in-flight authorization codes."""
+    """What the handler needs beyond the config. Nothing about clients is
+    kept: a client id carries its registration (see mint_client_id)."""
 
     def __init__(self, config: Config):
         self.config = config
-        self.clients: set[str] = set()
+
+
+class BodyRefused(Exception):
+    """The request body was refused and answered; the connection closes."""
 
 
 class McpHandler(BaseHTTPRequestHandler):
     state: McpState
     protocol_version = "HTTP/1.1"
+    # A connection silent this long is dropped (StreamRequestHandler puts it
+    # on the socket), so a slow or stalled client cannot hold a thread.
+    timeout = SOCKET_TIMEOUT_SECONDS
 
     def log_message(self, fmt: str, *args) -> None:
-        logger.info("%s %s", self.address_string(), fmt % args)
+        # The request line of /oauth/callback carries GitHub's login code:
+        # log the path only.
+        message = fmt % args
+        if "/oauth/callback?" in message:
+            message = re.sub(r"/oauth/callback\?\S*", "/oauth/callback?…", message)
+        logger.info("%s %s", self.address_string(), message)
 
     # -- helpers ------------------------------------------------------------
 
@@ -1035,6 +1284,7 @@ class McpHandler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
         for name, value in (extra_headers or {}).items():
             self.send_header(name, value)
         self.end_headers()
@@ -1044,22 +1294,42 @@ class McpHandler(BaseHTTPRequestHandler):
                    extra_headers: dict[str, str] | None = None) -> None:
         self._send(status, json.dumps(document).encode(), "application/json", extra_headers)
 
-    def _redirect(self, location: str, cookies: list[str] | None = None) -> None:
+    def _redirect(self, location: str) -> None:
         self.send_response(HTTPStatus.FOUND)
         self.send_header("Location", location)
         self.send_header("Content-Length", "0")
-        for cookie in cookies or []:
-            self.send_header("Set-Cookie", cookie)
+        self.send_header("Cache-Control", "no-store")
         self.end_headers()
 
     def _external(self, path: str) -> str:
         return f"{self.state.config.external_url}{path}"
 
+    def _body(self) -> bytes:
+        """The request body, at most MAX_BODY_BYTES. A body of unknown or
+        excessive length is answered (411, 400 or 413) and the connection
+        closed, never read: it is how one unauthenticated caller would
+        fill the server's memory or hold a thread."""
+        if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+            self._refuse(HTTPStatus.LENGTH_REQUIRED, "send a Content-Length, not a chunked body")
+        raw = (self.headers.get("Content-Length") or "").strip()
+        if not raw:
+            return b""
+        if not raw.isdigit():
+            self._refuse(HTTPStatus.BAD_REQUEST, "Content-Length is not a number")
+        length = int(raw)
+        if length > MAX_BODY_BYTES:
+            self._refuse(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, f"a request body is at most {MAX_BODY_BYTES} bytes")
+        return self.rfile.read(length) if length else b""
+
+    def _refuse(self, status: HTTPStatus, reason: str) -> None:
+        self._send_json(status, {"error": reason}, {"Connection": "close"})
+        raise BodyRefused(reason)
+
     # -- OAuth: the discovery documents and the token endpoint -------------
 
     def _well_known(self) -> None:
         config = self.state.config
-        if self.path == "/.well-known/oauth-protected-resource":
+        if urllib.parse.urlparse(self.path).path == "/.well-known/oauth-protected-resource":
             self._send_json(HTTPStatus.OK, {
                 "resource": self._external("/mcp"),
                 "authorization_servers": [config.external_url],
@@ -1077,29 +1347,26 @@ class McpHandler(BaseHTTPRequestHandler):
         })
 
     def _register(self) -> None:
-        length = int(self.headers.get("Content-Length") or 0)
         try:
-            request = json.loads(self.rfile.read(length) or b"{}")
+            request = json.loads(self._body() or b"{}")
         except ValueError:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_client_metadata"})
             return
-        redirect_uris = request.get("redirect_uris") or []
+        redirect_uris = request.get("redirect_uris") if isinstance(request, dict) else None
         if not isinstance(redirect_uris, list) or not redirect_uris:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_redirect_uri",
                                                      "error_description": "redirect_uris is required"})
             return
-        for uri in redirect_uris:
-            parsed = urllib.parse.urlparse(uri)
-            if parsed.scheme != "http" or parsed.hostname not in ("localhost", "127.0.0.1"):
-                self._send_json(HTTPStatus.BAD_REQUEST, {
-                    "error": "invalid_redirect_uri",
-                    "error_description": "only loopback http redirect URIs are accepted",
-                })
-                return
-        client_id = secrets.token_urlsafe(16)
-        self.state.clients.add(client_id)
-        self._send_json(HTTPStatus.CREATED, {"client_id": client_id,
-                                             "redirect_uris": redirect_uris})
+        if len(redirect_uris) > MAX_REDIRECT_URIS or not all(loopback_redirect(uri) for uri in redirect_uris):
+            self._send_json(HTTPStatus.BAD_REQUEST, {
+                "error": "invalid_redirect_uri",
+                "error_description": "only plain loopback http redirect URIs are accepted (http://localhost or"
+                                     f" http://127.0.0.1, no user part or backslash), at most {MAX_REDIRECT_URIS}",
+            })
+            return
+        client_id = mint_client_id(self.state.config.session_secret, redirect_uris)
+        self._send_json(HTTPStatus.CREATED, {"client_id": client_id, "redirect_uris": redirect_uris,
+                                             "token_endpoint_auth_method": "none"})
 
     def _authorize(self, now: float) -> None:
         config = self.state.config
@@ -1113,33 +1380,33 @@ class McpHandler(BaseHTTPRequestHandler):
         if response_type != "code":
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "unsupported_response_type"})
             return
-        if client_id not in self.state.clients:
+        registered = read_client_id(config.session_secret, client_id)
+        if registered is None:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_client",
-                                                     "error_description": "unknown client_id;"
-                                                     " register first"})
+                                                     "error_description": "unknown client_id; register first"})
             return
-        parsed = urllib.parse.urlparse(redirect_uri)
-        if parsed.scheme != "http" or parsed.hostname not in ("localhost", "127.0.0.1"):
-            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_redirect_uri"})
+        # Never redirect to an address the client did not register: an
+        # authorization code sent elsewhere is a login handed to whoever
+        # receives it.
+        if not any(same_redirect(uri, redirect_uri) for uri in registered):
+            self._send_json(HTTPStatus.BAD_REQUEST, {
+                "error": "invalid_redirect_uri",
+                "error_description": "redirect_uri is not one this client registered"})
             return
         if not challenge or challenge_method != "S256":
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_request",
                                                      "error_description": "PKCE with S256 is required"})
             return
-        cookies = SimpleCookie()
-        cookies.load(self.headers.get("Cookie") or "")
-        morsel = cookies.get(SESSION_COOKIE)
-        login = read_token(config.session_secret, morsel.value, now) if morsel else None
-        if login:
-            code = mint_code(login, challenge, redirect_uri, now)
-            target = f"{redirect_uri}{'&' if '?' in redirect_uri else '?'}code={urllib.parse.quote(code)}"
-            if state:
-                target += f"&state={urllib.parse.quote(state)}"
-            self._redirect(target)
-            return
         # The client's parameters stay here (see AUTHORIZES); GitHub gets a
-        # short nonce as the state.
-        nonce = mint_authorize(redirect_uri, challenge, state, now)
+        # short nonce as the state. Every login goes through GitHub: its
+        # session makes that one hop, and no cookie of ours stands for it.
+        nonce = mint_authorize(redirect_uri, challenge, state, client_id, now)
+        if nonce is None:
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {
+                "error": "temporarily_unavailable",
+                "error_description": f"{MAX_LOGINS_IN_FLIGHT} logins are already waiting for GitHub;"
+                                     " try again in a few minutes"})
+            return
         github = ("https://github.com/login/oauth/authorize?"
                   + urllib.parse.urlencode({
                       "client_id": config.github_client_id,
@@ -1161,9 +1428,6 @@ class McpHandler(BaseHTTPRequestHandler):
         if entry is None:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "the login state was broken"})
             return
-        redirect_uri = entry["redirect_uri"]
-        challenge = entry["challenge"]
-        state = entry["state"]
         try:
             login = github_login(config, code)
         except AuthError as error:
@@ -1171,36 +1435,38 @@ class McpHandler(BaseHTTPRequestHandler):
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
             return
         try:
-            if not grafana_user_exists(config, login):
-                self._send_json(HTTPStatus.FORBIDDEN, {
-                    "error": f"the GitHub login {login} has no Grafana user on {config.grafana_url};"
-                             " ask for one and log in again",
-                })
-                return
+            refusal = grafana_admission(config, login)
         except AuthError as error:
             logger.error("the Grafana check of the OAuth callback failed: %s", error)
             self._send_json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
             return
-        token = mint_token(config.session_secret, login, now)
+        if refusal:
+            logger.warning("the login of %s was refused: %s", login, refusal)
+            self._send_json(HTTPStatus.FORBIDDEN, {"error": refusal})
+            return
         # Back to the client's redirect URI with a fresh authorization code.
-        auth_code = mint_code(login, challenge, redirect_uri, now)
+        auth_code = mint_code(login, entry["challenge"], entry["redirect_uri"], entry["client_id"], now)
+        if auth_code is None:
+            self._send_json(HTTPStatus.SERVICE_UNAVAILABLE, {
+                "error": f"{MAX_CODES_IN_FLIGHT} login codes are already waiting to be exchanged;"
+                         " try again in a few minutes"})
+            return
+        redirect_uri = entry["redirect_uri"]
         target = f"{redirect_uri}{'&' if '?' in redirect_uri else '?'}code={urllib.parse.quote(auth_code)}"
-        if state:
-            target += f"&state={urllib.parse.quote(state)}"
-        self._redirect(target, cookies=[
-            f"{SESSION_COOKIE}={token}; Path=/; Max-Age={TOKEN_SECONDS}; HttpOnly; SameSite=Lax"])
+        if entry["state"]:
+            target += f"&state={urllib.parse.quote(entry['state'])}"
+        self._redirect(target)
 
     def _token(self, now: float) -> None:
         config = self.state.config
-        length = int(self.headers.get("Content-Length") or 0)
-        form = urllib.parse.parse_qs(self.rfile.read(length).decode())
+        form = urllib.parse.parse_qs(self._body().decode("utf-8", "replace"))
         if (form.get("grant_type") or [""])[0] != "authorization_code":
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "unsupported_grant_type"})
             return
         code = (form.get("code") or [""])[0]
         verifier = (form.get("code_verifier") or [""])[0]
-        entry = CODES.pop(code, None)
-        if entry is None or entry["expires"] < now:
+        entry = take_code(code, now)
+        if entry is None:
             self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_grant",
                                                      "error_description": "the code is unknown or"
                                                      " older than two minutes"})
@@ -1210,6 +1476,16 @@ class McpHandler(BaseHTTPRequestHandler):
                                                      "error_description": "the code verifier"
                                                      " does not match"})
             return
+        # RFC 6749 4.1.3: the exchange is the authorization's own client and
+        # redirect URI; a client that sends them must send those.
+        sent_client = (form.get("client_id") or [""])[0]
+        sent_redirect = (form.get("redirect_uri") or [""])[0]
+        if (sent_client and sent_client != entry["client_id"]) or \
+                (sent_redirect and sent_redirect != entry["redirect_uri"]):
+            self._send_json(HTTPStatus.BAD_REQUEST, {"error": "invalid_grant",
+                                                     "error_description": "the code was issued to another"
+                                                     " client or redirect URI"})
+            return
         self._send_json(HTTPStatus.OK, {
             "access_token": mint_token(config.session_secret, entry["login"], now),
             "token_type": "Bearer",
@@ -1218,12 +1494,11 @@ class McpHandler(BaseHTTPRequestHandler):
 
     def _mcp(self, now: float) -> None:
         config = self.state.config
-        # Read the whole body before any answer, the 401 included: on a
+        # Read the (bounded) body before any answer, the 401 included: on a
         # keep-alive connection an unread body becomes the next request's
         # request line, and the client's retry arrives as garbage (a 501
         # quoting the body). No body on GET.
-        length = int(self.headers.get("Content-Length") or 0)
-        raw = self.rfile.read(length) if length else b""
+        raw = self._body()
         header = self.headers.get("Authorization") or ""
         login = None
         if header.startswith("Bearer "):
@@ -1262,36 +1537,76 @@ class McpHandler(BaseHTTPRequestHandler):
 
     # -- routing ---------------------------------------------------------------
 
-    def do_GET(self) -> None:
-        now = time.time()
+    # The routes that read their own body; every other route's body is read
+    # (bounded) and dropped first, so it cannot desynchronize a keep-alive
+    # connection.
+    READS_BODY = frozenset({"/mcp", "/register", "/token"})
+
+    def _route(self, routes: dict[str, Callable[[float], None]]) -> None:
         path = urllib.parse.urlparse(self.path).path
-        if path in ("/.well-known/oauth-protected-resource", "/.well-known/oauth-authorization-server"):
-            self._well_known()
-        elif path == "/authorize":
-            self._authorize(now)
-        elif path == "/oauth/callback":
-            self._oauth_callback(now)
-        elif path == "/healthz":
-            self._send_json(HTTPStatus.OK, {"ok": True})
-        elif path == "/mcp":
-            self._mcp(now)
-        else:
-            self._send_json(HTTPStatus.NOT_FOUND, {"error": f"no {path} here"})
+        handler = routes.get(path)
+        try:
+            if handler is None or path not in self.READS_BODY:
+                self._body()
+            if handler is None:
+                self._send_json(HTTPStatus.NOT_FOUND, {"error": f"no {path} here"})
+            else:
+                handler(time.time())
+        except BodyRefused:
+            return
+
+    def _no_sessions(self, now: float) -> None:
+        self._body()
+        self._send_json(HTTPStatus.METHOD_NOT_ALLOWED, {"error": "sessions are not stored"})
+
+    def do_GET(self) -> None:
+        self._route({
+            "/.well-known/oauth-protected-resource": lambda now: self._well_known(),
+            "/.well-known/oauth-authorization-server": lambda now: self._well_known(),
+            "/authorize": self._authorize,
+            "/oauth/callback": self._oauth_callback,
+            "/healthz": lambda now: self._send_json(HTTPStatus.OK, {"ok": True}),
+            "/mcp": self._mcp,
+        })
 
     def do_POST(self) -> None:
-        now = time.time()
-        path = urllib.parse.urlparse(self.path).path
-        if path == "/register":
-            self._register()
-        elif path == "/token":
-            self._token(now)
-        elif path == "/mcp":
-            self._mcp(now)
-        else:
-            self._send_json(HTTPStatus.NOT_FOUND, {"error": f"no {path} here"})
+        self._route({
+            "/register": lambda now: self._register(),
+            "/token": self._token,
+            "/mcp": self._mcp,
+        })
 
     def do_DELETE(self) -> None:
-        self._send_json(HTTPStatus.METHOD_NOT_ALLOWED, {"error": "sessions are not stored"})
+        self._route({"/mcp": self._no_sessions})
+
+
+class McpServer(ThreadingHTTPServer):
+    """A thread per connection, at most MAX_CONNECTIONS at once: past that
+    a connection is closed at once and logged, not queued."""
+
+    daemon_threads = True
+
+    def __init__(self, address, handler, limit: int = MAX_CONNECTIONS):
+        super().__init__(address, handler)
+        self._slots = threading.BoundedSemaphore(limit)
+
+    def process_request(self, request, client_address) -> None:
+        if not self._slots.acquire(blocking=False):
+            logger.warning("refused a connection from %s: %d are already open", client_address[0],
+                           MAX_CONNECTIONS)
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
 
 
 def _sha256_b64(verifier: str) -> str:
@@ -1302,7 +1617,7 @@ def _sha256_b64(verifier: str) -> str:
 def serve(config: Config) -> None:
     state = McpState(config)
     McpHandler.state = state
-    server = ThreadingHTTPServer((config.bind, config.port), McpHandler)
+    server = McpServer((config.bind, config.port), McpHandler)
     logger.info("ci-observe MCP server on http://%s:%d (external %s), reading %s",
                 config.bind, config.port, config.external_url, config.exporter_url)
     server.serve_forever()

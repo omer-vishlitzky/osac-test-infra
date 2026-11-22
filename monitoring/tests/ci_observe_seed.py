@@ -589,8 +589,10 @@ def _seed_signatures(trends_db, jobs_db, now):
                     "INSERT OR REPLACE INTO artifact_log_signatures VALUES (?,?,?,?,?,?,?)",
                     (str(run_id), suite, kind, signature, outcome, phase, lines))
             conn.execute(
-                "INSERT OR REPLACE INTO artifact_logs VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (str(run_id), suite, "osac", "indexed", "", 12, 900, 30, 0, 0, _iso(now)))
+                "INSERT OR REPLACE INTO artifact_logs (run_id, suite, repo, state, reason, files, lines,"
+                " error_lines, skipped_files, skipped_lines, ingested_at, attempt)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (str(run_id), suite, "osac", "indexed", "", 12, 900, 30, 0, 0, _iso(now), "1"))
         conn.commit()
     finally:
         conn.close()

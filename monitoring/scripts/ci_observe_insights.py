@@ -473,87 +473,51 @@ class Stores:
         finally:
             conn.close()
 
-    def artifact_signatures(self, run_ids, suite="all"):
-        """[{signature, kind, phase, failed_runs, passing_runs, failed_lines,
-        runs}] for the given runs, from the artifact-log rollup's table: how
-        many failed and how many passing runs of this set show each error
-        signature. A merge-queue run holds three bundles (one per suite),
-        so the table carries its signatures under all three; `suite`
-        narrows to one suite's bundles, and "all" reads every suite's.
-        [] when the rollup has indexed nothing yet (its table is absent);
-        None when the table cannot be read: a read failure is not
-        "no signatures"."""
-        if not run_ids:
-            return []
-        conn = self._open(self.trends_db)
-        if conn is None:
-            return []
+    def artifact_signatures(self, units):
+        """The artifact-log rollup's record of the given suite runs: (indexed,
+        rows). `units` maps each (run id, suite) of the window to its result
+        ("passed" or "failed"); a merge-queue run holds three bundles, one per
+        suite, so a run is counted per suite. indexed is the set of those
+        units whose bundle the rollup read; rows are [(signature, kind,
+        phase, run id, suite, lines)] of the indexed units. ([], []) when
+        the rollup has indexed nothing yet (its tables are absent, or the
+        store does not exist); None when the store or a table cannot be
+        read: a read failure is not "no signatures"."""
+        if not units:
+            return set(), []
+        if not self.trends_db or not os.path.exists(self.trends_db):
+            return set(), []
         try:
-            if "artifact_log_signatures" not in self._tables(conn):
-                return []
-            grouped = {}
-            suite_filter = "" if suite == "all" or suite not in phases.SUITES else "AND suite = ?"
-            for start in range(0, len(run_ids), 400):
-                chunk = run_ids[start:start + 400]
-                marks = ",".join("?" * len(chunk))
-                rows = conn.execute(
-                    "SELECT signature, kind, phase, outcome, run_id, lines FROM artifact_log_signatures"
-                    f" WHERE run_id IN ({marks}) {suite_filter}", chunk if not suite_filter else [*chunk, suite])
-                for row in rows:
-                    key = (row["signature"], row["kind"], row["phase"] or "")
-                    entry = grouped.setdefault(
-                        key, {"failed_runs": set(), "passing_runs": set(), "failed_lines": 0})
-                    if row["outcome"] == "failure":
-                        entry["failed_runs"].add(row["run_id"])
-                        entry["failed_lines"] += row["lines"]
-                    else:
-                        entry["passing_runs"].add(row["run_id"])
-            created = self.run_created([run_id for entry in grouped.values()
-                                        for run_id in entry["failed_runs"]])
-            if created is None:
-                return None
-            table = []
-            for (signature, kind, phase), entry in grouped.items():
-                moments = [created[run_id] for run_id in entry["failed_runs"] if run_id in created]
-                table.append({
-                    "signature": signature, "kind": kind, "phase": phase,
-                    "failed_runs": len(entry["failed_runs"]), "passing_runs": len(entry["passing_runs"]),
-                    "failed_lines": entry["failed_lines"],
-                    "first_seen": min(moments) if moments else "",
-                    "last_seen": max(moments) if moments else "",
-                    "runs": sorted(entry["failed_runs"], reverse=True)[:3],
-                })
-            return table
+            conn = sqlite3.connect(f"file:{self.trends_db}?mode=ro", uri=True, timeout=5)
         except sqlite3.Error as error:
-            logger.error("the artifact log signature table could not be read: %s", error)
+            logger.error("the artifact log tables could not be opened: %s", error)
             return None
-        finally:
-            conn.close()
-
-    def run_created(self, run_ids):
-        """{run id: created_at} of the given runs from the archive, for
-        first-seen and last-seen. Runs the archive does not hold are left
-        out: their date is unknown, not today. None when the archive cannot
-        be read."""
-        if not run_ids:
-            return {}
-        conn = self._open(self.trends_db)
-        if conn is None:
-            return {}
+        conn.row_factory = sqlite3.Row
         try:
-            if "suite_runs" not in self._tables(conn):
-                return {}
-            out = {}
+            tables = self._tables(conn)
+            if "artifact_logs" not in tables or "artifact_log_signatures" not in tables:
+                return set(), []
+            run_ids = sorted({run_id for run_id, _ in units})
+            indexed, rows = set(), []
             for start in range(0, len(run_ids), 400):
                 chunk = run_ids[start:start + 400]
                 marks = ",".join("?" * len(chunk))
                 for row in conn.execute(
-                        f"SELECT run_id, MIN(created_at) AS created FROM suite_runs WHERE run_id IN ({marks})"
-                        " GROUP BY run_id", chunk):
-                    out[str(row["run_id"])] = row["created"]
-            return out
+                        f"SELECT run_id, suite FROM artifact_logs WHERE state = 'indexed' AND run_id IN ({marks})",
+                        chunk):
+                    unit = (str(row["run_id"]), row["suite"])
+                    if unit in units:
+                        indexed.add(unit)
+                for row in conn.execute(
+                        "SELECT signature, kind, phase, run_id, suite, lines FROM artifact_log_signatures"
+                        f" WHERE run_id IN ({marks})", chunk):
+                    unit = (str(row["run_id"]), row["suite"])
+                    if unit in indexed or unit in units:
+                        rows.append((row["signature"], row["kind"], row["phase"] or "", unit[0], unit[1],
+                                     row["lines"]))
+            return indexed, [row for row in rows if (row[3], row[4]) in indexed]
         except sqlite3.Error as error:
-            logger.error("the run archive could not be read: %s", error)
+            logger.error("the artifact log signature table could not be read: %s", error)
             return None
         finally:
             conn.close()
@@ -712,19 +676,38 @@ class CIObserveInsights:
             return document
 
     def _limit_to_stored_history(self, filters):
-        """'vs before' compares with the same span just before the window,
+        """Say when the stores do not reach back to the start of a window,
+        and leave 'vs before' empty when they do not hold its span.
+
+        The window itself: a window that starts before the oldest stored
+        run (a fresh install, or an end moved into the past) is counted
+        over the part the stores hold, and the page says which part,
+        instead of passing a short window off as a full one.
+
+        'vs before' compares with the same span just before the window,
         which is only stored once the stores reach back to its start (a day
         of slack). A partly stored span would make every count look like
         growth, and an unstored one like everything new, so the comparison
-        is left empty and the page says when it starts."""
+        is left empty and the page says why -- and, for a window that ends
+        now, from when it will be filled."""
+        oldest = phases.parse_time(self.stores.oldest_run())
+        if oldest is not None and oldest > filters.window_from + timedelta(days=1):
+            filters.notes.append(
+                f"the stored runs start on {oldest:%Y-%m-%d %H:%M} UTC, after this window's start"
+                f" ({filters.window_from:%Y-%m-%d %H:%M} UTC): its numbers cover {oldest:%Y-%m-%d %H:%M} to"
+                f" {filters.window_to:%Y-%m-%d %H:%M} UTC only")
         if not filters.has_previous:
             return
-        oldest = phases.parse_time(self.stores.oldest_run())
         if oldest is not None and oldest <= filters.previous_from + timedelta(days=1):
             return
         filters.has_previous = False
         if oldest is None:
             reason = "the stores hold no run yet"
+        elif filters.end:
+            # A window ending in the past: the span before it will never be
+            # stored if the stores begin after it starts.
+            reason = (f"the stored runs start on {oldest:%Y-%m-%d}, after the start of the {filters.days} days"
+                      f" before the window ({filters.previous_from:%Y-%m-%d})")
         else:
             ready = oldest + timedelta(days=2 * filters.days - 1)
             reason = (f"the stored runs start on {oldest:%Y-%m-%d}, so the {filters.days} days before the window "
@@ -763,12 +746,13 @@ class CIObserveInsights:
         if passes is None:
             # Unknown is not "never ran": the per-job lines below would
             # say "no pass recorded yet" over a table nobody could read.
-            parts.append("Test results and inside-the-tests: the rollup pass table could"
+            parts.append("Test results, inside-the-tests and error signatures: the rollup pass table could"
                          " not be read, so their freshness is unknown")
         else:
             for job, label, noun, timer in (
                 ("trends", "Test results", "test results", "ci-observe-trends.timer"),
                 ("spans", "Inside the tests", "inside-the-tests numbers", "ci-observe-spans.timer"),
+                ("logs", "Error signatures", "error signatures", "ci-observe-logs.timer"),
             ):
                 finished = phases.parse_time(passes.get(job))
                 if finished is None:
@@ -1306,9 +1290,8 @@ class CIObserveInsights:
         message_rows.sort(key=lambda row: (-row["count"], row["message"]))
         if not test_rows:
             notes.append("no per-test rollup is stored for this window, so failing tests and messages are empty")
-        signature_rows, signature_note = self._artifact_signature_rows(finished, filters)
-        if signature_note:
-            notes.append(signature_note)
+        signature_rows, signature_notes = self._artifact_signature_rows(finished, filters)
+        notes.extend(signature_notes)
         return {
             "population": (
                 f"failed VMaaS, CaaS and BMaaS suite runs in the last {filters.days} days; a run's cause is the "
@@ -1330,32 +1313,92 @@ class CIObserveInsights:
             "notes": notes,
         }
 
+    # A signature in fewer failed runs than this ranks after the rest: one
+    # run in three is a third of a small window, and is still one run.
+    SIGNATURE_MIN_FAILED_RUNS = 2
+
     def _artifact_signature_rows(self, finished, filters, limit=50):
-        """(rows, note): the error signatures of this window's runs, ranked
-        by how much more failed runs show them than passing ones -- the
-        comparison that tells a cause from the ambient noise every cluster
-        logs. The note says when the answer is not available and why; an
-        empty answer without a note means the window's bundles held no
-        error lines at all."""
-        run_ids = [str(fact["run_id"]) for fact in finished]
-        rows = self.stores.artifact_signatures(run_ids, filters.suite)
-        if rows is None:
-            return [], ("the artifact log signature table could not be read, so the error signatures"
-                        " of this window are unknown")
-        if not rows:
-            return [], ("the artifact log rollup has indexed no bundle of this window yet, so no error"
-                        " signatures are known (ci-observe-logs.timer)")
-        for row in rows:
-            # The drill-down selects the runs that show the signature, not
-            # the signature label: the label is the table's normalization
-            # of the line, and Loki's copy of it can lag a normalization
-            # change. The runs' lines are the verbatim evidence either way.
-            row["logs_query"] = '{source="artifact", run_id=~"%s"}' % "|".join(
-                run.replace('"', "") for run in row["runs"])
-        rows = [row for row in rows if row["failed_runs"]]
-        rows.sort(key=lambda row: (-(row["failed_runs"] - row["passing_runs"]), -row["failed_runs"],
-                                   row["signature"]))
-        return rows[:limit], ""
+        """(rows, notes): the error signatures of this window's runs, ranked
+        by how much more often failed runs show them than passing ones: the
+        share of the indexed failed runs that show a signature minus the
+        share of the indexed passing runs that do. Raw counts would not do:
+        when most runs fail, noise that every run logs has more failed runs
+        than any cause. A signature is one row whatever phase each failed
+        run stopped in (the phase column names the most common): grouping
+        by phase put every passing run, which has none, in a row of its
+        own. The notes say when the answer is not available, and how many
+        of the window's runs it covers."""
+        units = {}
+        facts = {}
+        for fact in finished:
+            unit = (str(fact["run_id"]), fact["suite"])
+            if fact["result"] in ("passed", "failed"):
+                units[unit] = fact["result"]
+                facts[unit] = fact
+        read = self.stores.artifact_signatures(units)
+        if read is None:
+            return [], ["the artifact log signature table could not be read, so the error signatures"
+                        " of this window are unknown"]
+        indexed, stored = read
+        if not indexed:
+            return [], ["the artifact log rollup has indexed no bundle of this window yet, so no error"
+                        " signatures are known (ci-observe-logs.timer)"]
+        total = {result: sum(1 for value in units.values() if value == result) for result in ("failed", "passed")}
+        covered = {result: sum(1 for unit in indexed if units[unit] == result) for result in ("failed", "passed")}
+        notes = []
+        if covered != total:
+            notes.append(f"the error signatures cover {covered['failed']} of {total['failed']} failed and"
+                         f" {covered['passed']} of {total['passed']} passing suite runs of this window; the"
+                         " others have no indexed bundle yet or none at all")
+        if not covered["passed"]:
+            notes.append("no passing run of this window has an indexed bundle, so the ranking cannot tell a"
+                         " cause from the noise every run logs")
+        grouped = {}
+        for signature, kind, phase, run_id, suite, lines in stored:
+            entry = grouped.setdefault((signature, kind), {"failed": set(), "passed": set(), "lines": 0,
+                                                           "phases": defaultdict(int)})
+            unit = (run_id, suite)
+            entry[units[unit]].add(unit)
+            if units[unit] == "failed":
+                entry["lines"] += lines
+                entry["phases"][phase or "other"] += 1
+        rows = []
+        for (signature, kind), entry in grouped.items():
+            if not entry["failed"]:
+                continue
+            failed_share = len(entry["failed"]) / covered["failed"] if covered["failed"] else None
+            passing_share = len(entry["passed"]) / covered["passed"] if covered["passed"] else None
+            score = (failed_share or 0) - (passing_share or 0)
+            examples = sorted(entry["failed"], key=lambda unit: facts[unit]["created_at"], reverse=True)[:3]
+            created = [facts[unit]["created_at"] for unit in entry["failed"] if facts[unit]["created_at"]]
+            started = [phases.parse_time(facts[unit]["created_at"]) for unit in examples]
+            ended = [phases.parse_time(facts[unit]["finished_at"] or facts[unit]["created_at"]) for unit in examples]
+            started = [moment for moment in started if moment]
+            ended = [moment for moment in ended if moment]
+            rows.append({
+                "signature": signature, "kind": kind,
+                "phase": max(entry["phases"].items(), key=lambda item: (item[1], item[0]))[0],
+                "failed_runs": len(entry["failed"]), "passing_runs": len(entry["passed"]),
+                "failed_share": round(failed_share, 4) if failed_share is not None else None,
+                "passing_share": round(passing_share, 4) if passing_share is not None else None,
+                "score": round(score, 4),
+                "failed_lines": entry["lines"],
+                "first_seen": min(created) if created else "",
+                "last_seen": max(created) if created else "",
+                "runs": [run_id for run_id, _ in examples],
+                # The example runs' lines: the run is structured metadata on
+                # them (a filter after the selector), and they are stamped
+                # inside the run, so this range holds them all. The drill-
+                # down selects runs, not the signature: Loki's copy of the
+                # normalization can lag a change to it.
+                "logs_query": '{source="artifact"} | run_id=~"%s"' % "|".join(
+                    run_id.replace('"', "") for run_id, _ in examples),
+                "logs_from": iso(min(started) - timedelta(hours=2)) if started else "",
+                "logs_to": iso(max(ended) + timedelta(hours=2)) if ended else "",
+            })
+        rows.sort(key=lambda row: (row["failed_runs"] < self.SIGNATURE_MIN_FAILED_RUNS, -row["score"],
+                                   -row["failed_runs"], row["signature"]))
+        return rows[:limit], notes
 
     # -- tests -------------------------------------------------------------
     def _test_summaries(self, rows, filters):

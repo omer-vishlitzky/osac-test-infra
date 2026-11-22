@@ -2008,7 +2008,7 @@
    "type": "table",
    "id": 19,
    "title": "Signatures from the failed runs' logs",
-   "description": "The error lines of the failed runs' artifact bundles, grouped after replacing names, ids and numbers, ranked by how many more failed runs show each than passing ones (the comparison that separates a cause from noise every cluster logs). Passing runs: in how many passing runs of the window the same signature appears. Population: the artifact bundles of the suite runs indexed by the artifact-log rollup. Time: runs created in the last $days days (the Window above). Unit: count of runs.",
+   "description": "The error lines of the failed runs' artifact bundles, grouped after replacing names, ids and numbers, ranked by how much more often failed runs show each than passing ones: the share of the indexed failed runs that show a signature minus the share of the indexed passing runs that do. Shares, not counts: when most runs fail, noise every run logs has more failed runs than any cause. A signature in fewer than 2 failed runs ranks after the rest. Of failed runs, Of passing runs: the share of the window's indexed failed (passing) runs that show it; Failed runs, Passing runs: how many. Phase: the phase most of its failed runs stopped in. Population: the artifact bundles of the suite runs indexed by the artifact-log rollup (the notes say how many of the window's runs that is). Time: runs created in the last $days days (the Window above). Unit: share of runs.",
    "gridPos": {
     "x": 0,
     "y": 23,
@@ -2153,6 +2153,102 @@
      {
       "matcher": {
        "id": "byName",
+       "options": "failed_share"
+      },
+      "properties": [
+       {
+        "id": "displayName",
+        "value": "Of failed runs"
+       },
+       {
+        "id": "custom.width",
+        "value": 110
+       },
+       {
+        "id": "unit",
+        "value": "percentunit"
+       },
+       {
+        "id": "decimals",
+        "value": 0
+       },
+       {
+        "id": "description",
+        "value": "Share of the window's indexed failed runs that show the signature."
+       },
+       {
+        "id": "noValue",
+        "value": "–"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "passing_share"
+      },
+      "properties": [
+       {
+        "id": "displayName",
+        "value": "Of passing runs"
+       },
+       {
+        "id": "custom.width",
+        "value": 110
+       },
+       {
+        "id": "unit",
+        "value": "percentunit"
+       },
+       {
+        "id": "decimals",
+        "value": 0
+       },
+       {
+        "id": "description",
+        "value": "Share of the window's indexed passing runs that show the signature."
+       },
+       {
+        "id": "noValue",
+        "value": "–"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
+       "options": "score"
+      },
+      "properties": [
+       {
+        "id": "displayName",
+        "value": "Failed minus passing"
+       },
+       {
+        "id": "custom.width",
+        "value": 120
+       },
+       {
+        "id": "unit",
+        "value": "percentunit"
+       },
+       {
+        "id": "decimals",
+        "value": 0
+       },
+       {
+        "id": "description",
+        "value": "The share of indexed failed runs that show the signature minus the share of indexed passing runs that do: the ranking."
+       },
+       {
+        "id": "noValue",
+        "value": "–"
+       }
+      ]
+     },
+     {
+      "matcher": {
+       "id": "byName",
        "options": "first_seen"
       },
       "properties": [
@@ -2225,7 +2321,7 @@
     },
     "sortBy": [
      {
-      "displayName": "Failed runs",
+      "displayName": "Failed minus passing",
       "desc": true
      }
     ]
@@ -2270,6 +2366,21 @@
       {
        "selector": "passing_runs",
        "text": "passing_runs",
+       "type": "number"
+      },
+      {
+       "selector": "failed_share",
+       "text": "failed_share",
+       "type": "number"
+      },
+      {
+       "selector": "passing_share",
+       "text": "passing_share",
+       "type": "number"
+      },
+      {
+       "selector": "score",
+       "text": "score",
        "type": "number"
       },
       {

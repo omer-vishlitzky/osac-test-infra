@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import threading
+import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from http.server import ThreadingHTTPServer
@@ -1319,3 +1320,16 @@ def test_the_dashboard_selectors_resolve_against_the_endpoint(exporter, jobs, fr
     assert node, "the contract document has no rows"
     for column in target["columns"]:
         assert column["selector"] in node[0], f"column {column['selector']} is not in the response"
+
+
+def test_an_indexed_run_links_to_its_lines_by_metadata_over_its_span(exporter, jobs, fresh, monkeypatch):
+    """The rollup keeps the run in structured metadata, so the Explore link
+    filters after the selector, and opens on the run's own time range."""
+    monkeypatch.setattr(exporter, "_logs_indexed", lambda run_id: True)
+    doc = exporter.get_ci_observe_runs_json({"days": ["7"]})
+    row = next(row for row in doc["runs"] if str(row["run_id"]) == str(RUN_ID))
+    state = json.loads(urllib.parse.unquote(row["logs_url"].split("left=", 1)[1]))
+    assert state["queries"][0]["expr"] == f'{{source="artifact"}} | run_id="{RUN_ID}"'
+    started = datetime.fromisoformat(row["created_at"].replace("Z", "+00:00"))
+    assert int(state["range"]["from"]) == int((started - timedelta(hours=2)).timestamp() * 1000)
+    assert int(state["range"]["to"]) > int(state["range"]["from"])

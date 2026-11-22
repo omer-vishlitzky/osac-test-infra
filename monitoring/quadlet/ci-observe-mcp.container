@@ -2,9 +2,10 @@
 # Installed by monitoring-setup.sh to ~/.config/containers/systemd/ci-observe-mcp.container
 #
 # Deployed on the CENTRAL machine only. Serves the ci-observe questions over
-# the MCP protocol (Streamable HTTP) on 127.0.0.1:9105; Caddy's :3443 vhost
-# proxies /mcp and the OAuth endpoints to it, so clients on the VPN reach it
-# at https://<canonical-host>:3443/mcp.
+# the MCP protocol (Streamable HTTP) on 127.0.0.1:9105; Caddy proxies /mcp
+# and the OAuth endpoints to it from the OTLP vhost that HAProxy's :443 SNI
+# route ends at, so clients on the VPN reach it at
+# https://osac-ci-1.redhat.com/mcp (see the Caddyfile).
 #
 # The server refuses to start until the OAuth and Grafana secrets are in
 # ~/.monitoring-server/.env (see monitoring-setup.sh's warning and the
@@ -41,12 +42,20 @@ Network=host
 Environment=MCP_BIND=127.0.0.1
 Environment=MCP_PORT=9105
 Environment=EXPORTER_URL=http://127.0.0.1:9103
-EnvironmentFile=%h/.monitoring-server/.env
+# Only the server's own keys enter the container. The .env also holds
+# PRIVATE_GITHUB_TOKEN and the other services' secrets, and this is the one
+# container the VPN reaches without the fleet's basic auth: systemd reads
+# the file into podman's environment ([Service] below), and `--env NAME`
+# without a value copies just that variable from it (unset ones stay unset).
+PodmanArgs=--env MCP_GITHUB_CLIENT_ID --env MCP_GITHUB_CLIENT_SECRET --env MCP_GRAFANA_URL
+PodmanArgs=--env MCP_GRAFANA_API_URL --env MCP_GRAFANA_SERVICE_TOKEN --env MCP_GRAFANA_TLS_VERIFY
+PodmanArgs=--env MCP_SESSION_SECRET --env MCP_EXTERNAL_URL --env MCP_GITHUB_API_URL --env LOG_LEVEL
 
 # The server module, mounted read-only like the exporter's siblings.
 Volume=%h/.monitoring-server/scripts/ci_observe_mcp.py:/app/ci_observe_mcp.py:ro,Z
 
 [Service]
+EnvironmentFile=%h/.monitoring-server/.env
 Restart=always
 RestartSec=30
 TimeoutStartSec=30

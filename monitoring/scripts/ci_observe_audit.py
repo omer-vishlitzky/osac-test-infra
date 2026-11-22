@@ -941,7 +941,7 @@ def artifact_failures(github, repo, run_id, suite, trigger):
         places = [in_the_private_repo, on_the_run]
     else:
         return {"failed": None, "tests": 0, "where": "", "note": f"a {trigger} run has no known artifact place"}
-    where, note, artifacts = "", "", []
+    where, artifacts = "", []
     for where, path in places:
         status, listing = github.try_get(path)
         if status != 200:
@@ -996,8 +996,11 @@ def stored_test_results(trends_db, run_ids):
                         failed.add((row["test_id"] or "").rsplit("::", 1)[-1])
             for row in conn.execute(f"SELECT run_id, state, reason FROM run_fetches WHERE run_id IN ({marks})", part):
                 fetches[str(row["run_id"])] = (row["state"], row["reason"] or "")
-    except sqlite3.Error:
-        pass
+    except sqlite3.Error as error:
+        # Read as "no results" this would report every run as missing its
+        # test results: a store fault passed off as a finding. The check
+        # fails instead, and the stale-audit alert says so.
+        raise RuntimeError(f"the test history in {trends_db} could not be read: {error}") from error
     finally:
         conn.close()
     return results, fetches

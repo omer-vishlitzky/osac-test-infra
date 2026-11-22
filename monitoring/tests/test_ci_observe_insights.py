@@ -700,15 +700,24 @@ def record_passes(stores, **ages):
 def test_the_about_row_says_how_old_each_source_is(stores):
     stored_since(stores)
     stores.run(NOW - timedelta(hours=2))
-    record_passes(stores, trends=0.5, spans=1)
+    record_passes(stores, trends=0.5, spans=1, logs=1.5)
 
     about = get(stores.api(), "health")["about"][0]
 
     assert about["sources"] == (
         "Runs: up to 2026-11-07 10:00 UTC · Test results: updated 2026-11-07 11:30 UTC"
-        " · Inside the tests: updated 2026-11-07 11:00 UTC · Not checked against GitHub yet (ci-observe-audit.timer)"
+        " · Inside the tests: updated 2026-11-07 11:00 UTC · Error signatures: updated 2026-11-07 10:30 UTC"
+        " · Not checked against GitHub yet (ci-observe-audit.timer)"
     )
     assert about["missing"] == "Nothing is missing in this window."
+
+
+def test_a_log_rollup_that_stopped_says_so(stores):
+    stored_since(stores)
+    stores.run(NOW - timedelta(hours=2))
+    record_passes(stores, trends=0.5, spans=1, logs=30)
+    about = get(stores.api(), "failures")["about"][0]
+    assert "error signatures were last updated 30 h ago (ci-observe-logs.timer)" in about["missing"]
 
 
 def write_audit(stores, hours_ago, **e2e):
@@ -749,11 +758,13 @@ def test_a_late_check_against_github_says_so(stores):
     assert "the last check against GitHub ran 40 h ago (2026-11-05 20:00 UTC); the daily check is late" in missing
 
 
-def test_an_unreadable_check_is_not_a_check(stores):
+def test_an_unreadable_check_is_a_broken_check_not_no_check(stores):
+    # "Not checked yet" would hide that the guard itself is down.
     stores.run(NOW - timedelta(hours=2))
     (Path(stores.jobs_db).parent / phases.AUDIT_FILE_NAME).write_text("{not json")
-    assert get(stores.api(), "health")["about"][0]["sources"].endswith(
-        "Not checked against GitHub yet (ci-observe-audit.timer)")
+    about = get(stores.api(), "health")["about"][0]
+    assert "The check against GitHub cannot be read (ci-observe-audit.json could not be read" in about["sources"]
+    assert "the result of the daily check against GitHub cannot be read" in about["missing"]
 
 
 def test_without_stored_runs_before_the_window_nothing_is_compared(stores):
@@ -939,3 +950,118 @@ def test_the_seeded_test_that_gets_slower_says_so(seeded):
     rows = {row["test_key"]: row for row in get(seeded, "tests", days=14)["tests"]}
 
     assert rows[ci_observe_seed.GETTING_SLOWER]["delta"] > 0.03
+
+
+# -- the error signatures of the artifact-log rollup ----------------------------------------
+
+
+def index_bundles(stores, runs, signatures):
+    """The rollup's tables: each (run id, outcome) indexed, with the given
+    signatures [(signature, phase)] for it."""
+    with sqlite3.connect(stores.trends_db) as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS artifact_logs (run_id TEXT NOT NULL, suite TEXT NOT NULL,"
+                     " repo TEXT NOT NULL, state TEXT NOT NULL, reason TEXT NOT NULL DEFAULT '',"
+                     " files INTEGER NOT NULL DEFAULT 0, lines INTEGER NOT NULL DEFAULT 0,"
+                     " error_lines INTEGER NOT NULL DEFAULT 0, skipped_files INTEGER NOT NULL DEFAULT 0,"
+                     " skipped_lines INTEGER NOT NULL DEFAULT 0, ingested_at TEXT NOT NULL,"
+                     " attempt TEXT NOT NULL DEFAULT '', PRIMARY KEY (run_id, suite))")
+        conn.execute("CREATE TABLE IF NOT EXISTS artifact_log_signatures (run_id TEXT NOT NULL, suite TEXT NOT NULL,"
+                     " kind TEXT NOT NULL, signature TEXT NOT NULL, outcome TEXT NOT NULL, phase TEXT NOT NULL,"
+                     " lines INTEGER NOT NULL, PRIMARY KEY (run_id, suite, kind, signature))")
+        for run_id, outcome in runs:
+            conn.execute("INSERT INTO artifact_logs (run_id, suite, repo, state, ingested_at, attempt)"
+                         " VALUES (?, 'vmaas', 'osac', 'indexed', ?, '1')", (run_id, iso(NOW)))
+            for signature, phase in signatures(run_id, outcome):
+                conn.execute("INSERT INTO artifact_log_signatures VALUES (?, 'vmaas', 'pod', ?, ?, ?, 3)",
+                             (run_id, signature, outcome, phase))
+
+
+def test_the_cause_outranks_the_noise_every_run_logs_when_most_runs_fail(stores):
+    """The review's case: 80 failed and 20 passing runs. Every run logs the
+    same noise; 60 failed runs and no passing one log the cause. By counts
+    the noise led (80 - 20 = 60 against 60 - 0); by shares it is 100% of
+    both, a difference of nothing, and the cause is 75% against 0%."""
+    runs = []
+    for i in range(100):
+        failed = i < 80
+        run_id = stores.run(NOW - timedelta(hours=i + 1), conclusion="failure" if failed else "success",
+                            failed="Install OSAC" if failed else None)
+        runs.append((run_id, "failure" if failed else "success", i))
+    index_bundles(stores, [(run_id, outcome) for run_id, outcome, _ in runs],
+                  lambda run_id, outcome: [("informer sync timeout after <n>s", "install" if outcome == "failure"
+                                            else "")] + ([("cert-manager cannot get lease", "install")]
+                                                         if outcome == "failure" and int(run_id) % 100 < 61 else []))
+    rows = get(stores.api(), "failures", days="7", suite="vmaas")["signatures"]
+    assert [row["signature"] for row in rows] == ["cert-manager cannot get lease", "informer sync timeout after <n>s"]
+    cause, noise = rows
+    assert (noise["failed_runs"], noise["passing_runs"], noise["score"]) == (80, 20, 0.0)
+    assert cause["passing_runs"] == 0 and cause["score"] == cause["failed_share"] > 0.7
+
+
+def test_one_signature_is_one_row_whatever_phase_its_runs_stopped_in(stores):
+    # Failed runs stop in different phases and passing runs in none; a row
+    # per phase gave every failed phase "0 passing runs".
+    failed_install = stores.run(NOW - timedelta(hours=1), conclusion="failure", failed="Install OSAC")
+    failed_test = stores.run(NOW - timedelta(hours=2), conclusion="failure", failed="Run E2E tests")
+    passing = stores.run(NOW - timedelta(hours=3))
+    index_bundles(stores, [(failed_install, "failure"), (failed_test, "failure"), (passing, "success")],
+                  lambda run_id, outcome: [("the same noise", {failed_install: "install", failed_test: "test"}
+                                            .get(run_id, ""))])
+    rows = get(stores.api(), "failures", days="7")["signatures"]
+    assert len(rows) == 1
+    assert (rows[0]["failed_runs"], rows[0]["passing_runs"]) == (2, 1)
+
+
+def test_the_signatures_say_how_much_of_the_window_they_cover(stores):
+    indexed = stores.run(NOW - timedelta(hours=1), conclusion="failure", failed="Install OSAC")
+    stores.run(NOW - timedelta(hours=2), conclusion="failure", failed="Install OSAC")  # no bundle indexed
+    index_bundles(stores, [(indexed, "failure")], lambda run_id, outcome: [("an error", "install")])
+    notes = get(stores.api(), "failures", days="7")["notes"]
+    assert any("cover 1 of 2 failed and 0 of 0 passing suite runs" in note for note in notes)
+    assert any("cannot tell a cause from the noise" in note for note in notes)
+
+
+def test_an_unreadable_signature_store_is_unknown_not_empty(stores, monkeypatch):
+    stores.run(NOW - timedelta(hours=1), conclusion="failure", failed="Install OSAC")
+    api = stores.api()
+    # A store that exists but cannot be opened (a permission, a lock) is a
+    # read failure, not "nothing indexed yet".
+    real_connect = insights.sqlite3.connect
+
+    def connect(database, *args, **kwargs):
+        if str(stores.trends_db) in str(database):
+            raise sqlite3.OperationalError("unable to open database file")
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(insights.sqlite3, "connect", connect)
+    notes = get(api, "failures", days="7")["notes"]
+    assert any("could not be read" in note for note in notes)
+    assert not any("has indexed no bundle" in note for note in notes)
+
+
+def test_each_signature_links_its_runs_lines_by_metadata_over_their_time(stores):
+    run_id = stores.run(NOW - timedelta(hours=5), conclusion="failure", failed="Install OSAC")
+    index_bundles(stores, [(run_id, "failure")], lambda run_id, outcome: [("an error", "install")])
+    [row] = get(stores.api(), "failures", days="7")["signatures"]
+    assert row["logs_query"] == f'{{source="artifact"}} | run_id=~"{run_id}"'
+    assert row["logs_from"] == iso(NOW - timedelta(hours=7))
+    assert row["logs_to"] > row["logs_from"]
+
+
+# -- windows the stores do not wholly hold --------------------------------------------------
+
+
+def test_a_window_that_starts_before_the_stored_runs_says_which_part_it_covers(stores):
+    for days_ago in (20, 15, 12):
+        stores.run(NOW - timedelta(days=days_ago))
+    doc = get(stores.api(), "health", days="30", end=(NOW - timedelta(days=10)).strftime("%Y-%m-%d"))
+    assert doc["tiles"][0]["runs"] == 3
+    assert any("after this window's start" in note and "cover 2026-10-18" in note for note in doc["notes"])
+
+
+def test_vs_before_of_a_past_window_names_no_date_it_will_never_reach(stores):
+    stores.run(NOW - timedelta(days=20))
+    doc = get(stores.api(), "health", days="30", end=(NOW - timedelta(days=10)).strftime("%Y-%m-%d"))
+    note = next(note for note in doc["notes"] if note.startswith("'vs before' is empty"))
+    assert "after the start of the 30 days before the window" in note
+    assert "are stored from" not in note

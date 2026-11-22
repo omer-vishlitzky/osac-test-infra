@@ -486,7 +486,7 @@
       "type": "stat",
       "id": 116,
       "title": "Approved at the first review",
-      "description": "Share of the merged pull requests a person reviewed whose first human review was the approval. For these the review stage is zero: the reviewer's reading time before the approval is not recorded by GitHub and falls in Wait for first review. Reviews by bots and by the machine accounts CI_OBSERVE_MACHINE_ACCOUNTS names (osac-ci-bot, redhat-chai-bot, openshift-ci-robot, openshift-cherrypick-robot by default) are not human reviews. Population: pull requests merged in the selected repository, author and working groups. Time: merged in the last $days days (the Window above). Unit: percent.",
+      "description": "Share of the merged pull requests a person reviewed whose first human review was an approval. When no other approval followed, their review stage is zero: the reviewer's reading time before the approval is not recorded by GitHub and falls in Wait for first review. When one did (another working group's, or a re-approval after a push), the stage runs from that first approval to the final one. Reviews by bots and by the machine accounts CI_OBSERVE_MACHINE_ACCOUNTS names (osac-ci-bot, redhat-chai-bot, openshift-ci-robot, openshift-cherrypick-robot by default) are not human reviews. Population: pull requests merged in the selected repository, author and working groups. Time: merged in the last $days days (the Window above). Unit: percent.",
       "gridPos": {
         "x": 12,
         "y": 1,

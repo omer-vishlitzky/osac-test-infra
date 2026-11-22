@@ -116,17 +116,60 @@ groups:
           summary: "The ci-observe job history has a gap the reconciliation did not heal"
           description: "The gap check found days with runs verified missing (github_actions_gap_check_missing_runs) or days GitHub would not answer (github_actions_gap_check_days{state=\"gapped|error\"}). See the day_checks table in workflow-exporter.db."
 
+      # CiObserveGapCheckStalled -- the hourly gap check has not finished a
+      # pass GitHub answered for every day in 3 hours, or not once since the
+      # exporter started. It waits while the shared GitHub budget is below
+      # GAP_CHECK_MIN_RATE_LIMIT, and a wait that never ends is a history
+      # nobody is proving complete.
+      - alert: CiObserveGapCheckStalled
+        expr: |
+          time() - max(github_actions_gap_check_last_success) > 10800
+          or absent(github_actions_gap_check_last_success)
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "The ci-observe gap check has not completed in 3 hours"
+          description: "The hourly check that proves the job history complete has not finished a pass GitHub answered for every day. Check the exporter's log for 'Gap check waits' (the shared GitHub budget, github_actions_gap_check_skipped_total) or 'Gap check for ... could not read GitHub'."
+
       # CiObserveHourlyStoreStale -- an hourly store (test results, span
-      # rollup, pull requests) has not completed a pass in 90 minutes.
-      # The 2026-11-16 to 2026-11-21 pull-request stall looked like this.
+      # rollup, error signatures, pull requests) has not completed a pass in
+      # 90 minutes. The 2026-11-16 to 2026-11-21 pull-request stall looked
+      # like this.
       - alert: CiObserveHourlyStoreStale
-        expr: time() - ci_observe_store_last_success{store=~"trends|spans|prs"} > 5400
+        expr: time() - ci_observe_store_last_success{store=~"trends|spans|logs|prs"} > 5400
         for: 10m
         labels:
           severity: warning
         annotations:
           summary: "The ci-observe {{ $labels.store }} store has not advanced in 90 minutes"
           description: "The last completed {{ $labels.store }} pass is older than 90 minutes. Check the matching ci-observe-{{ $labels.store }} service in `systemctl --user` and its journal."
+
+      # CiObserveStoreUnknown -- the exporter has not been able to read
+      # when a store last advanced since it started: the store cannot be
+      # read, or its job never ran. The age comparisons above need a value,
+      # so without this an unreadable store would be silent after a restart.
+      - alert: CiObserveStoreUnknown
+        expr: |
+          absent(ci_observe_store_last_success{store="trends"})
+          or absent(ci_observe_store_last_success{store="spans"})
+          or absent(ci_observe_store_last_success{store="logs"})
+          or absent(ci_observe_store_last_success{store="prs"})
+        for: 2h
+        labels:
+          severity: warning
+        annotations:
+          summary: "The freshness of the ci-observe {{ $labels.store }} store is unknown"
+          description: "The exporter has not read when the {{ $labels.store }} store last advanced since it started: the store cannot be read, or its job has never finished a pass. Check the exporter's log for 'Store freshness of {{ $labels.store }} could not be read' and the matching ci-observe-{{ $labels.store }} service."
+
+      - alert: CiObserveAuditUnknown
+        expr: absent(ci_observe_store_last_success{store="audit"})
+        for: 27h
+        labels:
+          severity: warning
+        annotations:
+          summary: "The ci-observe daily audit has no result the exporter can read"
+          description: "No ci-observe-audit.json the exporter could read since it started. Run `podman exec workflow-exporter python3 /app/ci_observe_audit.py --days 30 --sample 60 --e2e-sample 30 --out /data/ci-observe-audit.json` by hand and read its output."
 
       # CiObserveAuditStale -- the daily check against GitHub has not
       # written its JSON in 26 hours (timer runs 03:35 UTC; the unit exits

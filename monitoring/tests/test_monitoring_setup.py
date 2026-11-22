@@ -90,3 +90,89 @@ def test_update_central_exits_nonzero_over_a_dead_otelcol_router():
     exit_zero = block.index("exit 0", guard)
     assert "exit 1" in block[guard:exit_zero], "the guard must fail the update, not warn"
     assert "deployed Caddyfile" in block[guard:exit_zero], "the error says what is wrong"
+
+
+# -- every piece the units need reaches the host, in both central modes ------------------------
+
+QUADLETS = MONITORING / "quadlet"
+TIMERS = MONITORING / "systemd"
+
+
+def full_install_block() -> str:
+    """The script after the update modes: the first --central install."""
+    rest = SCRIPT.read_text().split('if [[ "${MODE}" == "update-agent" ]]', 1)[1]
+    return rest.split("\n    exit 0\nfi\n", 1)[1]
+
+
+def bash_array(text: str, name: str) -> list[str]:
+    match = re.search(rf"(?ms)^{name}=\((.*?)^\)", text)
+    assert match, f"{name} is not an array of monitoring-setup.sh"
+    return re.findall(r'"([^"]+)"', match.group(1))
+
+
+def mounted_scripts(quadlet: Path) -> list[str]:
+    return re.findall(r"^Volume=%h/\.monitoring-server/scripts/([^:]+):", quadlet.read_text(), re.M)
+
+
+def test_every_script_a_container_mounts_is_copied_by_both_central_modes():
+    """podman refuses a missing bind-mount source: a script a quadlet mounts
+    but an install does not copy is a container that does not start (a first
+    install lacked ci_observe_logs.py, so it had no exporter)."""
+    update, full = update_central_block(), full_install_block()
+    for quadlet in sorted(QUADLETS.glob("*.container")):
+        for script in mounted_scripts(quadlet):
+            source = f'"${{MONITORING_REPO_DIR}}/scripts/{script}"'
+            assert source in update, f"--update-central does not copy {script} ({quadlet.name} mounts it)"
+            assert source in full, f"--central does not copy {script} ({quadlet.name} mounts it)"
+
+
+def test_both_central_modes_install_the_same_containers():
+    update = update_central_block()
+    loop = re.search(r"(?ms)for unit in (.*?); do", update).group(1)
+    updated = set(re.findall(r"[\w.-]+\.container", loop))
+    setup = SCRIPT.read_text()
+    installed = set(bash_array(setup, "CENTRAL_UNITS")) | set(bash_array(setup, "COMMON_UNITS"))
+    assert updated == installed, f"only one mode installs: {sorted(updated ^ installed)}"
+    assert "ci-observe-mcp.container" in installed
+
+
+def test_every_ci_observe_timer_runs_after_both_central_modes():
+    """A timer copied but never enabled never runs, and nothing says so."""
+    update = update_central_block()
+    started = set(bash_array(SCRIPT.read_text(), "CENTRAL_SERVICES"))
+    for timer in sorted(path.name for path in TIMERS.glob("ci-observe-*.timer")):
+        assert f"systemctl --user enable --now {timer}" in update, f"--update-central does not enable {timer}"
+        assert timer in started, f"--central does not start and enable {timer}"
+
+
+def test_every_container_of_the_exporter_image_runs_its_own_program():
+    """The image's default command is the workflow exporter: a second
+    container without Exec= ran a second exporter (the MCP container did)."""
+    for quadlet in sorted(QUADLETS.glob("*.container")):
+        text = quadlet.read_text()
+        if "Image=localhost/osac-workflow-exporter" not in text or "ContainerName=workflow-exporter\n" in text:
+            continue
+        program = re.search(r"^Exec=/app/(\S+)", text, re.M)
+        assert program, f"{quadlet.name} runs the image's default program, the exporter"
+        assert program.group(1) in mounted_scripts(quadlet), f"{quadlet.name} runs a script it does not mount"
+
+
+def test_the_mcp_container_receives_only_its_own_keys():
+    """The one container the VPN reaches without the fleet's basic auth gets
+    its MCP_* keys from the .env, not the whole file with PRIVATE_GITHUB_TOKEN."""
+    import importlib.util
+    import sys
+
+    spec = importlib.util.spec_from_file_location("ci_observe_mcp_for_setup",
+                                                  MONITORING / "scripts" / "ci_observe_mcp.py")
+    mcp = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = mcp  # its dataclasses resolve their annotations through it
+    spec.loader.exec_module(mcp)
+    text = (QUADLETS / "ci-observe-mcp.container").read_text()
+    container = text.split("\n[Container]\n", 1)[1].split("\n[Service]\n", 1)[0]
+    service = text.split("\n[Service]\n", 1)[1]
+    assert "EnvironmentFile=" not in container
+    assert "EnvironmentFile=%h/.monitoring-server/.env" in service
+    passed = set(re.findall(r"--env (\w+)", container))
+    assert set(mcp.Config.REQUIRED) <= passed
+    assert "PRIVATE_GITHUB_TOKEN" not in passed

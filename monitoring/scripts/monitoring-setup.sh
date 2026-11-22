@@ -285,6 +285,28 @@ enable_units() {
     done
 }
 
+# Start (or restart) the ci-observe MCP server, but only with its secrets:
+# it refuses to run without them (fail fast, with the list of what is
+# missing). Saying so here beats a container restarting every 30 seconds
+# against an empty .env. Used by --central and --update-central alike.
+start_mcp_if_configured() {
+    local mcp_missing="" key
+    for key in MCP_GITHUB_CLIENT_ID MCP_GITHUB_CLIENT_SECRET MCP_GRAFANA_URL \
+               MCP_GRAFANA_SERVICE_TOKEN MCP_SESSION_SECRET MCP_EXTERNAL_URL; do
+        grep -q "^${key}=" "${MONITORING_HOME}/.env" 2>/dev/null || mcp_missing="${mcp_missing} ${key}"
+    done
+    if [[ -n "${mcp_missing}" ]]; then
+        echo "  WARNING: ci-observe-mcp.service is NOT started:${mcp_missing}" >&2
+        echo "           missing from ${MONITORING_HOME}/.env. Add them (see the module" >&2
+        echo "           docstring of monitoring/scripts/ci_observe_mcp.py), then run:" >&2
+        echo "           systemctl --user restart ci-observe-mcp.service" >&2
+        systemctl --user stop ci-observe-mcp.service 2>/dev/null || true
+    else
+        echo "  Restarting ci-observe-mcp.service ..."
+        systemctl --user restart ci-observe-mcp.service
+    fi
+}
+
 # Deploy the repo's Caddyfile, rendering the ci-observe OTLP ingest vhost's
 # CI_OBSERVE_OTLP_HASH placeholder (a credential, never committed) into a real
 # bcrypt hash. The hash comes, in priority order, from:
@@ -745,27 +767,10 @@ if [[ "${MODE}" == "update-central" ]]; then
         echo "  Restarting ${svc} ..."
         systemctl --user restart "${svc}"
     done
-    # The MCP server starts only with its secrets: it refuses to run
-    # without them (fail fast, with the list of what is missing). Saying
-    # so here beats a container restarting every 30 seconds against an
-    # empty .env.
-    mcp_missing=""
-    for key in MCP_GITHUB_CLIENT_ID MCP_GITHUB_CLIENT_SECRET MCP_GRAFANA_URL \
-               MCP_GRAFANA_SERVICE_TOKEN MCP_SESSION_SECRET MCP_EXTERNAL_URL; do
-        grep -q "^${key}=" "${MONITORING_HOME}/.env" 2>/dev/null || mcp_missing="${mcp_missing} ${key}"
-    done
-    if [[ -n "${mcp_missing}" ]]; then
-        echo "  WARNING: ci-observe-mcp.service is NOT started:${mcp_missing}" >&2
-        echo "           missing from ${MONITORING_HOME}/.env. Add them (see the module" >&2
-        echo "           docstring of monitoring/scripts/ci_observe_mcp.py), then run:" >&2
-        echo "           systemctl --user restart ci-observe-mcp.service" >&2
-        systemctl --user stop ci-observe-mcp.service 2>/dev/null || true
-    else
-        echo "  Restarting ci-observe-mcp.service ..."
-        systemctl --user restart ci-observe-mcp.service
-    fi
+    start_mcp_if_configured
     systemctl --user restart service-health-textfile.timer
     systemctl --user enable --now ci-observe-trends.timer
+    systemctl --user enable --now ci-observe-logs.timer
     systemctl --user enable --now ci-observe-prs.timer
     systemctl --user enable --now ci-observe-spans.timer
     systemctl --user enable --now ci-observe-audit.timer
@@ -920,6 +925,18 @@ cp "${MONITORING_REPO_DIR}/scripts/ci_observe_audit.py" \
    "${MONITORING_HOME}/scripts/ci_observe_audit.py"
 chmod +x "${MONITORING_HOME}/scripts/ci_observe_audit.py"
 info "Installed ci_observe_audit.py"
+# The artifact-log rollup (ci-observe-logs.timer). workflow-exporter.container
+# bind-mounts it, and podman refuses a missing mount source: without this a
+# first install has no exporter.
+cp "${MONITORING_REPO_DIR}/scripts/ci_observe_logs.py" \
+   "${MONITORING_HOME}/scripts/ci_observe_logs.py"
+chmod +x "${MONITORING_HOME}/scripts/ci_observe_logs.py"
+info "Installed ci_observe_logs.py"
+# The ci-observe MCP server module (ci-observe-mcp.container mounts it).
+cp "${MONITORING_REPO_DIR}/scripts/ci_observe_mcp.py" \
+   "${MONITORING_HOME}/scripts/ci_observe_mcp.py"
+chmod +x "${MONITORING_HOME}/scripts/ci_observe_mcp.py"
+info "Installed ci_observe_mcp.py"
 # The workflow-exporter quadlet bind-mounts these from
 # ${MONITORING_HOME}/scripts, and workflow-exporter.py imports them at load.
 # A first install must copy them or the container cannot start.
@@ -961,6 +978,7 @@ CENTRAL_UNITS=(
     "workflow-exporter.container"
     "caddy.container"
     "ci-observe-tempo210.container"
+    "ci-observe-mcp.container"
 )
 
 for unit in "${COMMON_UNITS[@]}"; do
@@ -1016,6 +1034,7 @@ fi
 systemctl --user daemon-reload
 if [[ "${MODE}" == "central" ]]; then
     systemctl --user enable ci-observe-trends.timer
+    systemctl --user enable ci-observe-logs.timer
     systemctl --user enable ci-observe-prs.timer
     systemctl --user enable ci-observe-spans.timer
     systemctl --user enable ci-observe-audit.timer
@@ -1048,6 +1067,7 @@ CENTRAL_SERVICES=(
     "ci-observe-logs.timer"
     "ci-observe-prs.timer"
     "ci-observe-spans.timer"
+    "ci-observe-audit.timer"
 )
 
 for svc in "${COMMON_SERVICES[@]}"; do
@@ -1060,6 +1080,8 @@ if [[ "${MODE}" == "central" ]]; then
         echo "  Starting ${svc} ..."
         systemctl --user start "${svc}"
     done
+    # Not in CENTRAL_SERVICES: it starts only once its secrets are in .env.
+    start_mcp_if_configured
 fi
 
 # Wait for containers to be running

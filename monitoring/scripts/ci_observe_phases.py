@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 from datetime import UTC, datetime
 from urllib.parse import quote
@@ -646,14 +647,20 @@ AUDIT_LATE_HOURS = 36
 
 
 def read_audit_summary(path: str) -> dict | None:
-    """The summary block of the last check, or None when there is none or
-    the file cannot be read."""
+    """The summary block of the last check; None when no check has written
+    one yet. A file that exists but cannot be read or holds no summary is
+    {"unreadable": reason}: a broken result is not "not checked yet"."""
     try:
         with open(path, encoding="utf-8") as handle:
-            summary = json.load(handle).get("summary")
-    except (OSError, ValueError, AttributeError):
+            document = json.load(handle)
+    except FileNotFoundError:
         return None
-    return summary if isinstance(summary, dict) else None
+    except (OSError, ValueError) as error:
+        return {"unreadable": f"{os.path.basename(path)} could not be read: {error}"}
+    summary = document.get("summary") if isinstance(document, dict) else None
+    if not isinstance(summary, dict):
+        return {"unreadable": f"{os.path.basename(path)} holds no summary"}
+    return summary
 
 
 def _audit_test_notes(tests: dict, when: str) -> list[str]:
@@ -690,6 +697,11 @@ def audit_lines(summary: dict | None, now: datetime, part: str) -> tuple[str, li
     """(source, notes) for one page: the line next to "Data as of" and what
     the check found, for "Missing or partial data". part is "e2e" for the run
     pages and "prs" for the Pull requests page."""
+    if summary and summary.get("unreadable"):
+        reason = summary["unreadable"]
+        return (f"The check against GitHub cannot be read ({reason})",
+                [f"the result of the daily check against GitHub cannot be read ({reason}), so nothing is known"
+                 " about how this page compares with GitHub"])
     block = (summary or {}).get(part)
     checked = parse_time((summary or {}).get("checked_at"))
     if not block or checked is None:
@@ -725,7 +737,7 @@ def audit_lines(summary: dict | None, now: datetime, part: str) -> tuple[str, li
                        f"{tests.get('runs', 0):,} suite runs that ran their tests")
             notes.extend(_audit_test_notes(tests, when))
         return source, notes
-    merged = "matches" if block.get("merged_ok") else "differs"
+    merged = {True: "matches", False: "differs"}.get(block.get("merged_ok"), "was not checked")
     source = (f"Checked against GitHub {when}: {block.get('sample', 0)} sampled merged pull requests, "
               f"{block.get('sample_differ', 0)} differ; the merged count {merged}")
     if block.get("sample_differ"):

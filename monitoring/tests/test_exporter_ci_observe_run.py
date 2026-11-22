@@ -19,6 +19,7 @@ import json
 import sys
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from http.server import ThreadingHTTPServer
@@ -524,7 +525,7 @@ class TestFailedTestsErrors:
         seed_direct_run(evidence)
         nothing_either_place(github)
         monkeypatch.setattr(evidence, "_logs_indexed", lambda run_id: True)
-        monkeypatch.setattr(evidence, "_indexed_error_lines", lambda run_id: [
+        monkeypatch.setattr(evidence, "_indexed_error_lines", lambda run_id, suite="": [
             {"signature": "unable to read tree <id>", "kind": "aap-jobs",
              "line": "fatal: unable to read tree (9b17fa51)", "ts": "1795273933000000000"},
         ])
@@ -541,11 +542,43 @@ class TestFailedTestsErrors:
         nothing_either_place(github)
         monkeypatch.setattr(evidence, "_logs_indexed", lambda run_id: False)
         asked = []
-        monkeypatch.setattr(evidence, "_indexed_error_lines", lambda run_id: asked.append(run_id))
+        monkeypatch.setattr(evidence, "_indexed_error_lines", lambda run_id, suite="": asked.append(run_id))
 
         refused(evidence)
 
         assert asked == [], "Loki is not asked for a run the rollup never recorded"
+
+    def test_the_indexed_error_lines_are_asked_by_metadata_over_the_runs_span(self, evidence, wfe, monkeypatch):
+        """The rollup keeps the run and the signature in structured metadata:
+        they are filters after the selector (matching the older lines that
+        carried them as labels too), and the run's own span bounds the
+        query instead of 29 days of every artifact stream."""
+        seed_direct_run(evidence, updated_at="2026-10-10T11:30:00Z")
+        asked = []
+
+        class Answer:
+            ok = True
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {"data": {"result": [
+                    {"stream": {"source": "artifact", "suite": "vmaas", "kind": "error"},
+                     "values": [["1760090000000000000", "fatal: new",
+                                 {"structuredMetadata": {"signature": "new <id>"}}]]},
+                    {"stream": {"source": "artifact", "run_id": str(RUN_ID), "signature": "old <id>"},
+                     "values": [["1760089000000000000", "fatal: old"]]},
+                ]}}
+
+        monkeypatch.setattr(wfe.requests, "get", lambda url, timeout=None: asked.append(url) or Answer())
+        lines = evidence._indexed_error_lines(str(RUN_ID), suite="vmaas")
+        query = urllib.parse.unquote(asked[0])
+        assert f'{{source="artifact", suite="vmaas"}} | run_id="{RUN_ID}" | signature!=""' in query
+        start = int(query.split("start=")[1].split("&")[0])
+        end = int(query.split("end=")[1].split("&")[0])
+        # 10:00 to 11:30 with two hours of slack each side.
+        assert (start, end) == (int((1791626400 - 7200) * 1e9), int((1791631800 + 7200) * 1e9))
+        assert [line["signature"] for line in lines] == ["new <id>", "old <id>"]
 
     def test_no_token(self, exporter, github):
         seed_direct_run(exporter)

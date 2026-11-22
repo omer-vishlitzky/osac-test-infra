@@ -153,6 +153,13 @@ RECONCILE_MIN_RATE_LIMIT = int(os.getenv("RECONCILE_MIN_RATE_LIMIT", "1000"))
 GAP_CHECK_INTERVAL = int(os.getenv("GAP_CHECK_INTERVAL", "3600"))
 GAP_CHECK_MIN_RATE_LIMIT = int(os.getenv("GAP_CHECK_MIN_RATE_LIMIT", "2500"))
 GAP_CHECK_VERIFIES_PER_PASS = int(os.getenv("GAP_CHECK_VERIFIES_PER_PASS", "4"))
+# The count proves every run is stored, not that it is current: a re-run
+# keeps its id and its created_at, so a run re-run after the reconciliation's
+# window would keep its old attempt and result. Each gap-check pass therefore
+# lists this many (repo, day) pairs whole, the least recently swept first,
+# and re-stores every run whose GitHub attempt is newer than the stored one:
+# with two repos and 29 days, each day is swept about once a day.
+GAP_CHECK_ATTEMPT_SWEEPS_PER_PASS = int(os.getenv("GAP_CHECK_ATTEMPT_SWEEPS_PER_PASS", "3"))
 
 # ---------------------------------------------------------------------------
 # Prometheus metrics
@@ -239,6 +246,11 @@ gap_check_skipped = Counter(
     "Gap-check passes skipped because the shared GitHub budget was below GAP_CHECK_MIN_RATE_LIMIT",
     ["org"],
 )
+gap_check_attempts_refreshed = Counter(
+    "github_actions_gap_check_attempts_refreshed_total",
+    "Runs the gap check's attempt sweep found re-run on GitHub after they were stored, and stored again",
+    ["org", "repo"],
+)
 gap_check_last_success = Gauge(
     "github_actions_gap_check_last_success",
     "Unix time of the last gap-check pass that got an answer for every day of every repo",
@@ -247,8 +259,9 @@ gap_check_last_success = Gauge(
 store_last_success = Gauge(
     "ci_observe_store_last_success",
     "Unix time of the last success of each ci-observe store: jobs a finished poll cycle, "
-    "trends and spans their last rollup pass, prs the end of the last fully covered window, "
-    "audit the daily check. A store that cannot be read keeps its last value and ages",
+    "trends, spans and logs their last rollup pass, prs the end of the last fully covered window, "
+    "audit the daily check. A store that cannot be read keeps its last value and ages; one never "
+    "read since the exporter started has none",
     ["org", "store"],
 )
 
@@ -1560,6 +1573,20 @@ class WorkflowExporter:
                     state TEXT NOT NULL,
                     error TEXT NOT NULL DEFAULT '',
                     checked_at TEXT NOT NULL,
+                    PRIMARY KEY (repo, day)
+                )
+            """)
+            # One row per (repo, day) the attempt sweep listed whole: when,
+            # how many runs GitHub listed, how many had a newer attempt than
+            # the stored one and were stored again, and why a sweep failed.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS attempt_sweeps (
+                    repo TEXT NOT NULL,
+                    day TEXT NOT NULL,
+                    swept_at TEXT NOT NULL,
+                    listed INTEGER,
+                    refreshed INTEGER,
+                    error TEXT NOT NULL DEFAULT '',
                     PRIMARY KEY (repo, day)
                 )
             """)
@@ -3399,11 +3426,12 @@ class WorkflowExporter:
                 missing.extend(run_id for run_id in batch if run_id not in present)
         return missing
 
-    def _list_window_runs(self, repo, since_dt, until_dt):
+    def _list_window_runs(self, repo, since_dt, until_dt, keep_runs=False):
         """(ids, dynamic) of the completed runs GitHub lists for
         [since_dt, until_dt), splitting any window whose total_count would
         be truncated by GitHub's ~1000-result list cap, so every run of the
-        window is seen. (None, reason) when GitHub did not answer."""
+        window is seen. With keep_runs the first item is the run objects
+        instead of their ids. (None, reason) when GitHub did not answer."""
         since_str = since_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
         until_str = until_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
         probe = self._get(f"{API_URL}/repos/{ORG}/{repo}/actions/runs"
@@ -3417,10 +3445,10 @@ class WorkflowExporter:
             return None, f"HTTP {probe.status_code}: the answer named no total_count"
         if total_count > self.BACKFILL_SAFE_RESULT_LIMIT and (until_dt - since_dt) > timedelta(hours=1):
             mid = since_dt + (until_dt - since_dt) / 2
-            first = self._list_window_runs(repo, since_dt, mid)
+            first = self._list_window_runs(repo, since_dt, mid, keep_runs)
             if first[0] is None:
                 return first
-            second = self._list_window_runs(repo, mid, until_dt)
+            second = self._list_window_runs(repo, mid, until_dt, keep_runs)
             if second[0] is None:
                 return second
             return first[0] + second[0], first[1] + second[1]
@@ -3431,7 +3459,7 @@ class WorkflowExporter:
             if run.get("event") in WorkflowExporter.IGNORED_EVENTS:
                 dynamic += 1
             else:
-                ids.append(run["id"])
+                ids.append(run if keep_runs else run["id"])
         url = probe.links.get("next", {}).get("url")
         while url:
             page = self._get(url)
@@ -3444,7 +3472,7 @@ class WorkflowExporter:
                 if run.get("event") in WorkflowExporter.IGNORED_EVENTS:
                     dynamic += 1
                 else:
-                    ids.append(run["id"])
+                    ids.append(run if keep_runs else run["id"])
             url = page.links.get("next", {}).get("url")
         return ids, dynamic
 
@@ -3464,6 +3492,63 @@ class WorkflowExporter:
             self._backfill_range(repo, day_start, day_start + timedelta(days=1), wait=False)
             missing = self._missing_run_ids(ids)
         return dynamic, missing
+
+    def _sweep_attempts(self, repos, days, now):
+        """List the least recently swept (repo, day) pairs whole and store
+        again every run GitHub has a newer attempt of (see
+        GAP_CHECK_ATTEMPT_SWEEPS_PER_PASS). Returns how many runs were
+        refreshed; a day GitHub would not list is recorded with its error
+        and swept again first next time."""
+        candidates = [(repo, day) for repo in repos for day in days]
+        if not candidates:
+            return 0
+        with self._db() as conn:
+            swept = {(row["repo"], row["day"]): (row["swept_at"] if not row["error"] else "")
+                     for row in conn.execute("SELECT repo, day, swept_at, error FROM attempt_sweeps")}
+        candidates.sort(key=lambda pair: (swept.get(pair, ""), pair[1]))
+        refreshed_total = 0
+        for repo, day in candidates[:GAP_CHECK_ATTEMPT_SWEEPS_PER_PASS]:
+            day_start = datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            runs, error = self._list_window_runs(repo, day_start, day_start + timedelta(days=1), keep_runs=True)
+            stamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+            if runs is None:
+                logger.error("Attempt sweep of %s %s could not list the day: %s", repo, day, error)
+                self._record_sweep(repo, day, stamp, None, None, error)
+                continue
+            stored = self._stored_attempts([run["id"] for run in runs])
+            refreshed = 0
+            for run in runs:
+                attempt = stored.get(run["id"])
+                if attempt is None or (run.get("run_attempt") or 1) <= attempt:
+                    continue
+                if self._process_completed_run(repo, run):
+                    refreshed += 1
+            if refreshed:
+                gap_check_attempts_refreshed.labels(org=ORG, repo=repo).inc(refreshed)
+                logger.info("Attempt sweep of %s %s stored %d re-run(s) again", repo, day, refreshed)
+            self._record_sweep(repo, day, stamp, len(runs), refreshed, "")
+            refreshed_total += refreshed
+        return refreshed_total
+
+    def _stored_attempts(self, ids):
+        """{run id: stored run_attempt} of the listed runs that have a row."""
+        attempts = {}
+        with self._db() as conn:
+            for start in range(0, len(ids), 500):
+                batch = [int(run_id) for run_id in ids[start:start + 500]]
+                marks = ",".join("?" * len(batch))
+                for row in conn.execute(f"SELECT id, run_attempt FROM jobs WHERE id IN ({marks})", batch):
+                    attempts[row[0]] = row[1] or 1
+        return attempts
+
+    def _record_sweep(self, repo, day, swept_at, listed, refreshed, error):
+        with self._db() as conn:
+            conn.execute(
+                "INSERT INTO attempt_sweeps (repo, day, swept_at, listed, refreshed, error) VALUES (?, ?, ?, ?, ?, ?)"
+                " ON CONFLICT(repo, day) DO UPDATE SET swept_at=excluded.swept_at, listed=excluded.listed,"
+                " refreshed=excluded.refreshed, error=excluded.error",
+                (repo, day, swept_at, listed, refreshed, error),
+            )
 
     def _gap_check_if_due(self, repos, now=None):
         """Once an hour, prove the job history complete over the whole
@@ -3529,6 +3614,7 @@ class WorkflowExporter:
                 self._record_day_check(repo, day, expected=expected,
                                        adjustment=max(0, expected - stored), stored=stored,
                                        missing=0, state="ok")
+        self._sweep_attempts(repos, days, now)
         self._export_gap_check_gauges(repos)
         if answered_all:
             gap_check_last_success.labels(org=ORG).set(time.time())
@@ -3545,7 +3631,7 @@ class WorkflowExporter:
             if row["repo"] in by_repo and row["state"] in WorkflowExporter.GAP_CHECK_STATES:
                 by_repo[row["repo"]][row["state"]] = [row["days"], row["missing"]]
         for repo, states in by_repo.items():
-            for state, (days, missing) in states.items():
+            for state, (days, _missing) in states.items():
                 gap_check_days.labels(org=ORG, repo=repo, state=state).set(days)
             gap_check_missing.labels(org=ORG, repo=repo).set(
                 sum(missing for _, missing in states.values()))
@@ -3998,9 +4084,12 @@ class WorkflowExporter:
 
     def _update_store_freshness(self):
         """Pin the last success of every ci-observe store, so a stalled
-        pass is an alert, not a quiet gap (see CiObserveStoreStale). A
+        pass is an alert, not a quiet gap (see CiObserveHourlyStoreStale). A
         store that cannot be read keeps its last value: the gauge ages and
-        the alert fires. The failure is logged once per distinct reason."""
+        the alert fires. A store that could not be read since the exporter
+        started has no value at all, which no age comparison sees;
+        CiObserveStoreUnknown alerts on the absent gauge. The failure is
+        logged once per distinct reason."""
         store_last_success.labels(org=ORG, store="jobs").set(time.time())
         self._pin_store_freshness(
             "trends", self._read_store_scalar(
@@ -4010,6 +4099,10 @@ class WorkflowExporter:
             "spans", self._read_store_scalar(
                 os.path.join(CACHE_DIR, "trends.db"),
                 "SELECT MAX(finished_at) FROM rollup_passes WHERE job = 'spans'"))
+        self._pin_store_freshness(
+            "logs", self._read_store_scalar(
+                os.path.join(CACHE_DIR, "trends.db"),
+                "SELECT MAX(finished_at) FROM rollup_passes WHERE job = 'logs'"))
         self._pin_store_freshness(
             "prs", self._read_store_scalar(
                 os.path.join(CACHE_DIR, "prs.db"),
@@ -5244,7 +5337,7 @@ class WorkflowExporter:
             # lines; asking Loki for anything else is a query for nothing.
             if match is None or not self._logs_indexed(match.group(1)):
                 raise
-            lines = self._indexed_error_lines(match.group(1))
+            lines = self._indexed_error_lines(match.group(1), suite=capture_id.split("-", 1)[0])
             if not lines:
                 raise
             return {
@@ -5259,19 +5352,49 @@ class WorkflowExporter:
                 ],
             }
 
-    def _indexed_error_lines(self, run_id, limit=20):
+    def _run_span(self, run_id):
+        """(first created_at, last updated_at) of a run's stored rows, or
+        None when the job history no longer holds it."""
+        try:
+            with self._db() as conn:
+                row = conn.execute(
+                    "SELECT MIN(created_at), MAX(updated_at) FROM jobs WHERE run_id = ? OR id = ?",
+                    (str(run_id), int(run_id) if str(run_id).isdigit() else -1)).fetchone()
+        except sqlite3.Error:
+            return None
+        if not row:
+            return None
+        start, end = ci_observe_phases.parse_time(row[0]), ci_observe_phases.parse_time(row[1])
+        return (start, end) if start and end else None
+
+    def _indexed_error_lines(self, run_id, limit=20, suite=""):
         """The run's indexed artifact error lines from Loki, newest first:
         [{signature, kind, line, ts}]. [] when nothing was indexed for the
         run. None when Loki refused: "no lines" is a fact, a refusal is
-        not, and the caller keeps the original error then."""
-        query = quote(f'{{source="artifact", run_id="{run_id}", signature!=""}}')
-        # The whole retention, just under Loki's 30d1h query-length limit:
-        # a run's lines carry the run's own timestamps, so a default
-        # (last hour) range would answer nothing for any run older than
-        # an hour, and a range over the limit is a 400.
-        start = int((time.time() - 29 * 86400) * 1e9)
+        not, and the caller keeps the original error then.
+
+        The run and the signature are structured metadata (the rollup keeps
+        stream labels few), so they are filters after the selector; the
+        same filters match the older lines that carried them as labels. The
+        rollup stamps every line inside the run (an hour of slack each
+        side), so the run's own time range finds them all and keeps the
+        query to that range of chunks."""
+        selector = 'source="artifact"'
+        if suite in ci_observe_phases.SUITES:
+            selector += f', suite="{suite}"'
+        query = quote(f'{{{selector}}} | run_id="{run_id}" | signature!=""')
+        span = self._run_span(run_id)
+        now_ns = int(time.time() * 1e9)
+        if span:
+            start = int((span[0] - timedelta(hours=2)).timestamp() * 1e9)
+            end = min(int((span[1] + timedelta(hours=2)).timestamp() * 1e9), now_ns)
+        else:
+            # The job history no longer holds the run: the whole retention,
+            # just under Loki's 30d1h query-length limit (a range over it is
+            # a 400).
+            start, end = int((time.time() - 29 * 86400) * 1e9), now_ns
         url = (f"{self._captures.loki_url}/loki/api/v1/query_range?query={query}"
-               f"&limit={limit}&start={start}&end={int(time.time() * 1e9)}")
+               f"&limit={limit}&start={start}&end={end}&direction=backward")
         try:
             response = requests.get(url, timeout=10)
         except requests.exceptions.RequestException as error:
@@ -5288,12 +5411,18 @@ class WorkflowExporter:
         rows = []
         for stream in result if isinstance(result, list) else []:
             labels = stream.get("stream") or {}
-            for when, line in stream.get("values") or []:
+            for value in stream.get("values") or []:
+                if not isinstance(value, list) or len(value) < 2:
+                    continue
+                # Loki answers structured metadata among the stream's labels,
+                # or -- when asked to categorize -- as the entry's third item.
+                extra = value[2] if len(value) > 2 and isinstance(value[2], dict) else {}
+                extra = extra.get("structuredMetadata", extra) if isinstance(extra, dict) else {}
                 rows.append({
-                    "signature": labels.get("signature") or "",
-                    "kind": labels.get("kind") or "",
-                    "line": line[:500],
-                    "ts": when,
+                    "signature": labels.get("signature") or extra.get("signature") or "",
+                    "kind": labels.get("kind") or extra.get("kind") or "",
+                    "line": str(value[1])[:500],
+                    "ts": value[0],
                 })
         rows.sort(key=lambda row: row["ts"], reverse=True)
         return rows[:limit]
