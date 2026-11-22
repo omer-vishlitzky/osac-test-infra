@@ -1644,7 +1644,9 @@ print_next_steps() {
     echo
     echo "Install OSAC into the vcluster by running this from the osac"
     echo "monorepo's osac-installer directory. AAP_LICENSE_FILE is required"
-    echo "for PLATFORM=openshift; point it at the AAP license zip:"
+    echo "for PLATFORM=openshift; point it at the AAP license zip. After"
+    echo "the install, publish the run's routes with"
+    echo "scripts/vcluster-publish-routes.sh (design step 6):"
     echo
     echo "  KUBECONFIG=${VCLUSTER_KUBECONFIG} \\"
     echo "  CLUSTER_DOMAIN=${OUTER_DOMAIN} \\"

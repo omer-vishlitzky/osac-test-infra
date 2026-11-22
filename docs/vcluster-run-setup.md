@@ -531,9 +531,12 @@ already exists).
   label (`osac.openshift.io/instance=<run>`); deleting by that label is
   follow-up work, as is the OSAC-side labeling for the objects that do not
   carry it yet.
-- The run routes (`fulfillment-api-<run>.<domain>` and friends) are not
-  created yet; the overlay and the printed command carry the hostnames so
-  the wiring is stable once they are.
+- The run routes are published by `scripts/vcluster-publish-routes.sh`
+  after the install (design step 6): passthrough routes for the
+  fulfillment APIs under the run's hostnames, an edge route for the UI,
+  all in the host namespace so the teardown removes them with it. The
+  vcluster API itself still has no route: reaching it from outside the
+  outer cluster's network needs a port-forward until that lands.
 - The Keycloak steps mirror the password-setting, controller role-grant
   and registration-policy parts of the osac-infra keycloak-set-passwords
   hook. The hook's two MCP steps are deliberately not mirrored: the MCP
