@@ -2,7 +2,9 @@
 # vcluster-run-teardown.sh -- remove one OSAC E2E run's objects from the
 # shared outer cluster, the counterpart of scripts/vcluster-run-setup.sh.
 #
-# The teardown deletes, in order:
+# The teardown first disables the run's periodic AAP schedules (otherwise a
+# dead run keeps launching error jobs in the shared AAP every few minutes),
+# then deletes, in order:
 #   1. the run's vcluster Helm release (before the namespace, so the
 #      chart's cluster-scoped RBAC is removed by helm itself);
 #   2. namespace vc-<run>, which held the vcluster's pods and copied
@@ -19,8 +21,9 @@
 # the run setup and the vcluster create, and fails loudly otherwise.
 #
 # Known gaps, deliberate:
-#   - The run's AAP organization is left in place. Nothing else names it,
-#     and deleting an organization the shared AAP still references is more
+#   - The run's AAP organization is left in place, and so are its job
+#     templates. Only its schedules are disabled (see above), because
+#     deleting an organization the shared AAP still references is more
 #     destructive than leaving it for the nightly fresh outer cluster.
 #   - Objects the TESTS create in the outer cluster through OSAC (subnet
 #     namespaces and ClusterUserDefinedNetworks, VirtualMachines,
@@ -36,6 +39,9 @@
 #                       the same value the setup was given)
 #   --keycloak-url URL  outer Keycloak base URL (default:
 #                       https://keycloak.keycloak.svc.cluster.local)
+#   --aap-instance NAME        shared AAP instance name (default: osac-aap)
+#   --aap-namespace NAMESPACE  namespace of the shared AAP instance
+#                              (default: osac)
 #   -h, --help          show this help
 #
 # Environment:
@@ -54,6 +60,14 @@ KEYCLOAK_NAMESPACE="keycloak"
 KEYCLOAK_ADMIN_CREDENTIALS_SECRET="keycloak-admin-credentials"
 KEYCLOAK_URL_DEFAULT="https://keycloak.keycloak.svc.cluster.local"
 CERT_MANAGER_NAMESPACE="cert-manager"
+
+# The shared AAP whose schedules the run leaves behind. The defaults mirror
+# scripts/vcluster-run-setup.sh (--aap-instance/--aap-namespace): the
+# operator names the controller route and the admin password secret after
+# the instance, and the run's org, templates and schedules after the run.
+AAP_INSTANCE_DEFAULT="osac-aap"
+AAP_NAMESPACE_DEFAULT="osac"
+AAP_ADMIN_USERNAME="admin"
 
 # The ClusterOrder namespace on the outer cluster, created by the run setup
 # when absent (OSAC-8054). Deleted only when this run created it: the
@@ -76,6 +90,9 @@ CLUSTER_SCOPED_SCAN_KINDS=("namespace" "clusterrole" "clusterrolebinding")
 RUN_NAME=""
 OUTPUT_DIR=""
 KEYCLOAK_URL="${KEYCLOAK_URL_DEFAULT}"
+AAP_INSTANCE="${AAP_INSTANCE_DEFAULT}"
+AAP_NAMESPACE="${AAP_NAMESPACE_DEFAULT}"
+AAP_ADMIN_PASSWORD=""
 
 HOST_NAMESPACE=""
 KEYCLOAK_CA_FILE=""
@@ -93,14 +110,18 @@ Options:
                       the same value the setup was given)
   --keycloak-url URL  outer Keycloak base URL (default:
                       https://keycloak.keycloak.svc.cluster.local)
+  --aap-instance NAME       shared AAP instance name (default: osac-aap)
+  --aap-namespace NAMESPACE namespace of the shared AAP instance
+                            (default: osac)
   -h, --help          show this help
 
-Deletes the run's vcluster (Helm release, then namespace vc-<run>), its
-orders namespace on the outer cluster when the run created it, its outer
-KafkaUsers and Strimzi secrets, its Keycloak realm and its output files,
-then verifies nothing named after the run remains among the kinds the run
-setup and the vcluster create. The run's AAP organization is left in
-place (known gap). Objects the tests create in the outer cluster are
+Disables the run's AAP schedules, then deletes the run's vcluster (Helm
+release, then namespace vc-<run>), its orders namespace on the outer
+cluster when the run created it, its outer KafkaUsers and Strimzi
+secrets, its Keycloak realm and its output files, then verifies nothing
+named after the run remains among the kinds the run setup and the
+vcluster create. The run's AAP organization and job templates are left
+in place (known gap). Objects the tests create in the outer cluster are
 not touched (known gap, label-based deletion is the follow-up).
 EOF
 }
@@ -129,6 +150,16 @@ read_secret_key() {
 
 keycloak_curl() {
     curl --cacert "${KEYCLOAK_CA_FILE}" "$@"
+}
+
+# The shared AAP's controller API, reached through its outer route. The
+# route's certificate is signed by the outer cluster's ingress CA, which
+# this script does not copy (only the CI CA that signs the service URLs
+# is copied), so the connection is not verified: the request carries the
+# shared AAP's admin password over the cluster's own route.
+aap_curl() {
+    curl -sS -k --connect-timeout 10 --max-time 60 \
+        -u "${AAP_ADMIN_USERNAME}:${AAP_ADMIN_PASSWORD}" "$@"
 }
 
 keycloak_admin_token() {
@@ -192,6 +223,97 @@ wait_until_absent() {
 ###############################################################################
 # Teardown steps
 ###############################################################################
+
+# Disable the run's periodical AAP schedules through the shared AAP's
+# controller API. The run's organization and job templates stay (known
+# gap), but the three schedules the config-as-code role creates in it --
+# <run>-sync every 10 minutes, <run>-config-as-code hourly,
+# <run>-publish-templates every 30 minutes -- keep launching jobs against a
+# vcluster that no longer exists, and every launch ends as an error job in
+# the shared AAP. PATCH {"enabled": false} stops that without deleting
+# anything the shared AAP still references.
+#
+# Only schedules whose name starts with "<run>-" are touched: the listing
+# is a name substring match, so this prefix test is what keeps run vcrun1
+# away from run vcrun10's schedules.
+#
+# Best effort on purpose: an unreachable shared AAP, a missing admin
+# password secret, or one schedule that cannot be updated must not fail the
+# teardown or stop it from deleting the run's other objects. Each such
+# failure is a warning that names what is still armed.
+disable_aap_schedules() {
+    local route_host password_b64 listing url
+    route_host="$(kubectl --namespace "${AAP_NAMESPACE}" get route "${AAP_INSTANCE}" \
+        -o jsonpath='{.spec.host}' 2>/dev/null)" || true
+    if [[ -z "${route_host}" ]]; then
+        echo "WARNING: cannot read route ${AAP_INSTANCE} in namespace ${AAP_NAMESPACE}; the AAP schedules of run ${RUN_NAME} stay enabled."
+        return
+    fi
+
+    # The AAP operator creates the admin password secret the setup also
+    # checks, <instance>-admin-password, with the gateway admin's password
+    # under key password.
+    password_b64="$(read_secret_key "${AAP_NAMESPACE}" "${AAP_INSTANCE}-admin-password" password 2>/dev/null)" || true
+    if [[ -z "${password_b64}" ]]; then
+        echo "WARNING: cannot read key password of secret ${AAP_INSTANCE}-admin-password in namespace ${AAP_NAMESPACE}; the AAP schedules of run ${RUN_NAME} stay enabled."
+        return
+    fi
+    AAP_ADMIN_PASSWORD="$(printf '%s' "${password_b64}" | base64 -d)"
+    url="https://${route_host}/api/controller/v2/schedules/"
+
+    if ! listing="$(aap_curl "${url}?name__icontains=${RUN_NAME}&page_size=200")"; then
+        echo "WARNING: cannot list the AAP schedules; the AAP schedules of run ${RUN_NAME} stay enabled."
+        return
+    fi
+
+    local schedule_lines schedule_id schedule_name status
+    local disabled=0 failed=0
+    if ! schedule_lines="$(python3 -c '
+import json
+import sys
+
+prefix = sys.argv[1] + "-"
+try:
+    results = json.load(sys.stdin).get("results", [])
+except ValueError:
+    raise SystemExit("schedule listing is not JSON")
+for item in results:
+    name = item.get("name") or ""
+    if name.startswith(prefix):
+        print("{}\t{}".format(item.get("id", ""), name))
+' "${RUN_NAME}" <<<"${listing}")"; then
+        echo "WARNING: cannot parse the AAP schedule listing; the AAP schedules of run ${RUN_NAME} stay enabled."
+        return
+    fi
+
+    if [[ -z "${schedule_lines}" ]]; then
+        echo "No AAP schedules named ${RUN_NAME}-* in the shared AAP; nothing to disable."
+        return
+    fi
+
+    while IFS=$'\t' read -r schedule_id schedule_name; do
+        [[ -n "${schedule_id}" ]] || continue
+        status="$(aap_curl -o /dev/null -w '%{http_code}' -X PATCH \
+            -H 'Content-Type: application/json' -d '{"enabled": false}' \
+            "${url}${schedule_id}/")" || status=""
+        case "${status}" in
+            200)
+                echo "Disabled AAP schedule ${schedule_name}."
+                disabled=$((disabled + 1))
+                ;;
+            *)
+                echo "WARNING: disabling AAP schedule ${schedule_name} returned HTTP ${status:-no response}; it stays enabled and keeps launching jobs."
+                failed=$((failed + 1))
+                ;;
+        esac
+    done <<<"${schedule_lines}"
+
+    if [[ "${failed}" -gt 0 ]]; then
+        echo "Disabled ${disabled} AAP schedule(s) of run ${RUN_NAME}; ${failed} could not be disabled (see the warnings above)."
+    else
+        echo "Disabled ${disabled} AAP schedule(s) of run ${RUN_NAME}."
+    fi
+}
 
 uninstall_vcluster_release() {
     local existing
@@ -373,9 +495,10 @@ verify_no_run_objects_remain() {
     echo "KafkaUsers, secrets, cluster roles and bindings, Helm releases,"
     echo "Keycloak realm), and the run's output files are deleted. The"
     echo "orders namespace was deleted only if this run created it."
-    echo "Left in place on purpose: the run's AAP organization, and any"
-    echo "objects the tests created in the outer cluster (see the known"
-    echo "gaps in docs/vcluster-run-setup.md)."
+    echo "Left in place on purpose: the run's AAP organization and job"
+    echo "templates (its schedules are disabled above), and any objects the"
+    echo "tests created in the outer cluster (see the known gaps in"
+    echo "docs/vcluster-run-setup.md)."
 }
 
 ###############################################################################
@@ -394,6 +517,16 @@ main() {
             --keycloak-url)
                 [[ $# -ge 2 ]] || die "--keycloak-url needs a value."
                 KEYCLOAK_URL="$2"
+                shift 2
+                ;;
+            --aap-instance)
+                [[ $# -ge 2 ]] || die "--aap-instance needs a value."
+                AAP_INSTANCE="$2"
+                shift 2
+                ;;
+            --aap-namespace)
+                [[ $# -ge 2 ]] || die "--aap-namespace needs a value."
+                AAP_NAMESPACE="$2"
                 shift 2
                 ;;
             -h|--help)
@@ -432,6 +565,11 @@ main() {
     echo "Checking outer cluster connectivity..."
     kubectl get --raw /readyz \
         || die "Cannot reach the outer cluster with KUBECONFIG=${KUBECONFIG}."
+
+    # Before anything else: a run that is being torn down must stop firing
+    # jobs in the shared AAP immediately, even if a later precondition fails
+    # (the Keycloak admin secret is gone, say) and the teardown aborts.
+    disable_aap_schedules
 
     read_keycloak_admin_credentials
     fetch_keycloak_ca
