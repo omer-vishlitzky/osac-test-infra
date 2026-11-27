@@ -73,6 +73,18 @@ cd "${OSAC}/osac-installer"
     helm dependency update charts/osac >/dev/null 2>&1
 ) 9>/tmp/opencode/poc/helm-dep.lock
 
+# Routes BEFORE the install: the console-proxy fetches JWKS from the run's
+# external hostname and blocks helm --wait until the route answers with the
+# backend's certificate. With no route the OpenShift router serves its
+# default certificate and the proxy never becomes ready (fresh-run
+# deadlock). A route pointing at a not-yet-existing service is fine.
+for spec in "fulfillment-api external-api" "fulfillment-internal-api internal-api"; do
+    read -r name port <<<"${spec}"
+    oc -n "vc-${RUN_ARG}" create route passthrough "${name}" \
+        --port="${port}" --service="${name}-x-osac-x-${RUN_ARG}" \
+        --hostname="${name}-${RUN_ARG}.${DOMAIN}" >/dev/null 2>&1 || true
+done
+
 IMAGE_ARGS="
 --set service.images.service.repository=localhost/fulfillment-service
 --set service.images.service.tag=${TAG_FULFILLMENT}
@@ -109,13 +121,14 @@ make install-osac PLATFORM=openshift PROFILE=vcluster-ci NS=osac \
 ${IMAGE_ARGS}" >"${RUN_DIR}/install.log" 2>&1 \
     || echo "WARNING: install returned nonzero; hooks may still have run (check ${RUN_DIR}/install.log)"
 
-# Routes: the vcluster syncer suffixes service names, so publish manually.
+# Routes: created before the install (see above); recreate only if the
+# service name changed (they point at the syncer-suffixed service).
 for spec in "fulfillment-api external-api" "fulfillment-internal-api internal-api"; do
     read -r name port <<<"${spec}"
-    oc -n "vc-${RUN_ARG}" delete route "${name}" --ignore-not-found >/dev/null 2>&1 || true
-    oc -n "vc-${RUN_ARG}" create route passthrough "${name}" \
-        --port="${port}" --service="${name}-x-osac-x-${RUN_ARG}" \
-        --hostname="${name}-${RUN_ARG}.${DOMAIN}" >/dev/null
+    oc -n "vc-${RUN_ARG}" get route "${name}" >/dev/null 2>&1 || \
+        oc -n "vc-${RUN_ARG}" create route passthrough "${name}" \
+            --port="${port}" --service="${name}-x-osac-x-${RUN_ARG}" \
+            --hostname="${name}-${RUN_ARG}.${DOMAIN}" >/dev/null
 done
 phase "install OSAC" "$T"
 
@@ -150,9 +163,19 @@ bao write -namespace="$RUN" auth/jwt/role/lifecycle role_type=jwt \
 BAOEOF
 
 # 3b. Resources the AAP job pods mount (OpenShift conventions the vanilla
-# vcluster lacks, plus the un-prefixed credentials name they expect).
-oc get configmap openshift-service-ca.crt -n osac -o json > "/tmp/svc-ca-${RUN_ARG}.json"
-kubectl --kubeconfig "${KC}" apply -f "/tmp/svc-ca-${RUN_ARG}.json" >/dev/null
+# vcluster lacks, plus the un-prefixed credentials name they expect). The
+# service-ca ConfigMap often already exists (chart/syncer compat objects);
+# apply only when missing, and never carry outer-cluster metadata over —
+# a stale resourceVersion conflicts with an existing object.
+if ! kubectl --kubeconfig "${KC}" get configmap openshift-service-ca.crt -n osac >/dev/null 2>&1; then
+    oc get configmap openshift-service-ca.crt -n osac -o json \
+      | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+d['metadata'] = {'name': d['metadata']['name'], 'namespace': 'osac'}
+json.dump(d, sys.stdout)" \
+      | kubectl --kubeconfig "${KC}" apply -f - >/dev/null
+fi
 kubectl --kubeconfig "${KC}" get secret "${RUN_ARG}-fulfillment-controller-credentials" -n osac -o json \
   | python3 -c "
 import json, sys
