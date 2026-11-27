@@ -1433,8 +1433,15 @@ create_aap_service_account() {
 #
 # The database secret names (<run>-db-config, <run>-db-client-cert,
 # <run>-db-metering-config, <run>-db-metering-client-cert) are derived by
-# the chart from global.instanceId. Do not set aap.organization or
-# aap.templatePrefix here: the chart derives both from global.instanceId.
+# the chart from global.instanceId.
+#
+# operator.aap.organization and operator.aap.templatePrefix are NOT derived
+# from global.instanceId: the operator chart renders OSAC_AAP_ORGANIZATION
+# and OSAC_AAP_TEMPLATE_PREFIX from its values alone, and both default to
+# "osac" (osac-operator/charts/operator/values.yaml; the binary's own
+# fallback is "osac" too). An overlay that left them unset would point this
+# run's job templates and organization at the shared install's, so the
+# overlay below sets both to the run name.
 #
 # global.eventTopicPrefix must stay non-empty. Every osac chart renders the
 # Kafka topic prefix with `default "osac.events."`, and Helm's default treats
