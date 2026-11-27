@@ -36,7 +36,13 @@
 #      vcluster;
 #  10. creates the orders namespace on the outer cluster when absent
 #      (OSAC-8054: remote-mode ClusterOrders need their namespace there);
-#  11. writes the per-run values overlay for `make install-osac` -- the
+#  11. for the b and c suites, provisions the run's virtual bare-metal
+#      hosts through scripts/vcluster-run-bmhs.sh -- the outer cluster's
+#      <run>-hosts namespace and its per-run RBAC, the run's sushy-tools
+#      emulator and VM group on this machine, and the run's BareMetalHosts
+#      (the suites order BareMetalInstances and hosted-cluster workers
+#      against them);
+#  12. writes the per-run values overlay for `make install-osac` -- the
 #      run's ID plus the suite's service toggles from the run name's suite
 #      letter -- and prints the command, plus the path of the vcluster
 #      kubeconfig.
@@ -53,6 +59,9 @@
 #   --recreate                  replace an existing vcluster release
 #   --output-dir PATH           where to write the run's files
 #                               (default: <repo>/.vcluster-runs/RUN_NAME)
+#   --bmh-network NAME          libvirt network the outer SNO node reaches
+#                               (required for b and c runs: their virtual
+#                               bare-metal hosts attach to it)
 #   --keycloak-url URL          outer Keycloak base URL (default:
 #                               https://keycloak.keycloak.svc.cluster.local,
 #                               verified with the CI certificate authority)
@@ -179,6 +188,7 @@ RUN_NAME=""
 REALM_JSON_SOURCE=""
 RECREATE="false"
 OUTPUT_DIR=""
+BMH_NETWORK=""
 KEYCLOAK_URL="${KEYCLOAK_URL_DEFAULT}"
 AAP_INSTANCE="${AAP_INSTANCE_DEFAULT}"
 AAP_NAMESPACE="${AAP_NAMESPACE_DEFAULT}"
@@ -202,6 +212,10 @@ INFERENCE_TOPIC=""            # <run>.metering.inference
 INFERENCE_DLQ_TOPIC=""        # <run>.metering.inference.dlq
 
 HOST_NAMESPACE=""
+# The outer-cluster namespace holding the b/c suites' virtual bare-metal
+# hosts, labelled osac.openshift.io/instance=<run>; scripts/vcluster-run-bmhs.sh
+# creates and removes it, and the overlay passes it as bmf.metal3.namespace.
+BMH_NAMESPACE=""
 VCLUSTER_KUBECONFIG=""
 VALUES_FILE=""
 INSTANCE_VALUES_FILE=""
@@ -232,6 +246,9 @@ Options:
   --recreate                  replace an existing vcluster release
   --output-dir PATH           where to write the run's files
                               (default: <repo>/.vcluster-runs/RUN_NAME)
+  --bmh-network NAME          libvirt network the outer SNO node reaches
+                              (required for b and c runs: their virtual
+                              bare-metal hosts attach to it)
   --keycloak-url URL          outer Keycloak base URL (default:
                               https://keycloak.keycloak.svc.cluster.local,
                               verified with the CI certificate authority)
@@ -251,6 +268,9 @@ DNS label limit. The last letter before the trailing attempt digits is
 the suite letter: v for VMaaS, b for BMaaS, c for CaaS (pr2100v1,
 pr2100b2, nightlyc1); it selects the suite's service toggles in the
 per-run values overlay.
+
+The b and c suites provision virtual bare-metal hosts, so they also need
+--bmh-network: the libvirt network the outer cluster's node reaches.
 EOF
 }
 
@@ -396,6 +416,32 @@ metadata:
     ${INSTANCE_LABEL_KEY}: ${RUN_NAME}
 EOF
     echo "Created namespace ${ORDERS_NAMESPACE} on the outer cluster for the run's ClusterOrders."
+}
+
+###############################################################################
+# The run's virtual bare-metal hosts (b and c suites)
+###############################################################################
+
+# The BMaaS and CaaS suites need BareMetalHosts: the BMaaS tests order
+# BareMetalInstances against them and CaaS gets its bare-metal workers from
+# them. The whole group is per run and lives in scripts/vcluster-run-bmhs.sh,
+# which the run teardown calls with --delete; this script only passes the
+# run's identity and the network the outer node reaches. A failure here
+# stops the setup before the (much longer) vcluster install, and the
+# teardown cleans up whatever was already created.
+#
+# Ironic activation is NOT part of this: .github/scripts/activate-ironic.sh
+# is a one-time outer-cluster ops step, and the BMH script fails loudly when
+# it has not happened.
+setup_run_bmhs() {
+    if [[ "${SUITE}" != "bmaas" && "${SUITE}" != "caas" ]]; then
+        return
+    fi
+    [[ -n "${BMH_NETWORK}" ]] \
+        || die "The ${SUITE} suite provisions virtual bare-metal hosts, so --bmh-network is required: name the libvirt network the outer cluster's node reaches."
+    "${SCRIPT_DIR}/vcluster-run-bmhs.sh" "${RUN_NAME}" \
+        --network "${BMH_NETWORK}" \
+        --output-dir "${OUTPUT_DIR}"
 }
 
 read_outer_dns_ip() {
@@ -1710,6 +1756,9 @@ print_next_steps() {
     echo
     echo "Run the suite with the run's realm and routes:"
     echo "  OSAC_KEYCLOAK_REALM=${RUN_NAME}"
+    if [[ "${SUITE}" == "bmaas" || "${SUITE}" == "caas" ]]; then
+        echo "  OSAC_BMH_NAMESPACE=${BMH_NAMESPACE}"
+    fi
     echo
     echo "The overlay selects the ${SUITE} suite from the run name's suite"
     echo "letter; the suite keys it sets are documented in the vcluster-ci"
@@ -1744,6 +1793,11 @@ main() {
             --output-dir)
                 [[ $# -ge 2 ]] || die "--output-dir needs a value."
                 OUTPUT_DIR="$2"
+                shift 2
+                ;;
+            --bmh-network)
+                [[ $# -ge 2 ]] || die "--bmh-network needs a value."
+                BMH_NETWORK="$2"
                 shift 2
                 ;;
             --keycloak-url)
@@ -1799,6 +1853,7 @@ main() {
     INFERENCE_DLQ_TOPIC="${RUN_NAME}.metering.inference.dlq"
 
     HOST_NAMESPACE="vc-${RUN_NAME}"
+    BMH_NAMESPACE="${RUN_NAME}-hosts"
     OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/.vcluster-runs/${RUN_NAME}}"
     VCLUSTER_KUBECONFIG="${OUTPUT_DIR}/kubeconfig"
     VALUES_FILE="${OUTPUT_DIR}/vcluster-values.yaml"
@@ -1807,6 +1862,7 @@ main() {
     check_all_preconditions
     ensure_orders_namespace
     mkdir -p "${OUTPUT_DIR}"
+    setup_run_bmhs
     render_values
     install_vcluster
     write_vcluster_kubeconfig
