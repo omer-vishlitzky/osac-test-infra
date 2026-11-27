@@ -81,9 +81,10 @@ cd "${OSAC}/osac-installer"
 # backend's certificate. With no route the OpenShift router serves its
 # default certificate and the proxy never becomes ready (fresh-run
 # deadlock). A route pointing at a not-yet-existing service is fine.
-for spec in "fulfillment-api external-api" "fulfillment-internal-api internal-api"; do
-    read -r name port <<<"${spec}"
-    oc -n "vc-${RUN_ARG}" create route passthrough "${name}" \
+# The echo-adapter route feeds the suite's METERING_ADAPTER_URL.
+for spec in "fulfillment-api external-api passthrough" "fulfillment-internal-api internal-api passthrough" "osac-metering-echo-adapter http edge"; do
+    read -r name port term <<<"${spec}"
+    oc -n "vc-${RUN_ARG}" create route "${term}" "${name}" \
         --port="${port}" --service="${name}-x-osac-x-${RUN_ARG}" \
         --hostname="${name}-${RUN_ARG}.${DOMAIN}" >/dev/null 2>&1 || true
 done
@@ -106,6 +107,7 @@ IMAGE_ARGS="
 --set aap.configAsCode.eeImagePull=missing
 --set aap.configAsCode.projectGitUri=https://github.com/omer-vishlitzky/osac
 --set aap.configAsCode.projectGitBranch=${SHA}
+--set aap.hooks.publishPollTimeout=1800
 "
 
 KUBECONFIG="${KC}" \
@@ -126,10 +128,10 @@ ${IMAGE_ARGS}" >"${RUN_DIR}/install.log" 2>&1 \
 
 # Routes: created before the install (see above); recreate only if the
 # service name changed (they point at the syncer-suffixed service).
-for spec in "fulfillment-api external-api" "fulfillment-internal-api internal-api"; do
-    read -r name port <<<"${spec}"
+for spec in "fulfillment-api external-api passthrough" "fulfillment-internal-api internal-api passthrough" "osac-metering-echo-adapter http edge"; do
+    read -r name port term <<<"${spec}"
     oc -n "vc-${RUN_ARG}" get route "${name}" >/dev/null 2>&1 || \
-        oc -n "vc-${RUN_ARG}" create route passthrough "${name}" \
+        oc -n "vc-${RUN_ARG}" create route "${term}" "${name}" \
             --port="${port}" --service="${name}-x-osac-x-${RUN_ARG}" \
             --hostname="${name}-${RUN_ARG}.${DOMAIN}" >/dev/null
 done
