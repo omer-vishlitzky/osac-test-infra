@@ -32,6 +32,28 @@ controlPlane:
         runAsNonRoot: true
         runAsUser: __VCLUSTER_UID__
 
+  distro:
+    k8s:
+      apiServer:
+        extraArgs:
+          # POC fact 6: the OSAC services validate every bearer token against
+          # the issuer of their own pod token. The kube-apiserver default
+          # issuer is https://kubernetes.default.svc.cluster.local, which
+          # resolves from an outer-cluster pod to the OUTER apiserver: that
+          # one does not know the vcluster's keys, so every suite-minted
+          # service-account token is rejected with "token is not valid".
+          # Pinning the issuer to the vcluster API service name (below, in
+          # proxy.extraSANs) keeps the issuer, the JWKS and the certificate
+          # in one place that resolves from both sides.
+          #
+          # The JWKS URI must be pinned too: without it the apiserver
+          # advertises the issuer's discovery at 127.0.0.1:6443, which no
+          # host pod can reach. Live-verified: with both args set,
+          # `kubectl create token` returns tokens whose iss is the service
+          # URL, and the projected pod tokens rotate to match.
+          - --service-account-issuer=https://__VCLUSTER_API_SAN__
+          - --service-account-jwks-uri=https://__VCLUSTER_API_SAN__/openid/v1/jwks
+
   proxy:
     extraSANs:
       # POC fact 5: without this SAN, TLS verification fails for clients that
