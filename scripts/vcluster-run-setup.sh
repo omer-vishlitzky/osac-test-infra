@@ -543,9 +543,11 @@ check_all_preconditions() {
 
 render_values() {
     VCLUSTER_API_SAN="${RUN_NAME}.${HOST_NAMESPACE}.svc.cluster.local"
+    VCLUSTER_HOST_ZONE="${HOST_NAMESPACE}.svc.cluster.local"
     sed \
         -e "s|__VCLUSTER_UID__|${VCLUSTER_UID}|g" \
         -e "s|__VCLUSTER_API_SAN__|${VCLUSTER_API_SAN}|g" \
+        -e "s|__VCLUSTER_HOST_ZONE__|${VCLUSTER_HOST_ZONE}|g" \
         -e "s|__OUTER_DNS_IP__|${OUTER_DNS_IP}|g" \
         "${VCLUSTER_VALUES_TEMPLATE}" >"${VALUES_FILE}"
     if grep -n '__[A-Z_]*__' "${VALUES_FILE}"; then

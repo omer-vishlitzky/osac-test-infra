@@ -129,6 +129,20 @@ controlPlane:
           forward . __OUTER_DNS_IP__
       }
 
+      # POC fact 8: the vcluster's own host namespace must also forward.
+      # The API server's pinned service-account-issuer is a service in this
+      # zone, and the OSAC services inside the vcluster fetch the API's
+      # OpenID discovery and JWKS from it (the grpc-server validates SA
+      # tokens through that issuer). The kubernetes plugin above answers
+      # cluster.local authoritatively and cannot see the host namespace, so
+      # without this block the issuer name is NXDOMAIN inside the vcluster
+      # and every SA token is rejected with "token is not valid".
+      __VCLUSTER_HOST_ZONE__:1053 {
+          errors
+          cache 30
+          forward . __OUTER_DNS_IP__
+      }
+
       import /etc/coredns/custom/*.server
 
 rbac:
