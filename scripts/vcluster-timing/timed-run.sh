@@ -16,6 +16,8 @@ set -euo pipefail
 export KUBECONFIG="$HOME/.kube/poc.kubeconfig"
 
 RUN_ARG="${1:?Usage: timed-run.sh RUN_NAME [PORT]}"
+TENANT="${TENANT:-tenant1}"
+TENANT_USER="${TENANT_USER:-tenant1_user}"
 PORT="${2:-9445}"
 DOMAIN="apps.test-infra-cluster-poc.redhat.com"
 TI=/tmp/ti-impl
@@ -51,6 +53,7 @@ die() { echo "FATAL: $*" >&2; exit 1; }
 echo "=== Timed run ${RUN_ARG} starting at $(date -u +%H:%M:%S)"
 
 # --- Phase 1: create the run (vcluster + isolation, parallel lanes) --------
+if [[ "${3:-}" != "resume" ]]; then
 T=$(date +%s)
 bash /tmp/opencode/poc/create-run.sh "${RUN_ARG}" "${PORT}" >"${RUN_DIR}/create.log" 2>&1 \
     || die "create-run failed, see ${RUN_DIR}/create.log"
@@ -227,9 +230,21 @@ if [[ "${3:-}" == "install-only" ]]; then
     echo "========================================================================"
     exit 0
 fi
+T_INSTALL_READY=$(date +%s)
+fi
 
 # --- Phase 4: tenant, user, catalog bootstrap (parallel tracks) ------------
 T=$(date +%s)
+
+# Resume mode: skip everything before this point (install already done).
+if [[ "${3:-}" == "resume" ]]; then
+    ADMIN_JWT=$(curl -sk -X POST "https://keycloak-keycloak.${DOMAIN}/realms/${RUN_ARG}/protocol/openid-connect/token" \
+        -d grant_type=password -d client_id=osac-cli \
+        --data-urlencode "username=admin" --data-urlencode "password=foobar" \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+    PRIV="fulfillment-internal-api-${RUN_ARG}.${DOMAIN}:443"
+    KC="${TI}/.vcluster-runs/${RUN_ARG}/kubeconfig-local"
+fi
 ADMIN_JWT=$(curl -sk -X POST "https://keycloak-keycloak.${DOMAIN}/realms/${RUN_ARG}/protocol/openid-connect/token" \
     -d grant_type=password -d client_id=osac-cli \
     --data-urlencode "username=admin" --data-urlencode "password=foobar" \
@@ -240,10 +255,10 @@ PRIV="fulfillment-internal-api-${RUN_ARG}.${DOMAIN}:443"
 # Everything below is gated on the tenant existing; create it (plus the
 # user) first, then fan out three independent tracks.
 grpcurl -insecure -H "authorization: Bearer ${ADMIN_JWT}" \
-    -d '{"object": {"metadata": {"name": "tenant1"}}}' \
+    -d '{"object": {"metadata": {"name": "'"${TENANT}"'"}}}' \
     "${PRIV}" osac.private.v1.Tenants/Create >/dev/null 2>&1 || true
 grpcurl -insecure -H "authorization: Bearer ${ADMIN_JWT}" \
-    -d '{"object": {"metadata": {"name": "tenant1-user", "tenant": "tenant1"}, "spec": {"username": "tenant1_user", "enabled": true}}}' \
+    -d '{"object": {"metadata": {"name": "'"${TENANT}"'-user", "tenant": "'"${TENANT}"'"}, "spec": {"username": "'"${TENANT_USER}"'", "enabled": true}}}' \
     "${PRIV}" osac.private.v1.Users/Create >/dev/null 2>&1 || true
 
 # Track A: storage marker secret (operator -> AAP backend job creates it;
@@ -251,22 +266,22 @@ grpcurl -insecure -H "authorization: Bearer ${ADMIN_JWT}" \
 track_storage() {
     local i
     for i in $(seq 1 60); do
-        kubectl --kubeconfig "${KC}" get secret -n osac -l osac.openshift.io/tenant=tenant1 \
+        kubectl --kubeconfig "${KC}" get secret -n osac -l osac.openshift.io/tenant=${TENANT} \
             --no-headers 2>/dev/null | grep -q lvms-tenant-config && return 0
         sleep 3
     done
     local bid
-    bid=$(kubectl --kubeconfig "${KC}" get tenant tenant1 -n osac \
+    bid=$(kubectl --kubeconfig "${KC}" get tenant ${TENANT} -n osac \
         -o jsonpath='{.status.storageBackends[0].name}' 2>/dev/null)
     [[ -n "${bid}" ]] || return 1
     kubectl --kubeconfig "${KC}" apply -f - >/dev/null <<EOF
 apiVersion: v1
 kind: Secret
 metadata:
-  name: lvms-tenant-config-tenant1-${bid}
+  name: lvms-tenant-config-${TENANT}-${bid}
   namespace: osac
   labels:
-    osac.openshift.io/tenant: tenant1
+    osac.openshift.io/tenant: ${TENANT}
     osac.openshift.io/storage-provider: lvms
     osac.openshift.io/storage-backend-id: ${bid}
     app.kubernetes.io/managed-by: osac-aap
@@ -282,11 +297,13 @@ PID_STORAGE=$!
 # Track B: Keycloak org membership (waits for the controller to sync the
 # org, then adds the user and the /members group).
 track_org() {
-    python3 - "${RUN_ARG}" <<'PYEOF'
+    python3 - "${RUN_ARG}" "${TENANT}" "${TENANT_USER}" <<'PYEOF'
 import base64, json, os, ssl, subprocess, sys, time
 import urllib.parse, urllib.request
 
 run = sys.argv[1]
+tenant = sys.argv[2]
+tenant_user = sys.argv[3]
 DOMAIN = "apps.test-infra-cluster-poc.redhat.com"
 KC_URL = f"https://keycloak-keycloak.{DOMAIN}"
 CTX = ssl.create_default_context(); CTX.check_hostname = False; CTX.verify_mode = ssl.CERT_NONE
@@ -330,21 +347,21 @@ def find(path, key, value):
 
 org = None
 for _ in range(80):
-    org = find("/organizations?search=tenant1&exact=true", "name", "tenant1")
+    org = find(f"/organizations?search={tenant}&exact=true", "name", tenant)
     if org:
         break
     time.sleep(3)
 if not org:
-    sys.exit("organization tenant1 never appeared in the realm")
+    sys.exit(f"organization {tenant} never appeared in the realm")
 
 user = None
 for _ in range(40):
-    user = find("/users?username=tenant1_user&exact=true", "username", "tenant1_user")
+    user = find(f"/users?username={tenant_user}&exact=true", "username", tenant_user)
     if user:
         break
     time.sleep(3)
 if not user:
-    sys.exit("user tenant1_user not found in the realm")
+    sys.exit(f"user {tenant_user} not found in the realm")
 
 try:
     req("POST", f"{base}/organizations/{org['id']}/members", tok, user["id"])
@@ -401,7 +418,7 @@ phase "tenant + catalog bootstrap" "$T"
 T=$(date +%s)
 T1_JWT=$(curl -sk -X POST "https://keycloak-keycloak.${DOMAIN}/realms/${RUN_ARG}/protocol/openid-connect/token" \
     -d grant_type=password -d client_id=osac-cli \
-    --data-urlencode "username=tenant1_user" --data-urlencode "password=foobar" \
+    --data-urlencode "username=${TENANT_USER}" --data-urlencode "password=foobar" \
     -d 'scope=openid organization' \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
 
