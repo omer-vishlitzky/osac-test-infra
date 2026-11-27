@@ -1674,6 +1674,12 @@ print_next_steps() {
     # vcluster under that name; the key defaults to password). Both exist
     # on the unified osac branch vcluster-e2e (PR osac#2566), not on osac
     # main: with aap.aap.instance.enabled=false the chart requires them.
+    #
+    # REMOTE_KUBECONFIG is the outer cluster's kubeconfig, the one this
+    # script ran with: PROFILE=vcluster-ci runs the install in remote mode
+    # and make install-osac fails without it, because the operator, the
+    # AAP config-as-code job and the BMF operator all reach the outer
+    # cluster through that kubeconfig.
     local extra_helm_args
     extra_helm_args="--values ${INSTANCE_VALUES_FILE}"
     extra_helm_args="${extra_helm_args} --set service.externalHostname=fulfillment-api-${RUN_NAME}.${OUTER_DOMAIN}"
@@ -1694,6 +1700,7 @@ print_next_steps() {
     echo "scripts/vcluster-publish-routes.sh (design step 6):"
     echo
     echo "  KUBECONFIG=${VCLUSTER_KUBECONFIG} \\"
+    echo "  REMOTE_KUBECONFIG=${KUBECONFIG} \\"
     echo "  CLUSTER_DOMAIN=${OUTER_DOMAIN} \\"
     echo "  AAP_LICENSE_FILE=/path/to/license.zip \\"
     echo "  make install-osac PLATFORM=openshift PROFILE=vcluster-ci NS=osac \\"
