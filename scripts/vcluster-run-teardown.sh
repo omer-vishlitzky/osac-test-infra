@@ -261,8 +261,18 @@ disable_aap_schedules() {
     AAP_ADMIN_PASSWORD="$(printf '%s' "${password_b64}" | base64 -d)"
     url="https://${route_host}/api/controller/v2/schedules/"
 
-    if ! listing="$(aap_curl "${url}?name__icontains=${RUN_NAME}&page_size=200")"; then
-        echo "WARNING: cannot list the AAP schedules; the AAP schedules of run ${RUN_NAME} stay enabled."
+    local listing_http
+    if ! listing="$(aap_curl -w '\n%{http_code}' "${url}?name__icontains=${RUN_NAME}&page_size=200")"; then
+        echo "WARNING: cannot reach the AAP to list schedules; the AAP schedules of run ${RUN_NAME} stay enabled."
+        return
+    fi
+    listing_http="${listing##*$'\n'}"
+    listing="${listing%$'\n'*}"
+    if [[ "${listing_http}" != "200" ]]; then
+        # Without this check a 401 looks exactly like "no schedules found"
+        # (curl -sS without --fail exits 0, the body has no results), and
+        # the run's schedules would silently stay armed.
+        echo "WARNING: the AAP schedule listing returned HTTP ${listing_http}; the AAP schedules of run ${RUN_NAME} stay enabled."
         return
     fi
 
