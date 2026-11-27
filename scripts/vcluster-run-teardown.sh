@@ -13,9 +13,15 @@
 #      this run created it: its instance label carries the run's name,
 #      and a pre-existing namespace (the shared AAP and CA bundle live
 #      in osac on today's outer clusters) is left alone;
-#   4. the run's outer KafkaUsers and their Strimzi secrets;
-#   5. the run's Keycloak realm, through the outer Keycloak's admin API;
-#   6. the run's output files (.vcluster-runs/<run> by default).
+#   4. the run's virtual bare-metal hosts (b and c suites): through
+#      scripts/vcluster-run-bmhs.sh --delete, the VMs, sushy-tools
+#      emulator, storage pool and cache on this machine, then namespace
+#      <run>-hosts with its per-run RBAC and BareMetalHosts. Best effort,
+#      verified at the end, so one stuck host never leaves the rest of the
+#      run behind;
+#   5. the run's outer KafkaUsers and their Strimzi secrets;
+#   6. the run's Keycloak realm, through the outer Keycloak's admin API;
+#   7. the run's output files (.vcluster-runs/<run> by default).
 #
 # It then verifies that nothing named after the run remains among the kinds
 # the run setup and the vcluster create, and fails loudly otherwise.
@@ -46,6 +52,8 @@
 #
 # Environment:
 #   KUBECONFIG          kubeconfig of the outer cluster (required)
+#   VM_DISK_DIR         parent of the run's VM disks, when the setup was
+#                       given it (default: /tmp)
 set -euo pipefail
 
 ###############################################################################
@@ -94,6 +102,10 @@ AAP_INSTANCE="${AAP_INSTANCE_DEFAULT}"
 AAP_NAMESPACE="${AAP_NAMESPACE_DEFAULT}"
 AAP_ADMIN_PASSWORD=""
 
+# Set when scripts/vcluster-run-bmhs.sh --delete reports leftovers: the rest
+# of the teardown still runs, and the final verification fails the run.
+BMH_CLEANUP_FAILED="false"
+
 HOST_NAMESPACE=""
 KEYCLOAK_CA_FILE=""
 KEYCLOAK_ADMIN_USERNAME=""
@@ -117,12 +129,14 @@ Options:
 
 Disables the run's AAP schedules, then deletes the run's vcluster (Helm
 release, then namespace vc-<run>), its orders namespace on the outer
-cluster when the run created it, its outer KafkaUsers and Strimzi
-secrets, its Keycloak realm and its output files, then verifies nothing
-named after the run remains among the kinds the run setup and the
-vcluster create. The run's AAP organization and job templates are left
-in place (known gap). Objects the tests create in the outer cluster are
-not touched (known gap, label-based deletion is the follow-up).
+cluster when the run created it, its virtual bare-metal hosts (VMs,
+sushy-tools emulator, storage pool, cache and namespace <run>-hosts with
+its RBAC and BareMetalHosts), its outer KafkaUsers and Strimzi secrets,
+its Keycloak realm and its output files, then verifies nothing named after
+the run remains among the kinds the run setup and the vcluster create. The
+run's AAP organization and job templates are left in place (known gap).
+Objects the tests create in the outer cluster are not touched (known gap,
+label-based deletion is the follow-up).
 EOF
 }
 
@@ -375,6 +389,25 @@ delete_orders_namespace() {
     wait_until_absent namespace "${ORDERS_NAMESPACE}" "" 120
 }
 
+# The run's virtual bare-metal hosts live half on the outer cluster
+# (namespace <run>-hosts, its RBAC, the BareMetalHosts) and half on this
+# machine (the libvirt VMs, the sushy-tools emulator, the storage pool and
+# the virtual-media cache). scripts/vcluster-run-bmhs.sh --delete owns both
+# halves and derives the same run-named objects the setup created.
+#
+# Best effort like the AAP schedules: a failure here must not stop the
+# Kafka, realm and file cleanup, but it must fail the teardown at the end
+# rather than pass as a clean run with leaked VMs or hosts.
+delete_run_bmhs() {
+    local status=0
+    "${SCRIPT_DIR}/vcluster-run-bmhs.sh" "${RUN_NAME}" --delete \
+        --output-dir "${OUTPUT_DIR}" || status=$?
+    if [[ "${status}" -ne 0 ]]; then
+        BMH_CLEANUP_FAILED="true"
+        echo "WARNING: removing the virtual bare-metal hosts of run ${RUN_NAME} failed (exit ${status}); continuing with the rest of the teardown."
+    fi
+}
+
 delete_kafka_users() {
     local kafka_user
     local kafka_users=("${RUN_NAME}-fulfillment-service" "${RUN_NAME}-osac-metering" "${RUN_NAME}-osac-metering-echo-adapter")
@@ -492,6 +525,9 @@ verify_no_run_objects_remain() {
     if [[ -n "${realm_leftovers}" ]]; then
         leftovers+="${realm_leftovers}"$'\n'
     fi
+    if [[ "${BMH_CLEANUP_FAILED}" == "true" ]]; then
+        leftovers+="virtual bare-metal hosts of run ${RUN_NAME} (see the error above)"$'\n'
+    fi
 
     if [[ -n "${leftovers}" ]]; then
         echo "ERROR: objects of run ${RUN_NAME} remain after teardown:" >&2
@@ -503,8 +539,10 @@ verify_no_run_objects_remain() {
     echo "Teardown complete: no objects matching ${RUN_NAME}-* remain among"
     echo "the kinds the run setup and the vcluster create (namespaces,"
     echo "KafkaUsers, secrets, cluster roles and bindings, Helm releases,"
-    echo "Keycloak realm), and the run's output files are deleted. The"
-    echo "orders namespace was deleted only if this run created it."
+    echo "Keycloak realm), the run's virtual bare-metal hosts are gone with"
+    echo "their VMs, storage pool and Redfish services, and the run's output"
+    echo "files are deleted. The orders namespace was deleted only if this"
+    echo "run created it."
     echo "Left in place on purpose: the run's AAP organization and job"
     echo "templates (its schedules are disabled above), and any objects the"
     echo "tests created in the outer cluster (see the known gaps in"
@@ -587,6 +625,7 @@ main() {
     uninstall_vcluster_release
     delete_host_namespace
     delete_orders_namespace
+    delete_run_bmhs
     delete_kafka_users
     delete_keycloak_realm
     delete_output_files
