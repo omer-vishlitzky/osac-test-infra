@@ -1502,6 +1502,11 @@ operator:
       secretName: ${RUN_NAME}-fulfillment-controller-credentials
   aap:
     templatePrefix: ${RUN_NAME}
+    # Jobs launch in the run's own AAP organization (created by the
+    # config-as-code hook from global.instanceId); the chart default
+    # "osac" is the outer install's shared organization. Labels and
+    # job templates are per run.
+    organization: ${RUN_NAME}
     # The shared AAP by its outer route: the chart's in-cluster default
     # (http://osac-aap/api/controller) does not resolve inside a vcluster,
     # and the operator's client wants the /api/controller path.
