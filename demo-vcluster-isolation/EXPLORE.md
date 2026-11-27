@@ -56,10 +56,15 @@ kubectl --kubeconfig $DEMOA get computeinstances -A
 kubectl --kubeconfig $DEMOB get computeinstances -A
 
 # The VM exists on the outer cluster, labeled with run A's ID
-oc get vm -A --show-labels | grep demoav1
+oc get vm -A --show-labels
 
-# Run B has no VMs labeled with its ID
-oc get vm -A -l osac.openshift.io/instance=demobv1
+# The owning run's VMs (the label lives on the VMI, copied from the
+# VM spec template that the AAP playbook stamps with the run's
+# instance ID):
+oc get vmi -A -l osac.openshift.io/instance=demoav1
+
+# Run B has no VMs:
+oc get vmi -A -l osac.openshift.io/instance=demobv1
 ```
 
 ## Same code, same images

@@ -104,7 +104,7 @@ say "The VM objectively exists on the outer cluster, labeled with run A's ID:"
 type_cmd 'oc get vm -A --show-labels | grep -v "^NAME" | head -5'
 
 say "Filtering by run B's label finds nothing:"
-type_cmd 'oc get vm -A -l osac.openshift.io/instance=demobv1 2>/dev/null || echo "No resources found"'
+type_cmd 'oc get vmi -A -l osac.openshift.io/instance=demobv1 2>/dev/null || echo "No resources found"'
 
 # --- Scene 5: How to check yourself ---
 
