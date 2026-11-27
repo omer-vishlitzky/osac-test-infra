@@ -53,6 +53,13 @@ controlPlane:
           # URL, and the projected pod tokens rotate to match.
           - --service-account-issuer=https://__VCLUSTER_API_SAN__
           - --service-account-jwks-uri=https://__VCLUSTER_API_SAN__/openid/v1/jwks
+          # POC fact 7: pinning the issuer changes the apiserver's accepted
+          # audiences to the new issuer alone, but `vcluster connect` still
+          # mints its admin token with the legacy default audiences
+          # (kubernetes.default and friends). Listing both keeps the CLI's
+          # kubeconfig and the suite's `kubectl create token` working at the
+          # same time.
+          - --api-audiences=https://__VCLUSTER_API_SAN__,https://kubernetes.default.svc.cluster.local,https://kubernetes.default.svc,https://kubernetes.default
 
   proxy:
     extraSANs:
