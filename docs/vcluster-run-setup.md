@@ -312,8 +312,10 @@ aap:
       key: token
 ```
 
-`aap.organization` and `aap.templatePrefix` are deliberately not set: the
-chart derives both from `global.instanceId`. The operator's credential
+`aap.organization` and `aap.templatePrefix` are both set to the run name:
+the operator chart defaults each to `osac` and derives nothing, so without
+these keys every run would launch its AAP jobs in the shared outer
+organization under the `osac-` prefix. The operator's credential
 reference overrides `operator.fulfillment.credentials.secretName` (the
 vmaas-ci and vcluster-ci profiles name the unprefixed
 `fulfillment-controller-credentials`; the run's operator must read the
@@ -417,22 +419,31 @@ KUBECONFIG=/path/to/outer-kubeconfig ./scripts/vcluster-run-teardown.sh pr2100v1
 
 The teardown deletes, in order:
 
-1. the run's vcluster Helm release — before the namespace deletion, so helm
+1. the run's AAP schedules (three, named `<run>-sync`,
+   `<run>-config-as-code`, `<run>-publish-templates`) through the shared
+   AAP's API, so a torn-down run's organization stops firing error jobs
+   every ten minutes; the organization itself is left in place (see the
+   known gaps below); failures are warnings, never fatal;
+2. the run's vcluster Helm release — before the namespace deletion, so helm
    itself removes the chart's cluster-scoped RBAC (a ClusterRole and
    ClusterRoleBinding the syncer needs), which deleting only the namespace
    would leave behind;
-2. namespace `vc-<run>` (its deletion removes the vcluster's pods and every
+3. namespace `vc-<run>` (its deletion removes the vcluster's pods and every
    object the syncer copied there, which keep their inner names and so
    cannot be found by a name-anchored scan), waiting until it is gone;
-3. the orders namespace `osac` on the outer cluster, but only when this run
+4. the run's virtual BMHs for b/c suites (VM group, BMHs with finalizer
+   stripping, sushy emulator, storage pool, cache, the `<run>-hosts`
+   namespace and its RBAC), best-effort; leftover hosts fail the run's
+   leftover verification instead of passing silently;
+5. the orders namespace `osac` on the outer cluster, but only when this run
    created it: the instance label the setup wrote at creation carries the
    run's name, and a namespace without this run's label — a pre-existing
    one, or one another run created — is left in place;
-4. the run's outer KafkaUsers, then their Strimzi secrets (the users go
+6. the run's outer KafkaUsers, then their Strimzi secrets (the users go
    first: while a KafkaUser exists, the Strimzi user operator recreates its
    secret), waiting until each is gone;
-5. the run's Keycloak realm through the admin API;
-6. the run's output files (`.vcluster-runs/<run>` by default; pass
+7. the run's Keycloak realm through the admin API;
+8. the run's output files (`.vcluster-runs/<run>` by default; pass
    `--output-dir` if the setup was given one).
 
 It then verifies that nothing named after the run remains among the kinds
