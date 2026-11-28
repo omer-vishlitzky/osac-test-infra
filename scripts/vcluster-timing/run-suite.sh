@@ -20,6 +20,13 @@ mkdir -p "${OUT}"
 cd "${OSAC}"
 uv sync >/dev/null 2>&1
 
+# The master-realm admin password comes from the outer cluster's secret:
+# the suite's organization-membership fixture logs into the master realm
+# with it. OSAC_JWT_PASSWORD is the realm users' password (foobar), which
+# is a different thing. Read it BEFORE switching KUBECONFIG to the run.
+KC_ADMIN_PASS="$(KUBECONFIG="$HOME/.kube/poc.kubeconfig" oc get secret -n keycloak keycloak-admin-credentials -o jsonpath='{.data.admin-password}' 2>/dev/null | base64 -d)"
+[[ -n "${KC_ADMIN_PASS}" ]] || KC_ADMIN_PASS="admin"
+
 export KUBECONFIG="${KC}"
 export OSAC_HUB_KUBECONFIG="${KC}"
 export OSAC_VM_KUBECONFIG="$HOME/.kube/poc.kubeconfig"
@@ -30,15 +37,20 @@ export OSAC_FULFILLMENT_PRIVATE_ADDRESS="fulfillment-internal-api-${RUN_ARG}.${D
 export OSAC_KEYCLOAK_URL="https://keycloak-keycloak.${DOMAIN}"
 export OSAC_KEYCLOAK_REALM="${RUN_ARG}"
 export OSAC_KEYCLOAK_CLIENT_ID=osac-cli
-# The master-realm admin password comes from the outer cluster's secret:
-# the suite's organization-membership fixture logs into the master realm
-# with it. OSAC_JWT_PASSWORD is the realm users' password (foobar), which
-# is a different thing.
-KC_ADMIN_PASS="$(oc get secret -n keycloak keycloak-admin-credentials -o jsonpath='{.data.admin-password}' 2>/dev/null | base64 -d)"
-export OSAC_KEYCLOAK_ADMIN_PASSWORD="${KC_ADMIN_PASS:-admin}"
+export OSAC_KEYCLOAK_ADMIN_PASSWORD="${KC_ADMIN_PASS}"
 export OSAC_JWT_PASSWORD=foobar
 export OSAC_IMPERSONATE_USER=
 export METERING_ADAPTER_URL="https://osac-metering-echo-adapter-${RUN_ARG}.${DOMAIN}"
+
+# The E2E workflows apply the install-namespace and shared Tenant CRs
+# between install and test (see the cluster_tenants fixture note in
+# tests/e2e/conftest.py). Without this, four xdist workers race the same
+# two creates and the losers fail their whole session. Apply them once,
+# serially, before pytest starts.
+for TNAME in osac shared; do
+    printf 'apiVersion: osac.openshift.io/v1alpha1\nkind: Tenant\nmetadata:\n  name: %s\n  namespace: osac\nspec: {}\n' \
+        "${TNAME}" | oc --kubeconfig "${KC}" apply -f - >/dev/null
+done
 
 exec uv run --no-sync pytest "tests/e2e/${SUITE}/" \
     --junitxml="${OUT}/${RUN_ARG}-junit.xml" \
