@@ -129,7 +129,15 @@ with `scripts/vcluster-run-bmhs.sh <run> --network <net>`.
 - One review finding was deferred: the metering relay stores its read
   position without the topic name. If the topic name changes, the old
   position is reused on the new topic. The fix needs a database schema
-  change, so it gets its own ticket.
+  change, so it gets its own ticket (OSAC-8365).
+- Under AAP load, the config-as-code run can fail to create the run's
+  vcluster credential on the first tries (the create is async and its
+  error is collected for the end of the play, while the instance-group
+  verification keeps retrying for minutes). The bootstrap job's own
+  retries heal it once the load drops, but each failed attempt is slow.
+  A clean hardening: the run setup pre-creates the organization and the
+  credential before the chart install, so config-as-code only updates
+  existing objects.
 
 ## Where the commits are
 
