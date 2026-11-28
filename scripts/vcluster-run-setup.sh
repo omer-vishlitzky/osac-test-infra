@@ -60,6 +60,8 @@
 #   --output-dir PATH           where to write the run's files
 #                               (default: <repo>/.vcluster-runs/RUN_NAME)
 #   --bmh-network NAME          libvirt network the outer SNO node reaches
+#   --skip-bmhs                 defer BMH provisioning to the libvirt host
+#                               (run vcluster-run-bmhs.sh there yourself)
 #                               (required for b and c runs: their virtual
 #                               bare-metal hosts attach to it)
 #   --keycloak-url URL          outer Keycloak base URL (default:
@@ -189,6 +191,7 @@ REALM_JSON_SOURCE=""
 RECREATE="false"
 OUTPUT_DIR=""
 BMH_NETWORK=""
+SKIP_BMHS="false"
 KEYCLOAK_URL="${KEYCLOAK_URL_DEFAULT}"
 AAP_INSTANCE="${AAP_INSTANCE_DEFAULT}"
 AAP_NAMESPACE="${AAP_NAMESPACE_DEFAULT}"
@@ -435,6 +438,10 @@ EOF
 # it has not happened.
 setup_run_bmhs() {
     if [[ "${SUITE}" != "bmaas" && "${SUITE}" != "caas" ]]; then
+        return
+    fi
+    if [[ "${SKIP_BMHS}" == "true" ]]; then
+        echo "BMH provisioning deferred (--skip-bmhs): run scripts/vcluster-run-bmhs.sh '${RUN_NAME}' on the libvirt host."
         return
     fi
     [[ -n "${BMH_NETWORK}" ]] \
@@ -1820,6 +1827,17 @@ main() {
                 [[ $# -ge 2 ]] || die "--bmh-network needs a value."
                 BMH_NETWORK="$2"
                 shift 2
+                ;;
+            --skip-bmhs)
+                # Defer the run's BareMetalHost provisioning to the machine
+                # that runs libvirt (the BMH script drives virsh, sushy-tools
+                # and the virtual-media cache, which must sit where the VMs
+                # live). The caller runs scripts/vcluster-run-bmhs.sh there
+                # with this run's name; the suites only need the hosts
+                # available before they start, not before the vcluster
+                # installs.
+                SKIP_BMHS="true"
+                shift
                 ;;
             --keycloak-url)
                 [[ $# -ge 2 ]] || die "--keycloak-url needs a value."
