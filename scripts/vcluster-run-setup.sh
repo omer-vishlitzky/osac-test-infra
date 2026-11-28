@@ -1750,6 +1750,31 @@ EOF
         HOSTED_CLUSTER_CONTROLLER_AVAILABILITY_POLICY: SingleReplica
         HOSTED_CLUSTER_INFRASTRUCTURE_AVAILABILITY_POLICY: SingleReplica
         HOSTED_CLUSTER_BASE_DOMAIN: hosted.${OUTER_DOMAIN#apps.}
+        # The guest ingress VIP range the external-access step reserves
+        # from. The chart key defaults to empty and the job refuses to run
+        # without it. Both addresses must be spelled in full: the chart
+        # schema and the claim module's parse_range reject the short
+        # 192.168.161.240-250 form. One shared range serves every parallel
+        # CaaS run on this lab: claims live in one ConfigMap keyed by
+        # ClusterOrder UID, and eleven addresses cover three runs.
+        CI_GUEST_INGRESS_IP_RANGE: 192.168.161.240-192.168.161.250
+        # The RFC 2136 DNS driver: the BIND server on the lab host serves
+        # the hosted-cluster zone and accepts signed updates. The job pods
+        # reach it from the outer cluster's network; the workstation does
+        # not, which is fine -- only the jobs talk to it. Proven by the
+        # first CaaS validation run.
+        DNS_CLASS: dns.rfc2136.dns
+        DNS_ZONE: hosted.${OUTER_DOMAIN#apps.}
+        EXTERNAL_ACCESS_BASE_DOMAIN: hosted.${OUTER_DOMAIN#apps.}
+        EXTERNAL_ACCESS_SUPPORTED_BASE_DOMAINS: hosted.${OUTER_DOMAIN#apps.}
+        DNS_RFC2136_SERVER: 10.1.155.16
+        DNS_RFC2136_PORT: "5333"
+        DNS_RFC2136_PROTOCOL: udp
+        DNS_RFC2136_KEY_NAME: osac-caas
+        DNS_RFC2136_KEY_ALGORITHM: hmac-sha256
+        DNS_SERVER: 10.1.155.16
+      secret:
+        DNS_RFC2136_KEY_SECRET: G4Jghff4HhsEx8sRnlKk+PiJaNbPPtEgZlgbdzr9qIo=
 EOF
     fi
 }
