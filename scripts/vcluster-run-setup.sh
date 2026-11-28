@@ -1139,12 +1139,21 @@ PYEOF
 import_keycloak_realm() {
     local token
     token="$(keycloak_admin_token)"
-    # Keycloak answers 201 with an empty body; any error body surfaces
+    # The run setup runs this twice by design: once in the setup script's
+    # serial flow, once in the caller's parallel lanes (create-run.sh step
+    # 3). A plain POST answers 409 on the second pass and kills the lane.
+    # Import as an upsert: POST creates the realm (201); when it already
+    # exists, PUT replaces it in place. Any other error body surfaces
     # because of --fail-with-body.
-    keycloak_curl -s --fail-with-body -X POST "${KEYCLOAK_URL}/admin/realms" \
+    if ! keycloak_curl -s --fail-with-body -X POST "${KEYCLOAK_URL}/admin/realms" \
         -H "Authorization: Bearer ${token}" \
         -H 'Content-Type: application/json' \
-        --data-binary "@${WORK_DIR}/realm.json" >/dev/null
+        --data-binary "@${WORK_DIR}/realm.json" >/dev/null 2>&1; then
+        keycloak_curl -s --fail-with-body -X PUT "${KEYCLOAK_URL}/admin/realms/${RUN_NAME}" \
+            -H "Authorization: Bearer ${token}" \
+            -H 'Content-Type: application/json' \
+            --data-binary "@${WORK_DIR}/realm.json" >/dev/null
+    fi
     echo "Imported realm ${RUN_NAME} into the outer Keycloak."
 }
 
