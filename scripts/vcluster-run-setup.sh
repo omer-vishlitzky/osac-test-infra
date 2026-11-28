@@ -1089,11 +1089,12 @@ PYEOF
     # openssl rand -base64 18 output cannot contain the sed-significant
     # characters (#, &, backslash), which is why the hook substitutes those
     # raw while the user-supplied values below get both escaping passes.
-    local controller_secret admin_secret csi_driver_secret ui_backend_secret
+    local controller_secret admin_secret csi_driver_secret ui_backend_secret aap_secret_reader_secret
     controller_secret="$(openssl rand -base64 18)"
     admin_secret="$(openssl rand -base64 18)"
     csi_driver_secret="$(openssl rand -base64 18)"
     ui_backend_secret="$(openssl rand -base64 18)"
+    aap_secret_reader_secret="$(openssl rand -base64 18)"
 
     # The realm admin user's credentials come from the outer cluster's
     # keycloak-admin-credentials secret, exactly what the osac-infra chart
@@ -1106,6 +1107,7 @@ PYEOF
         -e "s#__OSAC_ADMIN_CLIENT_SECRET__#${admin_secret}#" \
         -e "s#__OSAC_CSI_DRIVER_CLIENT_SECRET__#${csi_driver_secret}#" \
         -e "s#__OSAC_UI_BACKEND_CLIENT_SECRET__#${ui_backend_secret}#" \
+        -e "s#__OSAC_AAP_SECRET_READER_CLIENT_SECRET__#${aap_secret_reader_secret}#" \
         -e "s#__OSAC_REALM_ADMIN_USERNAME__#$(escape_sed_replacement "$(json_escape_string "${KEYCLOAK_ADMIN_USERNAME}")")#" \
         -e "s#__OSAC_REALM_ADMIN_PASSWORD__#$(escape_sed_replacement "$(json_escape_string "${KEYCLOAK_ADMIN_PASSWORD}")")#" \
         -e "s#__OSAC_UI_URL__#$(escape_sed_replacement "https://osac-ui-${RUN_NAME}.${OUTER_DOMAIN}")#g" \
