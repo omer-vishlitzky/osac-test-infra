@@ -1449,7 +1449,7 @@ create_aap_service_account() {
     create_vcluster_secret_literals "${RUN_NAME}-aap-vcluster-token" \
         --from-literal="token=${aap_token}"
 
-    precreate_aap_identity
+    precreate_aap_identity "${aap_token}"
 }
 
 # Create the run's AAP organization and vcluster credential directly, before
@@ -1462,6 +1462,7 @@ create_aap_service_account() {
 # A re-run with a fresh vcluster also repairs a credential that still holds
 # a previous incarnation's token (the orphan-adoption failure mode).
 precreate_aap_identity() {
+    local vcluster_token="$1"
     local api_token org_id cred_id
     api_token="$(kubectl --namespace "${AAP_NAMESPACE}" get secret osac-aap-api-token \
         -o jsonpath='{.data.token}' | base64 -d)" \
@@ -1487,17 +1488,16 @@ precreate_aap_identity() {
     cred_id="$(curl "${auth[@]}" "${api}/credentials/?name=${RUN_NAME}-vcluster" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["results"][0]["id"] if d["count"] else "")')" \
         || die "Cannot query the AAP for credential ${RUN_NAME}-vcluster."
     local cred_json
-    cred_json="$(python3 -c '
+    cred_json="$(RUN_NAME="${RUN_NAME}" ORG_ID="${org_id}" \
+        HOST="https://${RUN_NAME}.${HOST_NAMESPACE}.svc.cluster.local" \
+        TOKEN="${vcluster_token}" python3 -c '
 import json, os
-print(json.dumps({"name": os.environ["RUN"] + "-vcluster",
-                  "description": "Bearer token for the vcluster API of " + os.environ["RUN"],
+print(json.dumps({"name": os.environ["RUN_NAME"] + "-vcluster",
+                  "description": "Bearer token for the vcluster API of " + os.environ["RUN_NAME"],
                   "organization": int(os.environ["ORG_ID"]),
                   "credential_type": 17,
                   "inputs": {"host": os.environ["HOST"], "verify_ssl": False,
-                             "bearer_token": os.environ["TOKEN"]}}))' \
-        RUN="${RUN_NAME}" ORG_ID="${org_id}" \
-        HOST="https://${RUN_NAME}.${HOST_NAMESPACE}.svc.cluster.local" \
-        TOKEN="${aap_token}")"
+                             "bearer_token": os.environ["TOKEN"]}}))')"
     if [[ -z "${cred_id}" ]]; then
         curl "${auth[@]}" -X POST -d "${cred_json}" "${api}/credentials/" >/dev/null \
             || die "Cannot create AAP credential ${RUN_NAME}-vcluster."
