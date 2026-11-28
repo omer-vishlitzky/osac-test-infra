@@ -1448,6 +1448,65 @@ create_aap_service_account() {
 
     create_vcluster_secret_literals "${RUN_NAME}-aap-vcluster-token" \
         --from-literal="token=${aap_token}"
+
+    precreate_aap_identity
+}
+
+# Create the run's AAP organization and vcluster credential directly, before
+# the chart's config-as-code runs. The config-as-code dispatches its creates
+# asynchronously and collects failures for the end of the play, so under AAP
+# load a failed cold create turns into a half-installed run whose
+# instance-group verification spins for minutes while helm times out on the
+# pre-install hook. Creating both here, synchronously and fail-loud, means
+# the config-as-code only performs idempotent updates on existing objects.
+# A re-run with a fresh vcluster also repairs a credential that still holds
+# a previous incarnation's token (the orphan-adoption failure mode).
+precreate_aap_identity() {
+    local api_token org_id cred_id
+    api_token="$(kubectl --namespace "${AAP_NAMESPACE}" get secret osac-aap-api-token \
+        -o jsonpath='{.data.token}' | base64 -d)" \
+        || die "Cannot read the osac-aap-api-token Secret in ${AAP_NAMESPACE}: the AAP lane needs it to pre-create the run's organization and credential."
+    [[ -n "${api_token}" ]] || die "The osac-aap-api-token Secret in ${AAP_NAMESPACE} is empty."
+
+    local api="${AAP_CONTROLLER_URL}/api/controller/v2"
+    local auth=(-H "Authorization: Bearer ${api_token}" -H "Content-Type: application/json" -s --fail-with-body)
+
+    # Organization: create when missing. The API answers 400 with "already
+    # exists" in the body on a duplicate, which --fail-with-body surfaces.
+    org_id="$(curl "${auth[@]}" "${api}/organizations/?name=${RUN_NAME}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["results"][0]["id"] if d["count"] else "")')" \
+        || die "Cannot query the AAP for organization ${RUN_NAME}."
+    if [[ -z "${org_id}" ]]; then
+        org_id="$(curl "${auth[@]}" -X POST -d "{\"name\":\"${RUN_NAME}\",\"description\":\"vcluster E2E run ${RUN_NAME}\"}" \
+            "${api}/organizations/" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')" \
+            || die "Cannot create AAP organization ${RUN_NAME}."
+        echo "Pre-created AAP organization ${RUN_NAME} (id ${org_id})."
+    fi
+
+    # Credential: create when missing, refresh the token when it exists, so
+    # both a cold run and a re-run over a stale incarnation converge.
+    cred_id="$(curl "${auth[@]}" "${api}/credentials/?name=${RUN_NAME}-vcluster" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["results"][0]["id"] if d["count"] else "")')" \
+        || die "Cannot query the AAP for credential ${RUN_NAME}-vcluster."
+    local cred_json
+    cred_json="$(python3 -c '
+import json, os
+print(json.dumps({"name": os.environ["RUN"] + "-vcluster",
+                  "description": "Bearer token for the vcluster API of " + os.environ["RUN"],
+                  "organization": int(os.environ["ORG_ID"]),
+                  "credential_type": 17,
+                  "inputs": {"host": os.environ["HOST"], "verify_ssl": False,
+                             "bearer_token": os.environ["TOKEN"]}}))' \
+        RUN="${RUN_NAME}" ORG_ID="${org_id}" \
+        HOST="https://${RUN_NAME}.${HOST_NAMESPACE}.svc.cluster.local" \
+        TOKEN="${aap_token}")"
+    if [[ -z "${cred_id}" ]]; then
+        curl "${auth[@]}" -X POST -d "${cred_json}" "${api}/credentials/" >/dev/null \
+            || die "Cannot create AAP credential ${RUN_NAME}-vcluster."
+        echo "Pre-created AAP credential ${RUN_NAME}-vcluster."
+    else
+        curl "${auth[@]}" -X PATCH -d "${cred_json}" "${api}/credentials/${cred_id}/" >/dev/null \
+            || die "Cannot refresh AAP credential ${RUN_NAME}-vcluster (id ${cred_id})."
+        echo "Refreshed AAP credential ${RUN_NAME}-vcluster (id ${cred_id})."
+    fi
 }
 
 ###############################################################################
