@@ -136,7 +136,7 @@ SUSHY_VMEDIA_TMP=""   # ~/sushy-vmedia-tmp-<run>
 INVENTORY_FILE=""     # <output dir>/virtual-bmh-inventory.json
 
 VM_DISK_ROOT=""
-VM_DISK_DIR=""
+VM_DISK_DIR="${VM_DISK_DIR_OVERRIDE:-}"
 
 NETWORK_GATEWAY=""
 SUSHY_PORT=""
