@@ -32,6 +32,10 @@ mkdir -p "${RUN_DIR}"
 TAG_OLD="vc-e2e-f9b4fcc31"
 TAG_FULFILLMENT="vc-e2e-2e35492ea"
 TAG_OPERATOR="vc-e2e-c9cb7a2b5"
+# The BMF operator image: the profile inherits ghcr.io/...:latest which
+# predates the remote-cluster mode and crashloops on the BareMetalHost
+# CRD check. b-suite runs need the branch build.
+TAG_BMF="vc-e2e-86b327e8d"
 SHA="f9b4fcc314ffd2bac02b485fa471984cbfb8ae8f"
 
 T_START=$(date +%s)
@@ -105,6 +109,9 @@ IMAGE_ARGS="
 --set aap.bootstrap.image=localhost/osac-aap-ee:${TAG_OLD}
 --set aap.configAsCode.eeImage=localhost/osac-aap-ee:${TAG_OLD}
 --set aap.configAsCode.eeImagePull=missing
+--set bmf.image.repository=localhost/bare-metal-fulfillment-operator
+--set bmf.image.tag=${TAG_BMF}
+--set bmf.image.pullPolicy=IfNotPresent
 --set aap.configAsCode.projectGitUri=https://github.com/omer-vishlitzky/osac
 --set aap.configAsCode.projectGitBranch=${SHA}
 --set aap.hooks.publishPollTimeout=1800
