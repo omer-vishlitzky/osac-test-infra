@@ -21,15 +21,40 @@ machine on the outer cluster. Only the run that asked for it can see it.
 The last few failures were test bugs or node capacity problems, not OSAC
 bugs. All are fixed or skipped now.
 
+**Three VMaaS suites ran at the same time.** On one node, three runs each
+ran the whole VMaaS suite together. 378 of 381 tests passed. One run was
+fully green. The two others failed only on tests that are sensitive to
+load. Those tests now wait for the system to settle instead of failing.
+
 **CaaS got far.** The first CaaS run created a real hosted cluster on the
-outer cluster. The hosted cluster reached "Available". Two OSAC bugs block
-the rest. We list them below.
+outer cluster. The hosted cluster reached "Available". Two OSAC bugs
+blocked the rest. Both are now fixed (see below).
 
 **BMaaS got far.** The fake metal machines work. Both reached "available"
-and were seen by the run. One OSAC bug blocks the tests. We list it below.
+and were seen by the run. One OSAC bug blocked the tests. It is now fixed
+(see below).
 
-**Runs can be made in parallel.** We made many runs at the same time on one
-node and ran test suites against them at once.
+**The three OSAC bugs are fixed.** The fixes are in osac PR #2566:
+
+1. **The vault setup ran twice and crashed.** The second pass saw "this
+   locker is already taken" and gave up. Now it sees "already there" and
+   moves on. The real error is also shown in the log, not hidden.
+2. **The outer cluster threw away a thing it still needed.** A tag on the
+   InfraEnv pointed at an owner the outer cluster could not see, so it
+   deleted the InfraEnv every 30 seconds. The tag is gone in that mode.
+   The cleanup now happens by hand at teardown, the way Jira OSAC-8055
+   wanted.
+3. **One setting could not be set.** The guest ingress IP range had no
+   chart key. The key exists now.
+
+**The code review fixes are in.** A review bot (CodeRabbit) found real
+bugs in our changes. All the big ones are fixed: test tokens now come
+from the right cluster, the AAP job pods start without the OpenShift
+service CA, the metering topic names cannot collide, and two more.
+
+**The branch sits on top of current main.** The PR was first cut from an
+old main, which made it look huge (1000+ files). After the rebase it is
+about 220 files, all ours.
 
 ## The three parts
 
@@ -58,7 +83,7 @@ bash scripts/vcluster-timing/run-suite.sh myrunv1 vmaas/sanity
 bash scripts/vcluster-run-teardown.sh myrunv1
 ```
 
-## The open OSAC bugs (found by the first CaaS and BMaaS runs)
+## The OSAC bugs found by the first CaaS and BMaaS runs (all fixed now)
 
 1. **CaaS: cross-cluster ownerReferences.** The operator creates the InfraEnv
    on the outer cluster and marks it as owned by the ClusterOrder. But the
@@ -74,14 +99,23 @@ bash scripts/vcluster-run-teardown.sh myrunv1
 
 ## What each suite still needs
 
-- **VMaaS**: nothing. It is green.
-- **BMaaS**: the vault bug above. Then the suite should run.
-- **CaaS**: the two bugs above. Then the hosted cluster needs workers, which
-  needs the InfraEnv fix.
+- **VMaaS**: nothing. It is green, also three at a time.
+- **BMaaS**: nothing known. The vault bug is fixed. The next run proves it.
+- **CaaS**: nothing known. Both bugs are fixed. The next run proves it.
+
+## The big proof that is running now
+
+Nine runs at once on one node: three VMaaS, three CaaS, three BMaaS. All
+nine suites run at the same time. This is the shape of the final CI.
+
+The fake metal machines for the BMaaS and CaaS runs are made on the
+machine that runs libvirt (the rdu host), not on the machine that starts
+the run. The setup script learned `--skip-bmhs` for this: it makes the
+run first, and the metal machines are made after, on the right machine,
+with `scripts/vcluster-run-bmhs.sh <run> --network <net>`.
 
 ## What is still missing
 
-- The three OSAC bugs above.
 - The CI job that runs many tests at once is not written yet. The scripts
   are the start of it.
 - The nightly reset of the outer cluster is not set up. It would clean up
@@ -90,8 +124,12 @@ bash scripts/vcluster-run-teardown.sh myrunv1
   Today the runner starts its own port-forward, which works but is a
   workaround.
 - The BMF operator image and the vcluster compat objects (the service CA
-  ConfigMap, the unprefixed credentials Secret) must be part of the install,
-  not later fixes.
+  ConfigMap, the unprefixed credentials Secret) must be part of the
+  install, not later fixes.
+- One review finding was deferred: the metering relay stores its read
+  position without the topic name. If the topic name changes, the old
+  position is reused on the new topic. The fix needs a database schema
+  change, so it gets its own ticket.
 
 ## Where the commits are
 
