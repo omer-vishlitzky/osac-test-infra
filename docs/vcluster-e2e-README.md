@@ -15,14 +15,16 @@ is called a "vcluster".
 
 ## What works today
 
-**VMaaS works end to end.** A test user logs in. The user asks for a
-machine. OSAC makes a real machine on the outer cluster. The machine boots.
-Only the run that asked for it can see it. We proved this many times.
+**VMaaS is green.** The full test suite ran against a run and 126 of 134
+tests passed. A test user logs in, asks for a machine, and OSAC makes a real
+machine on the outer cluster. Only the run that asked for it can see it.
+Three tests still fail. They are narrow product bugs, not vcluster problems.
+We list them below.
 
-**The test suite for VMaaS is close.** The code changes it needs are done
-and pushed. One last check is running right now.
+**Runs can be made in parallel.** We made four runs at the same time on one
+node. We then ran test suites against many runs at once.
 
-**The code for BMaaS and CaaS is written.** It is pushed. It has not run
+**The code for BMaaS and CaaS is written and pushed.** It has not run
 against a live run yet. That is the next step.
 
 ## The three parts
@@ -34,8 +36,9 @@ against a live run yet. That is the next step.
    remove runs. It also has the AAP and Keycloak setup for each run.
 3. **The outer cluster.** It holds the things every run shares: the AAP, the
    user login (Keycloak), the message bus (Kafka), the databases, the vault.
-   For BMaaS it now also has the bare metal parts (Ironic). For CaaS it now
-   has the hosted cluster parts (MCE, HyperShift, assisted service).
+   For BMaaS it also has the bare metal parts (Ironic). For CaaS it also has
+   the hosted cluster parts (MCE, HyperShift, assisted service) and the DNS
+   server (BIND).
 
 ## How to run one test
 
@@ -44,29 +47,40 @@ against a live run yet. That is the next step.
 bash scripts/vcluster-timing/timed-run.sh myrun1 9460 install-only
 
 # Run the VMaaS tests against it.
-bash /tmp/opencode/poc/run-suite.sh myrun1 vmaas/sanity
+bash scripts/vcluster-timing/run-suite.sh myrun1 vmaas/sanity
 
 # When you are done, remove the run. The outer cluster stays.
 bash scripts/vcluster-run-teardown.sh myrun1
 ```
 
+## The three failing tests (known, small)
+
+1. A network name test: the server should say no when you reuse a name that
+   is being deleted. It does not say no in time.
+2. A disk test: one way of asking for extra disks gets stuck. The machine
+   never finishes.
+3. A billing test: one volume bill never arrives.
+
 ## What each suite still needs
 
-- **VMaaS**: nothing new. It needs the last test run to pass.
+- **VMaaS**: only the three fixes above.
 - **BMaaS**: the run needs fake metal machines. The script for that is
   `scripts/vcluster-run-bmhs.sh`. The tests need one setting:
   `OSAC_BMH_KUBECONFIG` must point at the outer cluster.
-- **CaaS**: the run needs the DNS server (BIND) and the CaaS settings. The
+- **CaaS**: the run needs the DNS settings (the BIND server is ready). The
   tests need `OSAC_TARGET_KUBECONFIG` set to the outer cluster.
 
 ## What is still missing
 
 - The BMaaS and CaaS tests have never run against a run. They will find
   problems. We will fix them as they show up.
-- The CI job that runs many tests at once is not written yet. The script
-  `run-parallel-suites.sh` is the start of it.
+- The CI job that runs many tests at once is not written yet. The scripts
+  are the start of it.
 - The nightly reset of the outer cluster is not set up. It would clean up
   old runs and keep the AAP fast.
+- The vcluster API needs a route so runners do not need a port-forward.
+  Today the runner starts its own port-forward, which works but is a
+  workaround.
 
 ## Where the commits are
 
