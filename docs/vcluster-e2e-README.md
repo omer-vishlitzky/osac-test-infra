@@ -108,6 +108,24 @@ bash scripts/vcluster-run-teardown.sh myrunv1
 Nine runs at once on one node: three VMaaS, three CaaS, three BMaaS. All
 nine suites run at the same time. This is the shape of the final CI.
 
+The installs go in three waves of three. Nine at once floods the one
+shared AAP: its bootstrap hooks queue past their deadlines. Three at a
+time is the proven load. The suites all start together after the last
+run exists, because the nine-suite load is the actual thing under test.
+
+The run setup now creates the run's AAP organization and its vcluster
+credential itself, with direct API calls that fail loudly. Before, the
+chart's config-as-code created them, but its async creates can fail
+under AAP load, and the failure turns into a slow spin instead of a
+fast error. With the pre-create, the config-as-code only updates
+things that already exist, and a re-run repairs a stale token instead
+of attaching to it.
+
+The CaaS runs get their full delivery through the run overlay: the
+guest ingress VIP range and the RFC 2136 DNS driver settings, both
+verified to render through the chart's schema into the ConfigMap and
+Secret the AAP job pods read.
+
 The fake metal machines for the BMaaS and CaaS runs are made on the
 machine that runs libvirt (the rdu host), not on the machine that starts
 the run. The setup script learned `--skip-bmhs` for this: it makes the
