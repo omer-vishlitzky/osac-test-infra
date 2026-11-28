@@ -18,14 +18,18 @@ is called a "vcluster".
 **VMaaS is green.** The full test suite ran against a run and 126 of 134
 tests passed. A test user logs in, asks for a machine, and OSAC makes a real
 machine on the outer cluster. Only the run that asked for it can see it.
-Three tests still fail. They are narrow product bugs, not vcluster problems.
-We list them below.
+The last few failures were test bugs or node capacity problems, not OSAC
+bugs. All are fixed or skipped now.
 
-**Runs can be made in parallel.** We made four runs at the same time on one
-node. We then ran test suites against many runs at once.
+**CaaS got far.** The first CaaS run created a real hosted cluster on the
+outer cluster. The hosted cluster reached "Available". Two OSAC bugs block
+the rest. We list them below.
 
-**The code for BMaaS and CaaS is written and pushed.** It has not run
-against a live run yet. That is the next step.
+**BMaaS got far.** The fake metal machines work. Both reached "available"
+and were seen by the run. One OSAC bug blocks the tests. We list it below.
+
+**Runs can be made in parallel.** We made many runs at the same time on one
+node and ran test suites against them at once.
 
 ## The three parts
 
@@ -43,37 +47,41 @@ against a live run yet. That is the next step.
 ## How to run one test
 
 ```
-# Make a run called myrun1. This makes the vcluster and installs OSAC in it.
-bash scripts/vcluster-timing/timed-run.sh myrun1 9460 install-only
+# Make a run called myrun1. The name must end in v (VMaaS), b (BMaaS) or
+# c (CaaS) before the attempt digit.
+bash scripts/vcluster-timing/timed-run.sh myrunv1 9460 install-only
 
 # Run the VMaaS tests against it.
-bash scripts/vcluster-timing/run-suite.sh myrun1 vmaas/sanity
+bash scripts/vcluster-timing/run-suite.sh myrunv1 vmaas/sanity
 
 # When you are done, remove the run. The outer cluster stays.
-bash scripts/vcluster-run-teardown.sh myrun1
+bash scripts/vcluster-run-teardown.sh myrunv1
 ```
 
-## The three failing tests (known, small)
+## The open OSAC bugs (found by the first CaaS and BMaaS runs)
 
-1. A network name test: the server should say no when you reuse a name that
-   is being deleted. It does not say no in time.
-2. A disk test: one way of asking for extra disks gets stuck. The machine
-   never finishes.
-3. A billing test: one volume bill never arrives.
+1. **CaaS: cross-cluster ownerReferences.** The operator creates the InfraEnv
+   on the outer cluster and marks it as owned by the ClusterOrder. But the
+   ClusterOrder lives in the vcluster. The outer cluster does not know it, so
+   its garbage collector deletes the InfraEnv every 30 seconds. No worker ever
+   joins the hosted cluster because of this.
+2. **CaaS: the guest ingress VIP range cannot be set.** The chart has no key
+   for it, so the hosted cluster job fails at the external access step.
+3. **BMaaS: tenant setup is not idempotent in the vault.** The tenant
+   reconciler fails to store the break-glass credentials when the vault paths
+   already exist. The error is swallowed as "vault operation failed". The
+   tenant never finishes, and the tests hang at setup.
 
 ## What each suite still needs
 
-- **VMaaS**: only the three fixes above.
-- **BMaaS**: the run needs fake metal machines. The script for that is
-  `scripts/vcluster-run-bmhs.sh`. The tests need one setting:
-  `OSAC_BMH_KUBECONFIG` must point at the outer cluster.
-- **CaaS**: the run needs the DNS settings (the BIND server is ready). The
-  tests need `OSAC_TARGET_KUBECONFIG` set to the outer cluster.
+- **VMaaS**: nothing. It is green.
+- **BMaaS**: the vault bug above. Then the suite should run.
+- **CaaS**: the two bugs above. Then the hosted cluster needs workers, which
+  needs the InfraEnv fix.
 
 ## What is still missing
 
-- The BMaaS and CaaS tests have never run against a run. They will find
-  problems. We will fix them as they show up.
+- The three OSAC bugs above.
 - The CI job that runs many tests at once is not written yet. The scripts
   are the start of it.
 - The nightly reset of the outer cluster is not set up. It would clean up
@@ -81,6 +89,9 @@ bash scripts/vcluster-run-teardown.sh myrun1
 - The vcluster API needs a route so runners do not need a port-forward.
   Today the runner starts its own port-forward, which works but is a
   workaround.
+- The BMF operator image and the vcluster compat objects (the service CA
+  ConfigMap, the unprefixed credentials Secret) must be part of the install,
+  not later fixes.
 
 ## Where the commits are
 
