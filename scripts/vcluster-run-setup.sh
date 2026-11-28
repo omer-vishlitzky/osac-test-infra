@@ -786,6 +786,18 @@ spec:
           - Read
           - Describe
         host: "*"
+      # The adapters consume the literal shared inference topics (the Go
+      # constant TopicInference, not configurable): grant them alongside
+      # the run-prefixed one so the echo adapter's consumer group is not
+      # blocked on the shared topic while heartbeats flow.
+      - resource:
+          type: topic
+          name: osac.metering.inference
+          patternType: prefix
+        operations:
+          - Read
+          - Describe
+        host: "*"
       - resource:
           type: topic
           name: ${DLQ_TOPIC_PREFIX}
