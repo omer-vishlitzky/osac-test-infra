@@ -1470,7 +1470,10 @@ precreate_aap_identity() {
     [[ -n "${api_token}" ]] || die "The osac-aap-api-token Secret in ${AAP_NAMESPACE} is empty."
 
     local api="${AAP_CONTROLLER_URL}/api/controller/v2"
-    local auth=(-H "Authorization: Bearer ${api_token}" -H "Content-Type: application/json" -s --fail-with-body)
+    # -k: the AAP route's certificate is signed by the lab's CA, which is
+    # not in this process's trust store; every other AAP client on this lab
+    # (the teardown, the CI tooling) skips verification the same way.
+    local auth=(-H "Authorization: Bearer ${api_token}" -H "Content-Type: application/json" -s -k --fail-with-body)
 
     # Organization: create when missing. The API answers 400 with "already
     # exists" in the body on a duplicate, which --fail-with-body surfaces.
